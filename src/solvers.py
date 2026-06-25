@@ -1,5 +1,7 @@
 import numpy as np
 import cvxpy as cp
+import gurobipy as gp
+from gurobipy import GRB
 import openjij as oj
 
 # No top-level Qiskit imports to avoid errors.
@@ -20,27 +22,40 @@ def solve_exact_qubo(qubo, N, K):
     x = np.array([best.sample[i] for i in range(N)])
     return x.astype(int), best.energy
 
-def solve_miqp_cvxpy(a_i, b_ij, K, N):
-    """Exact MIQP solver using CVXPY."""
-    x = cp.Variable(N, boolean=True)
-    # Build symmetric matrix B_full such that x^T B_full x = sum_{i<j} b_ij x_i x_j
-    B_full = np.zeros((N, N))
+def solve_miqp_gurobi(a_i, b_ij, K, N):
+    """Exact MIQP solver using Gurobi directly."""
+
+    # Create a Gurobi model
+    model = gp.Model("MIQP")
+
+    # Add binary variables (x_i in {0, 1})
+    x = model.addVars(N, vtype=GRB.BINARY, name="x")
+
+    # Build the objective: a_i^T x + sum_{i<j} b_ij x_i x_j
+    objective = gp.QuadExpr()
+
+    # Linear term: a_i^T x
     for i in range(N):
-        for j in range(N):
-            if i != j:
-                B_full[i, j] = b_ij[i, j] / 2.0
-    objective = cp.Minimize(a_i.T @ x + cp.quad_form(x, B_full))
-    constraints = [cp.sum(x) == K]
-    prob = cp.Problem(objective, constraints)
-    
-    # Use Gurobi as the exact baseline solver
-    try:
-        prob.solve(solver=cp.GUROBI, qcp=True, enforce_dcp=False)
-    except cp.SolverError:
-        # Fallback to letting CVXPY find any available mixed-integer solver
-        prob.solve()
-        
-    return x.value.astype(int), prob.value
+        objective += a_i[i] * x[i]
+
+    # Quadratic term: sum_{i<j} b_ij x_i x_j
+    for i in range(N):
+        for j in range(i + 1, N):
+            objective += b_ij[i, j] * x[i] * x[j]
+
+    model.setObjective(objective, GRB.MINIMIZE)
+
+    # Add constraint: sum(x) == K
+    model.addConstr(gp.quicksum(x[i] for i in range(N)) == K, "cardinality_constraint")
+
+    # Solve the model
+    model.optimize()
+
+    # Extract the solution
+    x_solution = np.array([x[i].X for i in range(N)], dtype=int)
+    optimal_value = model.objVal
+
+    return x_solution, optimal_value
 
 def solve_sa(qubo, num_reads=30, sweeps=1000):
     """Simulated Annealing using OpenJij."""
