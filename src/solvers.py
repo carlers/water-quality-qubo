@@ -58,21 +58,48 @@ def solve_miqp_gurobi(a_i, b_ij, K, N):
     return x_solution, optimal_value
 
 def solve_sa(qubo, N, num_reads=30, sweeps=1000):
-    """Simulated Annealing."""
+    """Simulated Annealing using OpenJij."""
     sampler = oj.SASampler()
     response = sampler.sample_qubo(qubo, num_reads=num_reads, num_sweeps=sweeps)
-    best = response.first
-    # best.sample is dict {var: value}, variables are 0..N-1
-    x = np.array([best.sample[i] for i in range(N)])
-    return x.astype(int), best.energy
+    
+    # Debug: print the structure
+    if num_reads == 1:  # only for debugging
+        print(f"SA response type: {type(response)}")
+        print(f"SA response.record shape: {response.record.shape if hasattr(response, 'record') else 'No record'}")
+        print(f"SA response.record: {response.record}")
+        if hasattr(response, 'first'):
+            print(f"SA first: {response.first}")
+            best_state = response.first[0]  # first[0] is the sample dict
+            energy = response.first[1]      # first[1] is the energy
+            # Convert dict to array
+            x = np.array([best_state[i] for i in range(N)])
+            return x.astype(int), energy
+    
+    # Default: use record
+    best_state = response.record[0][0]
+    energy = response.record[0][1]
+    return best_state, energy
 
 def solve_sqa(qubo, N, num_reads=30, sweeps=1000, trotter=32):
-    """Simulated Quantum Annealing."""
+    """Simulated Quantum Annealing using OpenJij."""
     sampler = oj.SQASampler()
     response = sampler.sample_qubo(qubo, num_reads=num_reads, num_sweeps=sweeps, trotter=trotter)
-    best = response.first
-    x = np.array([best.sample[i] for i in range(N)])
-    return x.astype(int), best.energy
+    
+    # Debug: print the structure
+    if num_reads == 1:
+        print(f"SQA response type: {type(response)}")
+        print(f"SQA response.record shape: {response.record.shape if hasattr(response, 'record') else 'No record'}")
+        print(f"SQA response.record: {response.record}")
+        if hasattr(response, 'first'):
+            print(f"SQA first: {response.first}")
+            best_state = response.first[0]
+            energy = response.first[1]
+            x = np.array([best_state[i] for i in range(N)])
+            return x.astype(int), energy
+    
+    best_state = response.record[0][0]
+    energy = response.record[0][1]
+    return best_state, energy
 
 def solve_qaoa(qubo, N, p=1, shots=1024, max_iter=100):
     """
