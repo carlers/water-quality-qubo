@@ -69,7 +69,7 @@ def solve_sa(qubo, num_reads=30, sweeps=1000):
 def solve_sqa(qubo, num_reads=30, sweeps=1000, trotter=32):
     """Simulated Quantum Annealing using OpenJij."""
     sampler = oj.SQASampler()   # no arguments
-    response = sampler.sample_qubo(qubo, num_reads=num_reads, num_sweeps=sweeps, num_trotters=trotter)
+    response = sampler.sample_qubo(qubo, num_reads=num_reads, num_sweeps=sweeps, trotter=trotter)
     best_state = response.record[0][0]
     energy = response.record[0][1]
     return best_state, energy
