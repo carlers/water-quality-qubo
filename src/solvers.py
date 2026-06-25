@@ -5,6 +5,21 @@ import openjij as oj
 # No top-level Qiskit imports to avoid errors.
 # All Qiskit-related imports are inside solve_qaoa().
 
+def solve_exact_qubo(qubo, N, K):
+    """
+    Exact QUBO solver using dimod.ExactSolver.
+    Returns best state (as list of ints) and minimum energy.
+    """
+    import dimod
+    # qubo is a dict {(i,j): coeff} with i<=j (diagonal for linear terms)
+    bqm = dimod.BinaryQuadraticModel.from_qubo(qubo)
+    sampler = dimod.ExactSolver()
+    response = sampler.sample(bqm)
+    best = response.first
+    # best.sample is a dict {var: value}
+    x = np.array([best.sample[i] for i in range(N)])
+    return x.astype(int), best.energy
+
 def solve_miqp_cvxpy(a_i, b_ij, K, N):
     """Exact MIQP solver using CVXPY."""
     x = cp.Variable(N, boolean=True)

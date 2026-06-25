@@ -1,5 +1,5 @@
 jijmodeling
-jijmodeling-transpiler
+jijmodeling_transpiler
 openjij
 cvxpy
 numpy
@@ -9,3 +9,4 @@ seaborn
 qiskit>=0.45          # For QAOA simulation
 qiskit-optimization   # Optional, helps with QUBO->Hamiltonian
 pandas
+gurobipy
