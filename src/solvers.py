@@ -57,22 +57,22 @@ def solve_miqp_gurobi(a_i, b_ij, K, N):
 
     return x_solution, optimal_value
 
-def solve_sa(qubo, num_reads=30, sweeps=1000):
-    """Simulated Annealing using OpenJij."""
-    sampler = oj.SASampler()   # no arguments
+def solve_sa(qubo, N, num_reads=30, sweeps=1000):
+    """Simulated Annealing."""
+    sampler = oj.SASampler()
     response = sampler.sample_qubo(qubo, num_reads=num_reads, num_sweeps=sweeps)
-    # The best (lowest energy) solution is the first record
-    best_state = response.record[0][0]
-    energy = response.record[0][1]
-    return best_state, energy
+    best = response.first
+    # best.sample is dict {var: value}, variables are 0..N-1
+    x = np.array([best.sample[i] for i in range(N)])
+    return x.astype(int), best.energy
 
-def solve_sqa(qubo, num_reads=30, sweeps=1000, trotter=32):
-    """Simulated Quantum Annealing using OpenJij."""
-    sampler = oj.SQASampler()   # no arguments
+def solve_sqa(qubo, N, num_reads=30, sweeps=1000, trotter=32):
+    """Simulated Quantum Annealing."""
+    sampler = oj.SQASampler()
     response = sampler.sample_qubo(qubo, num_reads=num_reads, num_sweeps=sweeps, trotter=trotter)
-    best_state = response.record[0][0]
-    energy = response.record[0][1]
-    return best_state, energy
+    best = response.first
+    x = np.array([best.sample[i] for i in range(N)])
+    return x.astype(int), best.energy
 
 def solve_qaoa(qubo, N, p=1, shots=1024, max_iter=100):
     """
