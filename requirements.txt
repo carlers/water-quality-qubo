@@ -1,0 +1,11 @@
+jijmodeling
+jijmodeling-transpiler
+openjij
+cvxpy
+numpy
+scipy
+matplotlib
+seaborn
+qiskit>=0.45          # For QAOA simulation
+qiskit-optimization   # Optional, helps with QUBO->Hamiltonian
+pandas
