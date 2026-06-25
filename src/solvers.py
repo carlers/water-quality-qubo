@@ -43,15 +43,18 @@ def solve_miqp_cvxpy(a_i, b_ij, K, N):
     return x.value.astype(int), prob.value
 
 def solve_sa(qubo, num_reads=30, sweeps=1000):
-    sampler = oj.SASampler(num_reads=num_reads, sweeps=sweeps)
-    response = sampler.sample_qubo(qubo)
+    """Simulated Annealing using OpenJij."""
+    sampler = oj.SASampler()   # no arguments
+    response = sampler.sample_qubo(qubo, num_reads=num_reads, sweeps=sweeps)
+    # The best (lowest energy) solution is the first record
     best_state = response.record[0][0]
     energy = response.record[0][1]
     return best_state, energy
 
 def solve_sqa(qubo, num_reads=30, sweeps=1000, trotter=32):
-    sampler = oj.SQASampler(num_reads=num_reads, sweeps=sweeps, trotter=trotter)
-    response = sampler.sample_qubo(qubo)
+    """Simulated Quantum Annealing using OpenJij."""
+    sampler = oj.SQASampler()   # no arguments
+    response = sampler.sample_qubo(qubo, num_reads=num_reads, sweeps=sweeps, trotter=trotter)
     best_state = response.record[0][0]
     energy = response.record[0][1]
     return best_state, energy
