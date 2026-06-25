@@ -1,5 +1,5 @@
 import jijmodeling as jm
-import jijmodeling.transpiler as jmt
+import jijmodeling_transpiler as jmt
 import numpy as np
 
 def build_water_quality_problem(N, K_target, a_i, b_ij, lambda_penalty):
