@@ -18,7 +18,12 @@ def build_water_quality_problem(N, K_target, a_i, b_ij, lambda_penalty):
     K = jm.Placeholder('K')
     
     linear = jm.sum(i, a[i] * x[i])
-    quad = jm.sum([i, j], b[i][j] * x[i] * x[j], i < j)
+    
+    # Quadratic objective term:
+    # Since b_ij is symmetric and diagonal is 0, summing over all [i, j] 
+    # double-counts every pair. Multiplying by 0.5 yields exactly the sum over i < j.
+    quad = 0.5 * jm.sum([i, j], b[i][j] * x[i] * x[j])
+    
     penalty = lam * (jm.sum(i, x[i]) - K) ** 2
     
     prob += linear + quad + penalty
