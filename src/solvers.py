@@ -15,7 +15,7 @@ def solve_miqp_gurobi(a_i, b_ij, K, N):
 
     # Suppress all Gurobi output
     model.setParam('OutputFlag', 0)
-    
+
     # Add binary variables (x_i in {0, 1})
     x = model.addVars(N, vtype=GRB.BINARY, name="x")
 
@@ -45,45 +45,83 @@ def solve_miqp_gurobi(a_i, b_ij, K, N):
 
     return x_solution, optimal_value
 
-def solve_sa(qubo, N, num_reads=30, sweeps=1000):
-    """Simulated Annealing using OpenJij."""
+def solve_sa(qubo_dict, N, linear_coeffs=None, num_reads=30, sweeps=1000):
+    """
+    Simulated Annealing using OpenJij.
+    qubo_dict: JijModeling QUBO dict (may include self-terms)
+    linear_coeffs: if provided, these are the linear coefficients from the QUBO
+    """
     sampler = oj.SASampler()
-    response = sampler.sample_qubo(qubo, num_reads=num_reads, num_sweeps=sweeps)
     
-    # Debug: print the structure
-    if num_reads == 1:  # only for debugging
+    # If we have linear coefficients, we need to build the QUBO properly
+    if linear_coeffs is not None:
+        # OpenJij expects a dict where keys are (i, j) with i<j
+        # and values are the quadratic coefficients.
+        # Linear terms are handled via the 'linear' parameter.
+        quadratic = {}
+        for (i, j), coeff in qubo_dict.items():
+            if i != j:
+                if i < j:
+                    quadratic[(i, j)] = coeff
+                else:
+                    quadratic[(j, i)] = quadratic.get((j, i), 0) + coeff
+        
+        response = sampler.sample_qubo(
+            quadratic,
+            linear=linear_coeffs,
+            num_reads=num_reads,
+            num_sweeps=sweeps
+        )
+    else:
+        # Fallback: try to handle it directly (but this won't work with self-terms)
+        response = sampler.sample_qubo(qubo_dict, num_reads=num_reads, num_sweeps=sweeps)
+    
+    if num_reads == 1:
         print(f"SA response type: {type(response)}")
-        print(f"SA response.record shape: {response.record.shape if hasattr(response, 'record') else 'No record'}")
-        print(f"SA response.record: {response.record}")
-        if hasattr(response, 'first'):
-            print(f"SA first: {response.first}")
-            best_state = response.first[0]  # first[0] is the sample dict
-            energy = response.first[1]      # first[1] is the energy
-            # Convert dict to array
-            x = np.array([best_state[i] for i in range(N)])
-            return x.astype(int), energy
+        print(f"SA response.record shape: {response.record.shape}")
+        print(f"SA first sample: {response.first}")
+        best_state = response.first[0]
+        energy = response.first[1]
+        x = np.array([best_state[i] for i in range(N)])
+        return x.astype(int), energy
     
-    # Default: use record
     best_state = response.record[0][0]
     energy = response.record[0][1]
     return best_state, energy
 
-def solve_sqa(qubo, N, num_reads=30, sweeps=1000, trotter=32):
-    """Simulated Quantum Annealing using OpenJij."""
+def solve_sqa(qubo_dict, N, linear_coeffs=None, num_reads=30, sweeps=1000, trotter=32):
+    """
+    Simulated Quantum Annealing using OpenJij.
+    """
     sampler = oj.SQASampler()
-    response = sampler.sample_qubo(qubo, num_reads=num_reads, num_sweeps=sweeps, trotter=trotter)
     
-    # Debug: print the structure
+    if linear_coeffs is not None:
+        quadratic = {}
+        for (i, j), coeff in qubo_dict.items():
+            if i != j:
+                if i < j:
+                    quadratic[(i, j)] = coeff
+                else:
+                    quadratic[(j, i)] = quadratic.get((j, i), 0) + coeff
+        
+        response = sampler.sample_qubo(
+            quadratic,
+            linear=linear_coeffs,
+            num_reads=num_reads,
+            num_sweeps=sweeps,
+            trotter=trotter
+        )
+    else:
+        response = sampler.sample_qubo(qubo_dict, num_reads=num_reads, num_sweeps=sweeps, trotter=trotter)
+    
     if num_reads == 1:
         print(f"SQA response type: {type(response)}")
-        print(f"SQA response.record shape: {response.record.shape if hasattr(response, 'record') else 'No record'}")
-        print(f"SQA response.record: {response.record}")
-        if hasattr(response, 'first'):
-            print(f"SQA first: {response.first}")
-            best_state = response.first[0]
-            energy = response.first[1]
-            x = np.array([best_state[i] for i in range(N)])
-            return x.astype(int), energy
+        print(f"SQA response.record shape: {response.record.shape}")
+        print(f"SQA first sample: {response.first}")
+        best_state = response.first[0]
+        energy = response.first[1]
+        x = np.array([best_state[i] for i in range(N)])
+        return x.astype(int), energy
     
     best_state = response.record[0][0]
     energy = response.record[0][1]
