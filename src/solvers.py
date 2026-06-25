@@ -53,28 +53,33 @@ def solve_sa(qubo_dict, N, linear_coeffs=None, num_reads=30, sweeps=1000):
     """
     sampler = oj.SASampler()
     
-    # If we have linear coefficients, we need to build the QUBO properly
+    # Build complete QUBO dictionary with self-terms for linear coefficients
+    qubo_full = {}
+    
+    # If we have linear coefficients, add them as self-terms (i, i)
     if linear_coeffs is not None:
-        # OpenJij expects a dict where keys are (i, j) with i<j
-        # and values are the quadratic coefficients.
-        # Linear terms are handled via the 'linear' parameter.
-        quadratic = {}
-        for (i, j), coeff in qubo_dict.items():
-            if i != j:
-                if i < j:
-                    quadratic[(i, j)] = coeff
-                else:
-                    quadratic[(j, i)] = quadratic.get((j, i), 0) + coeff
-        
-        response = sampler.sample_qubo(
-            quadratic,
-            linear=linear_coeffs,
-            num_reads=num_reads,
-            num_sweeps=sweeps
-        )
-    else:
-        # Fallback: try to handle it directly (but this won't work with self-terms)
-        response = sampler.sample_qubo(qubo_dict, num_reads=num_reads, num_sweeps=sweeps)
+        for i, coeff in enumerate(linear_coeffs):
+            if coeff != 0:  # Only add non-zero terms
+                qubo_full[(i, i)] = coeff
+    
+    # Add quadratic terms
+    for (i, j), coeff in qubo_dict.items():
+        if i != j:
+            # OpenJij expects i < j for quadratic terms
+            if i < j:
+                qubo_full[(i, j)] = coeff
+            else:
+                qubo_full[(j, i)] = qubo_full.get((j, i), 0) + coeff
+        else:
+            # This is already a self-term (linear)
+            qubo_full[(i, i)] = qubo_full.get((i, i), 0) + coeff
+    
+    # Sample with the complete QUBO
+    response = sampler.sample_qubo(
+        qubo_full,
+        num_reads=num_reads,
+        num_sweeps=sweeps
+    )
     
     if num_reads == 1:
         print(f"SA response type: {type(response)}")
@@ -89,30 +94,41 @@ def solve_sa(qubo_dict, N, linear_coeffs=None, num_reads=30, sweeps=1000):
     energy = response.record[0][1]
     return best_state, energy
 
+
 def solve_sqa(qubo_dict, N, linear_coeffs=None, num_reads=30, sweeps=1000, trotter=32):
     """
     Simulated Quantum Annealing using OpenJij.
     """
     sampler = oj.SQASampler()
     
+    # Build complete QUBO dictionary with self-terms for linear coefficients
+    qubo_full = {}
+    
+    # If we have linear coefficients, add them as self-terms (i, i)
     if linear_coeffs is not None:
-        quadratic = {}
-        for (i, j), coeff in qubo_dict.items():
-            if i != j:
-                if i < j:
-                    quadratic[(i, j)] = coeff
-                else:
-                    quadratic[(j, i)] = quadratic.get((j, i), 0) + coeff
-        
-        response = sampler.sample_qubo(
-            quadratic,
-            linear=linear_coeffs,
-            num_reads=num_reads,
-            num_sweeps=sweeps,
-            trotter=trotter
-        )
-    else:
-        response = sampler.sample_qubo(qubo_dict, num_reads=num_reads, num_sweeps=sweeps, trotter=trotter)
+        for i, coeff in enumerate(linear_coeffs):
+            if coeff != 0:  # Only add non-zero terms
+                qubo_full[(i, i)] = coeff
+    
+    # Add quadratic terms
+    for (i, j), coeff in qubo_dict.items():
+        if i != j:
+            # OpenJij expects i < j for quadratic terms
+            if i < j:
+                qubo_full[(i, j)] = coeff
+            else:
+                qubo_full[(j, i)] = qubo_full.get((j, i), 0) + coeff
+        else:
+            # This is already a self-term (linear)
+            qubo_full[(i, i)] = qubo_full.get((i, i), 0) + coeff
+    
+    # Sample with the complete QUBO
+    response = sampler.sample_qubo(
+        qubo_full,
+        num_reads=num_reads,
+        num_sweeps=sweeps,
+        trotter=trotter
+    )
     
     if num_reads == 1:
         print(f"SQA response type: {type(response)}")
