@@ -17,10 +17,14 @@ def solve_miqp_cvxpy(a_i, b_ij, K, N):
     objective = cp.Minimize(a_i.T @ x + cp.quad_form(x, B_full))
     constraints = [cp.sum(x) == K]
     prob = cp.Problem(objective, constraints)
+    
+    # Use Gurobi as the exact baseline solver
     try:
-        prob.solve(solver=cp.SCIP)
-    except:
-        prob.solve(solver=cp.ECOS_BB)
+        prob.solve(solver=cp.GUROBI)
+    except cp.SolverError:
+        # Fallback to letting CVXPY find any available mixed-integer solver
+        prob.solve()
+        
     return x.value.astype(int), prob.value
 
 def solve_sa(qubo, num_reads=30, sweeps=1000):
