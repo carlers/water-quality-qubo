@@ -35,7 +35,7 @@ def solve_miqp_cvxpy(a_i, b_ij, K, N):
     
     # Use Gurobi as the exact baseline solver
     try:
-        prob.solve(solver=cp.MOSEK)
+        prob.solve(solver=cp.GUROBI)
     except cp.SolverError:
         # Fallback to letting CVXPY find any available mixed-integer solver
         prob.solve()
