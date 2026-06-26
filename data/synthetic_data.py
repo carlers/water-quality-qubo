@@ -64,18 +64,38 @@ def generate_coordinates(
     n: int, domain_size: float, seed: Optional[int] = None
 ) -> np.ndarray:
     """
-    Generate random (x, y) coordinates uniformly in a square domain.
-
-    Args:
-        n: Number of points to generate.
-        domain_size: Side length of the square (km).
-        seed: Random seed. If None, uses the global RANDOM_SEED.
-
-    Returns:
-        (n, 2) array of coordinates in kilometers.
+    Generate a structured uniform grid of points (mimicking a hexagonal lattice).
+    
+    This creates an approx sqrt(N) x sqrt(N) grid with a small random jitter
+    to simulate real-world data, but maintaining a clear uniform structure.
     """
     rng = np.random.RandomState(seed if seed is not None else RANDOM_SEED)
-    coords = rng.uniform(0.0, domain_size, size=(n, 2))
+    
+    # Determine grid dimensions
+    cols = int(np.ceil(np.sqrt(n)))
+    rows = int(np.ceil(n / cols))
+    
+    # Generate grid points
+    x = np.linspace(0, domain_size, cols)
+    y = np.linspace(0, domain_size, rows)
+    xx, yy = np.meshgrid(x, y)
+    
+    coords = np.column_stack([xx.ravel(), yy.ravel()])
+    
+    # Randomly sample N points if grid has more than N
+    if len(coords) > n:
+        idx = rng.choice(len(coords), size=n, replace=False)
+        coords = coords[idx]
+    
+    # # Add a tiny amount of jitter (e.g., up to 5% of spacing) to avoid exact alignment
+    # # This mimics real GPS / QGIS noise without breaking the structure.
+    # spacing = domain_size / max(cols, rows)
+    # jitter = rng.uniform(-0.3 * spacing, 0.3 * spacing, size=coords.shape)
+    # coords += jitter
+    
+    # Ensure points stay within bounds
+    coords = np.clip(coords, 0, domain_size)
+    
     return coords.astype(np.float64)
 
 
