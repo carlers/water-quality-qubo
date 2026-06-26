@@ -11,11 +11,17 @@ This module creates a master set of candidate sites with:
 - Fixed "existing stations" M for incremental deployment scenarios
 
 All outputs are saved to the `data/` directory as .npy, .pkl, and .json files.
+
+Usage (command line):
+    python data/synthetic_data.py --seed 123 --n_master 150 --subset_sizes 10,20,30,50,100
+    python data/synthetic_data.py --seed random  # Random seed (uses current time)
 """
 
 import json
 import pickle
 import warnings
+import argparse
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -23,10 +29,10 @@ import numpy as np
 from scipy.spatial.distance import cdist
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION (hardcoded for reproducibility; can be overridden by config.py)
+# DEFAULT CONFIGURATION
 # -----------------------------------------------------------------------------
 
-# Random seed for all stochastic operations
+# Random seed for all stochastic operations (can be overridden via CLI)
 RANDOM_SEED: int = 42
 
 # Domain: square of size DOMAIN_SIZE x DOMAIN_SIZE (kilometers)
@@ -55,10 +61,10 @@ SUBSET_SIZES: List[int] = [10, 20, 30, 50, 100]
 # Output directory (relative to project root)
 OUTPUT_DIR: str = "data"
 
+
 # -----------------------------------------------------------------------------
 # GENERATION FUNCTIONS
 # -----------------------------------------------------------------------------
-
 
 def generate_coordinates(
     n: int, domain_size: float, seed: Optional[int] = None
@@ -163,6 +169,7 @@ def farthest_point_sampling(
     sizes: List[int],
     start_idx: Optional[int] = None,
     seed: Optional[int] = None,
+    domain_size: float = 50.0,
 ) -> Dict[int, List[int]]:
     """
     Generate nested subsets via farthest-point sampling (FPS).
@@ -177,6 +184,7 @@ def farthest_point_sampling(
         start_idx: Index to start with. If None, uses the point closest to the
                    geometric center of the domain.
         seed: Random seed for tie-breaking. If None, uses global RANDOM_SEED.
+        domain_size: Domain size for center calculation.
 
     Returns:
         Dict mapping size -> list of indices (nested).
@@ -192,7 +200,7 @@ def farthest_point_sampling(
 
     # Determine starting point
     if start_idx is None:
-        center = np.array([DOMAIN_SIZE / 2.0, DOMAIN_SIZE / 2.0])
+        center = np.array([domain_size / 2.0, domain_size / 2.0])
         distances_to_center = np.linalg.norm(coords - center, axis=1)
         # Tie-breaking: pick the first occurrence with minimal distance
         start_idx = int(np.argmin(distances_to_center))
@@ -247,6 +255,7 @@ def create_nested_subsets(
     sizes: List[int],
     start_idx: Optional[int] = None,
     seed: Optional[int] = None,
+    domain_size: float = 50.0,
 ) -> Dict[int, Dict[str, Union[np.ndarray, List[int]]]]:
     """
     Generate nested subsets with full data (coords, factors, utility, indices).
@@ -258,6 +267,7 @@ def create_nested_subsets(
         sizes: Requested subset sizes (will be sorted).
         start_idx: Starting index for FPS. If None, uses point closest to center.
         seed: Random seed for FPS tie-breaking.
+        domain_size: Domain size for center calculation.
 
     Returns:
         Dict mapping size -> {
@@ -267,7 +277,7 @@ def create_nested_subsets(
             'indices': List[int] (original master indices)
         }
     """
-    indices_dict = farthest_point_sampling(coords, sizes, start_idx, seed)
+    indices_dict = farthest_point_sampling(coords, sizes, start_idx, seed, domain_size)
 
     subsets = {}
     for size, indices in indices_dict.items():
@@ -479,6 +489,10 @@ def verify_subsets(
 def generate_and_save_all(
     output_dir: Optional[Union[str, Path]] = None,
     seed: Optional[int] = None,
+    n_master: Optional[int] = None,
+    domain_size: Optional[float] = None,
+    n_existing: Optional[int] = None,
+    subset_sizes: Optional[List[int]] = None,
 ) -> Dict:
     """
     Full pipeline: generate coordinates, factors, utility, subsets, and save.
@@ -486,30 +500,47 @@ def generate_and_save_all(
     Args:
         output_dir: Directory to save data. If None, uses OUTPUT_DIR.
         seed: Random seed. If None, uses RANDOM_SEED.
+        n_master: Number of master candidates. If None, uses N_MASTER.
+        domain_size: Domain size in km. If None, uses DOMAIN_SIZE.
+        n_existing: Number of existing stations. If None, uses N_EXISTING.
+        subset_sizes: List of subset sizes. If None, uses SUBSET_SIZES.
 
     Returns:
         Dict with keys: 'coords', 'factors', 'U', 'subsets', 'metadata'
     """
     if output_dir is None:
         output_dir = OUTPUT_DIR
-
+    
     if seed is None:
         seed = RANDOM_SEED
+    
+    if n_master is None:
+        n_master = N_MASTER
+    
+    if domain_size is None:
+        domain_size = DOMAIN_SIZE
+    
+    if n_existing is None:
+        n_existing = N_EXISTING
+    
+    if subset_sizes is None:
+        subset_sizes = SUBSET_SIZES
 
     print("=" * 60)
     print("Generating synthetic master dataset...")
     print(f"  Seed: {seed}")
-    print(f"  Domain: {DOMAIN_SIZE} × {DOMAIN_SIZE} km")
-    print(f"  Master candidates: {N_MASTER}")
-    print(f"  Subset sizes: {SUBSET_SIZES}")
+    print(f"  Domain: {domain_size} × {domain_size} km")
+    print(f"  Master candidates: {n_master}")
+    print(f"  Existing stations: {n_existing}")
+    print(f"  Subset sizes: {subset_sizes}")
     print("=" * 60)
 
     # Step 1: Generate coordinates
-    coords = generate_coordinates(N_MASTER, DOMAIN_SIZE, seed)
+    coords = generate_coordinates(n_master, domain_size, seed)
     print(f"✓ Coordinates: shape {coords.shape}, range [{coords.min():.2f}, {coords.max():.2f}] km")
 
     # Step 2: Generate factors
-    factors = generate_factors(N_MASTER, seed)
+    factors = generate_factors(n_master, seed)
     print(f"✓ Factors: shape {factors.shape}, range [{factors.min():.3f}, {factors.max():.3f}]")
 
     # Step 3: Compute utility
@@ -517,12 +548,12 @@ def generate_and_save_all(
     print(f"✓ Utility: shape {utility.shape}, range [{utility.min():.3f}, {utility.max():.3f}]")
 
     # Step 4: Select existing stations M
-    existing_indices = select_existing_stations(N_EXISTING, N_MASTER, seed)
+    existing_indices = select_existing_stations(n_existing, n_master, seed)
     print(f"✓ Existing stations (M): {existing_indices}")
 
     # Step 5: Create nested subsets using FPS starting from center
     # Use the point closest to domain center as the first point
-    center = np.array([DOMAIN_SIZE / 2.0, DOMAIN_SIZE / 2.0])
+    center = np.array([domain_size / 2.0, domain_size / 2.0])
     dist_to_center = np.linalg.norm(coords - center, axis=1)
     start_idx = int(np.argmin(dist_to_center))
 
@@ -530,9 +561,10 @@ def generate_and_save_all(
         coords=coords,
         factors=factors,
         utility=utility,
-        sizes=SUBSET_SIZES,
+        sizes=subset_sizes,
         start_idx=start_idx,
         seed=seed,
+        domain_size=domain_size,
     )
     print(f"✓ Subsets created: {list(subsets.keys())}")
 
@@ -565,17 +597,65 @@ def generate_and_save_all(
         "subsets": subsets,
         "metadata": {
             "seed": seed,
-            "domain_size": DOMAIN_SIZE,
-            "n_master": N_MASTER,
+            "domain_size": domain_size,
+            "n_master": n_master,
             "ahp_weights": AHP_WEIGHTS.tolist(),
             "L_c": L_C,
             "current_vector": CURRENT_VECTOR,
-            "n_existing": N_EXISTING,
+            "n_existing": n_existing,
             "existing_indices": existing_indices,
-            "subset_sizes": SUBSET_SIZES,
+            "subset_sizes": subset_sizes,
             "start_idx": start_idx,
         },
     }
+
+
+# -----------------------------------------------------------------------------
+# COMMAND LINE INTERFACE
+# -----------------------------------------------------------------------------
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Generate synthetic dataset for water quality monitoring QUBO."
+    )
+    parser.add_argument(
+        "--seed", 
+        type=str, 
+        default="42",
+        help='Random seed (integer) or "random" for time-based seed.'
+    )
+    parser.add_argument(
+        "--n_master", 
+        type=int, 
+        default=None,
+        help="Number of master candidate sites."
+    )
+    parser.add_argument(
+        "--domain_size", 
+        type=float, 
+        default=None,
+        help="Domain size in km (square)."
+    )
+    parser.add_argument(
+        "--n_existing", 
+        type=int, 
+        default=None,
+        help="Number of existing stations M."
+    )
+    parser.add_argument(
+        "--subset_sizes", 
+        type=str, 
+        default=None,
+        help='Comma-separated subset sizes, e.g., "10,20,30,50,100"'
+    )
+    parser.add_argument(
+        "--output_dir", 
+        type=str, 
+        default=None,
+        help="Output directory for data files."
+    )
+    return parser.parse_args()
 
 
 # -----------------------------------------------------------------------------
@@ -583,5 +663,27 @@ def generate_and_save_all(
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Run the full pipeline
-    _ = generate_and_save_all()
+    args = parse_args()
+    
+    # Parse seed
+    if args.seed.lower() == "random":
+        seed = int(time.time() * 1000) % 1000000  # Use current time as seed
+        print(f"Using random seed: {seed}")
+    else:
+        seed = int(args.seed)
+    
+    # Parse subset sizes
+    if args.subset_sizes is not None:
+        subset_sizes = [int(x.strip()) for x in args.subset_sizes.split(",")]
+    else:
+        subset_sizes = None
+    
+    # Generate data
+    _ = generate_and_save_all(
+        output_dir=args.output_dir,
+        seed=seed,
+        n_master=args.n_master,
+        domain_size=args.domain_size,
+        n_existing=args.n_existing,
+        subset_sizes=subset_sizes,
+    )
