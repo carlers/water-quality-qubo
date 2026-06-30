@@ -19,6 +19,7 @@ All functions are designed to be:
 
 import json
 import pickle
+from tabnanny import verbose
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
@@ -641,6 +642,36 @@ def build_qubo_manual(
 
     if verbose:
         print(f"[QUBO_Manual] Built: {len(h)} linear, {len(J)} quadratic, constant={constant:.4f}")
+
+      # DEBUG: Print penalty structure
+    if verbose:
+        # Compute penalty for selecting K_new vs K_new+1 stations
+        # Take the first few free indices as an example
+        sample_indices = free_indices[:K_new+1]
+    
+        # Energy for selecting K_new stations (using only these indices)
+        E_K = 0.0
+        for i in sample_indices[:K_new]:
+            E_K += h.get(i, 0.0)
+        for idx_i in range(K_new):
+            for idx_j in range(idx_i+1, K_new):
+                i = sample_indices[idx_i]
+                j = sample_indices[idx_j]
+                E_K += J.get((min(i,j), max(i,j)), 0.0)
+    
+        # Energy for selecting K_new+1 stations
+        E_K1 = 0.0
+        for i in sample_indices[:K_new+1]:
+            E_K1 += h.get(i, 0.0)
+        for idx_i in range(K_new+1):
+            for idx_j in range(idx_i+1, K_new+1):
+                i = sample_indices[idx_i]
+                j = sample_indices[idx_j]
+                E_K1 += J.get((min(i,j), max(i,j)), 0.0)
+    
+        print(f"[QUBO_Manual] DEBUG: Energy for K={K_new}: {E_K:.6f}")
+        print(f"[QUBO_Manual] DEBUG: Energy for K={K_new+1}: {E_K1:.6f}")
+        print(f"[QUBO_Manual] DEBUG: Difference (should be POSITIVE): {E_K1 - E_K:.6f}")
 
     return {
         "h": h,
