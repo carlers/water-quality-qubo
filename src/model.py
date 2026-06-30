@@ -598,15 +598,15 @@ def build_qubo_manual(
     # 2. Budget penalty: lambda1 * (sum x_i - K)^2
     #    Expand: lambda1 * (sum x_i)^2 - 2*lambda1*K * sum x_i + lambda1*K^2
     # ------------------------------------------------------------------------
-    # Linear: -2 * lambda1 * K
+    # Budget penalty: lambda1 * (sum x_i - K)^2
+    # Expansion: lambda1 * (Σx_i + 2Σ_{i<j} x_i x_j - 2K Σx_i + K^2)
     for i in free_indices:
-        add_linear(i, lambda1 * (1.0 - 2.0 * K_new))
+        add_linear(i, lambda1 * (1.0 - 2.0 * K_new))   # FIXED
 
-    # Quadratic: 2 * lambda1 for each pair (i, j)
+    # Quadratic: 2*lambda1 for each pair
     for idx_i, i in enumerate(free_indices):
-        for idx_j, j in enumerate(free_indices):
-            if i < j:
-                add_quad(i, j, 2.0 * lambda1)
+        for j in free_indices[idx_i+1:]:
+            add_quad(i, j, 2.0 * lambda1)
 
     # Constant: lambda1 * K^2
     constant += lambda1 * (K_new ** 2)
