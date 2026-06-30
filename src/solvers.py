@@ -7,6 +7,7 @@ This module provides:
     1. Greedy selection (simple top-K and marginal gain)
     2. Simulated Annealing (SA) via OpenJij
     3. Simulated Quantum Annealing (SQA) via OpenJij
+    4. Constraint violation metrics for debugging
 
 All solvers accept the same QUBO representation (h, J, constant) and return
 a standardized result dictionary for fair comparison.
@@ -29,6 +30,74 @@ import warnings
 from typing import Dict, List, Optional, Tuple, Union, Any
 
 import numpy as np
+
+# -----------------------------------------------------------------------------
+# CONSTRAINT VIOLATION METRICS
+# -----------------------------------------------------------------------------
+
+
+def compute_violations(
+    x_full: np.ndarray,
+    free_indices: List[int],
+    M_indices: List[int],
+    neighbors: Dict[int, List[int]],
+    K_new: int,
+) -> Dict[str, Union[int, float, bool]]:
+    """
+    Compute constraint violations for a solution.
+
+    Args:
+        x_full: Binary vector of length N_total.
+        free_indices: List of free variable indices.
+        M_indices: List of fixed existing station indices.
+        neighbors: Dict {i: list_of_j} from pairwise_data.
+        K_new: Required number of new stations.
+
+    Returns:
+        dict with:
+            'budget_violation': |Σx_free - K_new| (absolute error)
+            'num_isolated': number of selected free stations with no neighbors
+            'max_isolated_penalty': max(1 - sum_neighbors, 0) for selected free stations
+            'feasible': True if budget_violation == 0 and num_isolated == 0
+            'total_selected_new': int, actual number of new stations selected
+    """
+    # Budget: count selected free stations
+    selected_free = [i for i in free_indices if x_full[i] == 1]
+    sum_selected = len(selected_free)
+    budget_violation = abs(sum_selected - K_new)
+
+    # Connectivity: check each selected free station
+    isolated_count = 0
+    max_isolated_penalty = 0.0
+    isolated_indices = []
+    
+    for i in selected_free:
+        # Count selected neighbors (free + fixed)
+        selected_neighbors = 0
+        for j in neighbors.get(i, []):
+            if x_full[j] == 1:
+                selected_neighbors += 1
+        
+        if selected_neighbors == 0:
+            isolated_count += 1
+            isolated_indices.append(i)
+            max_isolated_penalty = max(max_isolated_penalty, 1.0)
+        else:
+            # Penalty term: x_i * (1 - sum_neighbors)
+            # If sum_neighbors >= 1, penalty is <= 0 (reward for clustering)
+            # We report the actual penalty value
+            penalty = 1.0 - selected_neighbors
+            max_isolated_penalty = max(max_isolated_penalty, penalty)
+
+    return {
+        "budget_violation": budget_violation,
+        "num_isolated": isolated_count,
+        "max_isolated_penalty": max_isolated_penalty,
+        "feasible": (budget_violation == 0 and isolated_count == 0),
+        "total_selected_new": sum_selected,
+        "isolated_indices": isolated_indices,
+    }
+
 
 # -----------------------------------------------------------------------------
 # INTERNAL UTILITIES
@@ -241,6 +310,7 @@ def solve_greedy(
             - "time": float (wall-clock seconds).
             - "solver": "Greedy".
             - "status": "OPTIMAL", "FEASIBLE", or "FAILED".
+            - "violations": dict from compute_violations().
             - "details": dict with mode, selected_indices.
     """
     start_time = time.time()
@@ -326,7 +396,6 @@ def solve_greedy(
         raise ValueError(f"mode must be 'simple' or 'marginal', got '{mode}'")
 
     # Build full solution vector
-    # For greedy, we don't have a sample dict, so we build directly
     x_full = np.zeros(N_total, dtype=int)
     for m in M_indices:
         x_full[m] = 1
@@ -337,12 +406,25 @@ def solve_greedy(
     qubo_energy = _compute_qubo_energy(x_full, h, J, constant)
     miqp_energy = _compute_miqp_energy(x_full, pairwise_data)
 
+    # Compute violations
+    neighbors = pairwise_data.get("neighbors", {})
+    violations = compute_violations(
+        x_full=x_full,
+        free_indices=free_indices,
+        M_indices=M_indices,
+        neighbors=neighbors,
+        K_new=K_new,
+    )
+
     elapsed_time = time.time() - start_time
 
     if verbose:
         print(f"[Greedy] QUBO energy: {qubo_energy:.8f}")
         print(f"[Greedy] MIQP energy: {miqp_energy:.8f}")
         print(f"[Greedy] Time: {elapsed_time:.4f}s")
+        print(f"[Greedy] Violations: feasible={violations['feasible']}, "
+              f"budget_err={violations['budget_violation']}, "
+              f"isolated={violations['num_isolated']}")
 
     return {
         "solution": x_full,
@@ -351,6 +433,7 @@ def solve_greedy(
         "time": elapsed_time,
         "solver": "Greedy",
         "status": "FEASIBLE" if len(selected_new) == K_new else "FAILED",
+        "violations": violations,
         "details": {
             "mode": mode,
             "selected_indices": selected_new,
@@ -402,6 +485,7 @@ def solve_sa(
             - "time": float (wall-clock seconds).
             - "solver": "SA".
             - "status": "OPTIMAL", "FEASIBLE", or "FAILED".
+            - "violations": dict from compute_violations().
             - "details": dict with num_reads, num_sweeps, response_info.
     """
     try:
@@ -440,6 +524,14 @@ def solve_sa(
             "time": time.time() - start_time,
             "solver": "SA",
             "status": "FAILED",
+            "violations": {
+                "budget_violation": float("inf"),
+                "num_isolated": float("inf"),
+                "max_isolated_penalty": float("inf"),
+                "feasible": False,
+                "total_selected_new": 0,
+                "isolated_indices": [],
+            },
             "details": {"error": str(e)},
         }
 
@@ -468,12 +560,25 @@ def solve_sa(
         # Compute MIQP energy (without penalties)
         miqp_energy = _compute_miqp_energy(x_full, pairwise_data)
 
+        # Compute violations
+        neighbors = pairwise_data.get("neighbors", {})
+        violations = compute_violations(
+            x_full=x_full,
+            free_indices=free_indices,
+            M_indices=M_indices,
+            neighbors=neighbors,
+            K_new=K_new,
+        )
+
         elapsed_time = time.time() - start_time
 
         if verbose:
             print(f"[SA] Computed QUBO energy: {computed_energy:.8f}")
             print(f"[SA] MIQP energy: {miqp_energy:.8f}")
             print(f"[SA] Time: {elapsed_time:.4f}s")
+            print(f"[SA] Violations: feasible={violations['feasible']}, "
+                  f"budget_err={violations['budget_violation']}, "
+                  f"isolated={violations['num_isolated']}")
 
         return {
             "solution": x_full,
@@ -482,6 +587,7 @@ def solve_sa(
             "time": elapsed_time,
             "solver": "SA",
             "status": "OPTIMAL",
+            "violations": violations,
             "details": {
                 "num_reads": num_reads,
                 "num_sweeps": num_sweeps,
@@ -502,6 +608,14 @@ def solve_sa(
             "time": time.time() - start_time,
             "solver": "SA",
             "status": "FAILED",
+            "violations": {
+                "budget_violation": float("inf"),
+                "num_isolated": float("inf"),
+                "max_isolated_penalty": float("inf"),
+                "feasible": False,
+                "total_selected_new": 0,
+                "isolated_indices": [],
+            },
             "details": {"error": str(e)},
         }
 
@@ -551,6 +665,7 @@ def solve_sqa(
             - "time": float (wall-clock seconds).
             - "solver": "SQA".
             - "status": "OPTIMAL", "FEASIBLE", or "FAILED".
+            - "violations": dict from compute_violations().
             - "details": dict with num_reads, num_sweeps, trotter, response_info.
     """
     try:
@@ -603,6 +718,14 @@ def solve_sqa(
                 "time": time.time() - start_time,
                 "solver": "SQA",
                 "status": "FAILED",
+                "violations": {
+                    "budget_violation": float("inf"),
+                    "num_isolated": float("inf"),
+                    "max_isolated_penalty": float("inf"),
+                    "feasible": False,
+                    "total_selected_new": 0,
+                    "isolated_indices": [],
+                },
                 "details": {"error": str(e2)},
             }
     except Exception as e:
@@ -617,6 +740,14 @@ def solve_sqa(
             "time": time.time() - start_time,
             "solver": "SQA",
             "status": "FAILED",
+            "violations": {
+                "budget_violation": float("inf"),
+                "num_isolated": float("inf"),
+                "max_isolated_penalty": float("inf"),
+                "feasible": False,
+                "total_selected_new": 0,
+                "isolated_indices": [],
+            },
             "details": {"error": str(e)},
         }
 
@@ -645,12 +776,25 @@ def solve_sqa(
         # Compute MIQP energy (without penalties)
         miqp_energy = _compute_miqp_energy(x_full, pairwise_data)
 
+        # Compute violations
+        neighbors = pairwise_data.get("neighbors", {})
+        violations = compute_violations(
+            x_full=x_full,
+            free_indices=free_indices,
+            M_indices=M_indices,
+            neighbors=neighbors,
+            K_new=K_new,
+        )
+
         elapsed_time = time.time() - start_time
 
         if verbose:
             print(f"[SQA] Computed QUBO energy: {computed_energy:.8f}")
             print(f"[SQA] MIQP energy: {miqp_energy:.8f}")
             print(f"[SQA] Time: {elapsed_time:.4f}s")
+            print(f"[SQA] Violations: feasible={violations['feasible']}, "
+                  f"budget_err={violations['budget_violation']}, "
+                  f"isolated={violations['num_isolated']}")
 
         return {
             "solution": x_full,
@@ -659,6 +803,7 @@ def solve_sqa(
             "time": elapsed_time,
             "solver": "SQA",
             "status": "OPTIMAL",
+            "violations": violations,
             "details": {
                 "num_reads": num_reads,
                 "num_sweeps": num_sweeps,
@@ -680,6 +825,14 @@ def solve_sqa(
             "time": time.time() - start_time,
             "solver": "SQA",
             "status": "FAILED",
+            "violations": {
+                "budget_violation": float("inf"),
+                "num_isolated": float("inf"),
+                "max_isolated_penalty": float("inf"),
+                "feasible": False,
+                "total_selected_new": 0,
+                "isolated_indices": [],
+            },
             "details": {"error": str(e)},
         }
 
@@ -820,7 +973,15 @@ def solve_all_classical(
                 status_display = f"✅ {status}"
             else:
                 status_display = f"⚠️ {status}"
-            print(f"{name:8s} | {status_display:15s} | QUBO: {result['qubo_energy']:10.6f} | MIQP: {result['miqp_energy']:10.6f} | Time: {result['time']:.4f}s")
+            
+            # Show violation summary
+            v = result.get("violations", {})
+            feasible = v.get("feasible", False)
+            feasible_str = "✅" if feasible else "❌"
+            budget_err = v.get("budget_violation", "?")
+            isolated = v.get("num_isolated", "?")
+            
+            print(f"{name:8s} | {status_display:15s} | QUBO: {result['qubo_energy']:10.6f} | MIQP: {result['miqp_energy']:10.6f} | Time: {result['time']:.4f}s | Feasible: {feasible_str} | BudgetErr: {budget_err} | Isolated: {isolated}")
 
     return {
         "Greedy": greedy_result,
@@ -828,322 +989,15 @@ def solve_all_classical(
         "SQA": sqa_result,
     }
 
-# ============================================================================
-# QAOA SOLVER (PHASE 3.5) – FIXED VERSION
-# ============================================================================
 
-def _project_qubo_to_free_variables(
-    h: Dict[int, float],
-    J: Dict[Tuple[int, int], float],
-    constant: float,
-    M_indices: List[int],
-    free_indices: List[int],
-) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], float]:
-    """
-    Project QUBO onto free variables only (remove fixed M_indices).
+# -----------------------------------------------------------------------------
+# MODULE EXPORTS
+# -----------------------------------------------------------------------------
 
-    For fixed stations m ∈ M, x_m = 1. We absorb their contributions into
-    linear terms of free variables and update the constant.
-    """
-    M_set = set(M_indices)
-    free_set = set(free_indices)
-
-    const_proj = constant
-    h_proj = {}
-    for i in free_indices:
-        h_proj[i] = h.get(i, 0.0)
-
-    # Absorb fixed stations
-    for m in M_indices:
-        const_proj += h.get(m, 0.0)
-        for i in free_indices:
-            if m < i:
-                j_coeff = J.get((m, i), 0.0)
-            else:
-                j_coeff = J.get((i, m), 0.0)
-            if j_coeff != 0:
-                h_proj[i] = h_proj.get(i, 0.0) + j_coeff
-
-    # Fixed-fixed quadratic terms to constant
-    for idx_m, m in enumerate(M_indices):
-        for n in M_indices[idx_m + 1:]:
-            if m < n:
-                const_proj += J.get((m, n), 0.0)
-            else:
-                const_proj += J.get((n, m), 0.0)
-
-    # Quadratic terms (only free-free)
-    J_proj = {}
-    for (i, j), coeff in J.items():
-        if i in free_set and j in free_set:
-            J_proj[(i, j)] = coeff
-
-    return h_proj, J_proj, const_proj
-
-
-def _qubo_to_ising(h, J, constant, n_qubits):
-    """Convert QUBO to Ising Hamiltonian (INCLUDES CONSTANT)."""
-    from qiskit.quantum_info import SparsePauliOp
-    
-    pauli_list = []
-    
-    # Linear terms
-    for i, coeff in h.items():
-        if i >= n_qubits:
-            continue
-        z_list = ['I'] * n_qubits
-        z_list[i] = 'Z'
-        pauli_list.append((''.join(z_list), -coeff / 2.0))
-    
-    # Quadratic terms
-    for (i, j), coeff in J.items():
-        if i >= n_qubits or j >= n_qubits:
-            continue
-        z_i_list = ['I'] * n_qubits
-        z_i_list[i] = 'Z'
-        pauli_list.append((''.join(z_i_list), -coeff / 4.0))
-        z_j_list = ['I'] * n_qubits
-        z_j_list[j] = 'Z'
-        pauli_list.append((''.join(z_j_list), -coeff / 4.0))
-        z_ij_list = ['I'] * n_qubits
-        z_ij_list[i] = 'Z'
-        z_ij_list[j] = 'Z'
-        pauli_list.append((''.join(z_ij_list), coeff / 4.0))
-    
-    # Combine
-    combined = {}
-    for pauli_str, coeff in pauli_list:
-        combined[pauli_str] = combined.get(pauli_str, 0.0) + coeff
-    
-    # Constant term (THIS IS THE FIX)
-    ising_const = constant
-    for i, coeff in h.items():
-        if i < n_qubits:
-            ising_const += coeff / 2.0
-    for (i, j), coeff in J.items():
-        if i < n_qubits and j < n_qubits:
-            ising_const += coeff / 4.0
-    
-    # Build SparsePauliOp
-    if combined:
-        pauli_strings = list(combined.keys())
-        coeffs = list(combined.values())
-        ham = SparsePauliOp.from_list(list(zip(pauli_strings, coeffs)))
-    else:
-        ham = SparsePauliOp.from_list([('I' * n_qubits, 0.0)])
-    
-    return ham, ising_const
-
-
-def _qaoa_objective(
-    params: np.ndarray,
-    qaoa: Any,
-    ham: Any,
-) -> float:
-    """Compute QAOA expectation value (without constant)."""
-    from qiskit.quantum_info import Statevector
-    circuit = qaoa.assign_parameters(params)
-    state = Statevector.from_instruction(circuit)
-    return state.expectation_value(ham).real
-
-
-def _qaoa_state_to_binary(
-    state: Any,
-    n_qubits: int,
-    verbose: bool = False,
-) -> np.ndarray:
-    """
-    Extract binary solution from QAOA statevector.
-    Uses the MOST LIKELY bitstring (mode of probability distribution).
-    """
-    probs = state.probabilities()
-    
-    # Find the bitstring with highest probability
-    best_state_int = int(np.argmax(probs))
-    
-    # Convert to bitstring (LSB first, like Qiskit)
-    binary = np.zeros(n_qubits, dtype=int)
-    for q in range(n_qubits):
-        binary[q] = (best_state_int >> q) & 1
-    
-    if verbose:
-        print(f"    Probabilities (top 4): {[(i, probs[i]) for i in np.argsort(probs)[-4:][::-1]]}")
-        print(f"    Most likely: state {best_state_int} (binary: {binary}), prob={probs[best_state_int]:.6f}")
-    
-    return binary
-
-
-def solve_qaoa(
-    h: Dict[int, float],
-    J: Dict[Tuple[int, int], float],
-    constant: float,
-    K_new: int,
-    free_indices: List[int],
-    M_indices: List[int],
-    N_total: int,
-    pairwise_data: Dict,
-    p: int = 1,
-    maxiter: Optional[int] = None,
-    warm_start: Optional[np.ndarray] = None,
-    seed: Optional[int] = None,
-    verbose: bool = False,
-) -> Dict[str, Any]:
-    """
-    Solve QUBO using QAOA with Statevector exact simulation.
-
-    Args:
-        ... (same as before)
-        warm_start: Optional binary array for free variables (length n_qubits)
-                    to initialize QAOA parameters from (not used in this version).
-    """
-    try:
-        from qiskit.quantum_info import Statevector
-        from qiskit.circuit.library import QAOAAnsatz
-        from scipy.optimize import minimize
-    except ImportError as e:
-        if verbose:
-            print(f"[QAOA] Import error: {e}")
-        return {
-            "solution": np.zeros(N_total, dtype=int),
-            "qubo_energy": float("inf"),
-            "miqp_energy": float("inf"),
-            "time": 0.0,
-            "solver": f"QAOA(p={p})",
-            "status": "FAILED",
-            "details": {"error": f"Missing import: {e}", "p": p},
-        }
-
-    start_time = time.time()
-    if verbose:
-        print(f"\n[QAOA] p={p}, maxiter={maxiter}")
-        if seed is not None:
-            print(f"[QAOA] Seed: {seed}")
-
-    # Project to free variables
-    h_proj, J_proj, const_proj = _project_qubo_to_free_variables(
-        h, J, constant, M_indices, free_indices
-    )
-    n_qubits = len(free_indices)
-
-    if n_qubits == 0:
-        return {"solution": np.zeros(N_total, dtype=int), "qubo_energy": float("inf"),
-                "miqp_energy": float("inf"), "time": 0.0,
-                "solver": f"QAOA(p={p})", "status": "FAILED",
-                "details": {"error": "No free variables.", "p": p}}
-
-    if maxiter is None:
-        maxiter = 100 + (p - 1) * 80
-
-    if verbose:
-        print(f"[QAOA] n_qubits={n_qubits}, maxiter={maxiter}")
-
-    if n_qubits > 20:
-        warnings.warn(f"[QAOA] n_qubits={n_qubits} > 20. Statevector simulation may be slow.")
-
-    if seed is not None:
-        np.random.seed(seed)
-
-    # Build Hamiltonian (constant removed)
-    ham, _ = _qubo_to_ising(h_proj, J_proj, 0.0, n_qubits)
-    if verbose:
-        print(f"[QAOA] Hamiltonian: {len(ham.paulis)} Pauli terms")
-
-    # Build QAOAAnsatz
-    qaoa = QAOAAnsatz(cost_operator=ham, reps=p)
-    if verbose:
-        print(f"[QAOA] QAOAAnsatz: {qaoa.num_parameters} params, {qaoa.num_qubits} qubits")
-
-    # Initial parameters (random)
-    initial_params = np.random.randn(qaoa.num_parameters) * 0.1
-    if verbose:
-        print(f"[QAOA] Initial params: {initial_params}")
-
-    # Objective (without constant)
-    def objective(params):
-        return _qaoa_objective(params, qaoa, ham)
-
-    # Warm start: if warm_start is provided, we could set initial params accordingly
-    # (For simplicity, we keep random initialization; but we'll add support if needed.)
-
-    # Optimize
-    try:
-        result = minimize(objective, initial_params, method='COBYLA',
-                          options={'maxiter': maxiter, 'tol': 1e-6})
-        best_params = result.x
-        best_obj = result.fun
-        nfev = result.nfev
-        success = result.success
-        if verbose:
-            print(f"[QAOA] COBYLA finished: success={success}, nfev={nfev}, final objective={best_obj:.6f}")
-    except Exception as e:
-        if verbose:
-            print(f"[QAOA] Optimization failed: {e}")
-        return {
-            "solution": np.zeros(N_total, dtype=int),
-            "qubo_energy": float("inf"),
-            "miqp_energy": float("inf"),
-            "time": time.time() - start_time,
-            "solver": f"QAOA(p={p})",
-            "status": "FAILED",
-            "details": {"error": str(e), "p": p},
-        }
-
-    # Extract binary solution
-    try:
-        best_circuit = qaoa.assign_parameters(best_params)
-        best_state = Statevector.from_instruction(best_circuit)
-        binary_free = _qaoa_state_to_binary(best_state, n_qubits, verbose=verbose)
-        if verbose:
-            print(f"[QAOA] Binary (free): {binary_free}")
-
-        x_full = np.zeros(N_total, dtype=int)
-        for m in M_indices:
-            x_full[m] = 1
-        for pos, idx in enumerate(free_indices):
-            if pos < len(binary_free) and binary_free[pos]:
-                x_full[idx] = 1
-
-        selected_new = [i for i in range(N_total) if x_full[i] == 1 and i not in M_indices]
-        if verbose:
-            print(f"[QAOA] Selected new: {selected_new}")
-
-    except Exception as e:
-        if verbose:
-            print(f"[QAOA] Extraction failed: {e}")
-        return {
-            "solution": np.zeros(N_total, dtype=int),
-            "qubo_energy": float("inf"),
-            "miqp_energy": float("inf"),
-            "time": time.time() - start_time,
-            "solver": f"QAOA(p={p})",
-            "status": "FAILED",
-            "details": {"error": str(e), "p": p},
-        }
-
-    # Compute final energies (full QUBO and MIQP)
-    qubo_energy = _compute_qubo_energy(x_full, h, J, constant)
-    miqp_energy = _compute_miqp_energy(x_full, pairwise_data)
-
-    elapsed = time.time() - start_time
-    if verbose:
-        print(f"[QAOA] QUBO energy: {qubo_energy:.6f}")
-        print(f"[QAOA] MIQP energy: {miqp_energy:.6f}")
-        print(f"[QAOA] Time: {elapsed:.2f}s")
-
-    return {
-        "solution": x_full,
-        "qubo_energy": qubo_energy,
-        "miqp_energy": miqp_energy,
-        "time": elapsed,
-        "solver": f"QAOA(p={p})",
-        "status": "FEASIBLE" if success else "FEASIBLE",
-        "details": {
-            "p": p,
-            "maxiter": maxiter,
-            "nfev": nfev,
-            "success": success,
-            "final_objective": best_obj,
-            "seed": seed,
-            "n_qubits": n_qubits,
-        },
-    }
+__all__ = [
+    "compute_violations",
+    "solve_greedy",
+    "solve_sa",
+    "solve_sqa",
+    "solve_all_classical",
+]
