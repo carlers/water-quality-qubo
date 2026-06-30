@@ -1,7 +1,6 @@
 jijmodeling
 jijmodeling-transpiler
 openjij
-cvxpy
 numpy
 scipy
 matplotlib

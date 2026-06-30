@@ -881,54 +881,49 @@ def _project_qubo_to_free_variables(
     return h_proj, J_proj, const_proj
 
 
-def _qubo_to_ising(
-    h: Dict[int, float],
-    J: Dict[Tuple[int, int], float],
-    constant: float,
-    n_qubits: int,
-) -> Tuple[Any, float]:
-    """
-    Convert QUBO to Ising Hamiltonian. Returns (SparsePauliOp, ising_const).
-    The ising_const is returned as 0.0; the constant is not included in the
-    Hamiltonian to keep the landscape well-conditioned.
-    """
+def _qubo_to_ising(h, J, constant, n_qubits):
+    """Convert QUBO to Ising Hamiltonian (INCLUDES CONSTANT)."""
     from qiskit.quantum_info import SparsePauliOp
-
-    # We intentionally do NOT add the constant term to the Hamiltonian.
-    # The constant will be added back later when computing the final energy.
+    
     pauli_list = []
-
-    # Linear terms: h_i * (1 - Z_i)/2
+    
+    # Linear terms
     for i, coeff in h.items():
         if i >= n_qubits:
             continue
         z_list = ['I'] * n_qubits
         z_list[i] = 'Z'
         pauli_list.append((''.join(z_list), -coeff / 2.0))
-
-    # Quadratic terms: J_ij * (1 - Z_i)(1 - Z_j)/4
+    
+    # Quadratic terms
     for (i, j), coeff in J.items():
         if i >= n_qubits or j >= n_qubits:
             continue
-        # Z_i
         z_i_list = ['I'] * n_qubits
         z_i_list[i] = 'Z'
         pauli_list.append((''.join(z_i_list), -coeff / 4.0))
-        # Z_j
         z_j_list = ['I'] * n_qubits
         z_j_list[j] = 'Z'
         pauli_list.append((''.join(z_j_list), -coeff / 4.0))
-        # Z_i Z_j
         z_ij_list = ['I'] * n_qubits
         z_ij_list[i] = 'Z'
         z_ij_list[j] = 'Z'
         pauli_list.append((''.join(z_ij_list), coeff / 4.0))
-
-    # Combine terms with same Pauli string
+    
+    # Combine
     combined = {}
     for pauli_str, coeff in pauli_list:
         combined[pauli_str] = combined.get(pauli_str, 0.0) + coeff
-
+    
+    # Constant term (THIS IS THE FIX)
+    ising_const = constant
+    for i, coeff in h.items():
+        if i < n_qubits:
+            ising_const += coeff / 2.0
+    for (i, j), coeff in J.items():
+        if i < n_qubits and j < n_qubits:
+            ising_const += coeff / 4.0
+    
     # Build SparsePauliOp
     if combined:
         pauli_strings = list(combined.keys())
@@ -936,9 +931,8 @@ def _qubo_to_ising(
         ham = SparsePauliOp.from_list(list(zip(pauli_strings, coeffs)))
     else:
         ham = SparsePauliOp.from_list([('I' * n_qubits, 0.0)])
-
-    # Return ising_const = 0.0 (we'll add constant later)
-    return ham, 0.0
+    
+    return ham, ising_const
 
 
 def _qaoa_objective(
