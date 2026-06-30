@@ -600,7 +600,7 @@ def build_qubo_manual(
     # ------------------------------------------------------------------------
     # Linear: -2 * lambda1 * K
     for i in free_indices:
-        add_linear(i, -2.0 * lambda1 * K_new)
+        add_linear(i, lambda1 * (1.0 - 2.0 * K_new))
 
     # Quadratic: 2 * lambda1 for each pair (i, j)
     for idx_i, i in enumerate(free_indices):
