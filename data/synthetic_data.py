@@ -315,6 +315,59 @@ def select_existing_stations(
     indices = rng.choice(n_total, size=n_existing, replace=False).tolist()
     return indices
 
+def select_existing_stations_clustered(
+    coords: np.ndarray,
+    utility: np.ndarray,
+    n_existing: int,
+    max_distance: float = 10.0,  # km, to ensure they aren't scattered too far
+    seed: Optional[int] = None,
+) -> List[int]:
+    """
+    Select existing stations that are spatially coherent (clustered).
+
+    Strategy: Pick the highest-utility point as an anchor, then greedily add
+    the next highest-utility point within max_distance of any already selected point.
+    This mimics real-world historical deployment (they start near pollution sources).
+    """
+    rng = np.random.RandomState(seed if seed is not None else RANDOM_SEED)
+    n_total = coords.shape[0]
+    
+    # Start with the single highest utility site
+    anchor_idx = int(np.argmax(utility))
+    selected = [anchor_idx]
+    
+    # If n_existing is 1, return early
+    if n_existing == 1:
+        return selected
+    
+    # Greedily add the best utility point within max_distance of the current cluster
+    for _ in range(1, n_existing):
+        # Calculate distances from all points to the current cluster
+        dists = cdist(coords, coords[selected]).min(axis=1)
+        
+        # Create a mask: points not selected and within max_distance
+        mask = (dists <= max_distance) & (~np.isin(np.arange(n_total), selected))
+        
+        # If no points are within max_distance, relax the constraint (fallback to random)
+        if not np.any(mask):
+            warnings.warn(
+                f"No points within {max_distance} km. Falling back to random selection for station {_+1}."
+            )
+            candidates = [i for i in range(n_total) if i not in selected]
+            if not candidates:
+                break
+            # Pick random from remaining
+            new_idx = rng.choice(candidates)
+            selected.append(int(new_idx))
+            continue
+        
+        # Among the valid points, pick the one with the highest utility
+        valid_indices = np.where(mask)[0]
+        best_idx = valid_indices[np.argmax(utility[valid_indices])]
+        selected.append(int(best_idx))
+    
+    return selected
+
 
 def save_master_data(
     coords: np.ndarray,
@@ -548,7 +601,7 @@ def generate_and_save_all(
     print(f"✓ Utility: shape {utility.shape}, range [{utility.min():.3f}, {utility.max():.3f}]")
 
     # Step 4: Select existing stations M
-    existing_indices = select_existing_stations(n_existing, n_master, seed)
+    existing_indices = select_existing_stations_clustered(coords, utility, n_existing, seed=seed)
     print(f"✓ Existing stations (M): {existing_indices}")
 
     # Step 5: Create nested subsets using FPS starting from center
