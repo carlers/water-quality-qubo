@@ -319,7 +319,7 @@ def select_existing_stations_clustered(
     coords: np.ndarray,
     utility: np.ndarray,
     n_existing: int,
-    max_distance: float = 10.0,  # km, to ensure they aren't scattered too far
+    max_distance: float = 10.0,
     seed: Optional[int] = None,
 ) -> List[int]:
     """
@@ -328,15 +328,32 @@ def select_existing_stations_clustered(
     Strategy: Pick the highest-utility point as an anchor, then greedily add
     the next highest-utility point within max_distance of any already selected point.
     This mimics real-world historical deployment (they start near pollution sources).
+
+    Args:
+        coords: (N, 2) array of coordinates.
+        utility: (N,) array of utility scores.
+        n_existing: Number of existing stations to select.
+        max_distance: Maximum distance (km) for a station to be considered "in the cluster".
+        seed: Random seed for tie-breaking.
+
+    Returns:
+        List of indices (length n_existing).
     """
     rng = np.random.RandomState(seed if seed is not None else RANDOM_SEED)
     n_total = coords.shape[0]
+    
+    if n_existing > n_total:
+        raise ValueError(
+            f"n_existing ({n_existing}) cannot exceed n_total ({n_total})."
+        )
+    
+    if n_existing == 0:
+        return []
     
     # Start with the single highest utility site
     anchor_idx = int(np.argmax(utility))
     selected = [anchor_idx]
     
-    # If n_existing is 1, return early
     if n_existing == 1:
         return selected
     
@@ -348,7 +365,7 @@ def select_existing_stations_clustered(
         # Create a mask: points not selected and within max_distance
         mask = (dists <= max_distance) & (~np.isin(np.arange(n_total), selected))
         
-        # If no points are within max_distance, relax the constraint (fallback to random)
+        # If no points are within max_distance, relax the constraint
         if not np.any(mask):
             warnings.warn(
                 f"No points within {max_distance} km. Falling back to random selection for station {_+1}."
@@ -356,18 +373,16 @@ def select_existing_stations_clustered(
             candidates = [i for i in range(n_total) if i not in selected]
             if not candidates:
                 break
-            # Pick random from remaining
             new_idx = rng.choice(candidates)
             selected.append(int(new_idx))
             continue
         
-        # Among the valid points, pick the one with the highest utility
+        # Among valid points, pick the one with highest utility
         valid_indices = np.where(mask)[0]
         best_idx = valid_indices[np.argmax(utility[valid_indices])]
         selected.append(int(best_idx))
     
     return selected
-
 
 def save_master_data(
     coords: np.ndarray,
@@ -545,6 +560,7 @@ def generate_and_save_all(
     n_master: Optional[int] = None,
     domain_size: Optional[float] = None,
     n_existing: Optional[int] = None,
+    max_existing_distance: Optional[float] = 10.0,  # <-- NEW PARAMETER
     subset_sizes: Optional[List[int]] = None,
 ) -> Dict:
     """
@@ -601,7 +617,7 @@ def generate_and_save_all(
     print(f"✓ Utility: shape {utility.shape}, range [{utility.min():.3f}, {utility.max():.3f}]")
 
     # Step 4: Select existing stations M
-    existing_indices = select_existing_stations_clustered(coords, utility, n_existing, seed=seed)
+    existing_indices = select_existing_stations_clustered(coords, utility, n_existing, max_existing_distance, seed=seed)
     print(f"✓ Existing stations (M): {existing_indices}")
 
     # Step 5: Create nested subsets using FPS starting from center
@@ -636,6 +652,7 @@ def generate_and_save_all(
             "start_idx": start_idx,
             "description": "Synthetic dataset for water quality monitoring QUBO.",
             "created_with_seed": seed,
+            "max_existing_distance": max_existing_distance,  # <-- LOG IT
         },
     )
 
@@ -697,6 +714,12 @@ def parse_args():
         help="Number of existing stations M."
     )
     parser.add_argument(
+        "--max_existing_distance",  # <-- NEW ARGUMENT
+        type=float, 
+        default=10.0,
+        help="Maximum cluster distance (km) for existing stations. Default: 10.0"
+    )
+    parser.add_argument(
         "--subset_sizes", 
         type=str, 
         default=None,
@@ -720,7 +743,7 @@ if __name__ == "__main__":
     
     # Parse seed
     if args.seed.lower() == "random":
-        seed = int(time.time() * 1000) % 1000000  # Use current time as seed
+        seed = int(time.time() * 1000) % 1000000
         print(f"Using random seed: {seed}")
     else:
         seed = int(args.seed)
@@ -738,5 +761,6 @@ if __name__ == "__main__":
         n_master=args.n_master,
         domain_size=args.domain_size,
         n_existing=args.n_existing,
+        max_existing_distance=args.max_existing_distance,  # <-- PASS IT
         subset_sizes=subset_sizes,
     )
