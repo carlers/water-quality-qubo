@@ -950,18 +950,27 @@ def _qaoa_objective(
 def _qaoa_state_to_binary(
     state: Any,
     n_qubits: int,
-    threshold: float = 0.5,
     verbose: bool = False,
 ) -> np.ndarray:
+    """
+    Extract binary solution from QAOA statevector.
+    Uses the MOST LIKELY bitstring (mode of probability distribution).
+    """
     probs = state.probabilities()
-    p1 = np.zeros(n_qubits)
-    for state_int, prob in enumerate(probs):
-        for q in range(n_qubits):
-            if (state_int >> q) & 1:
-                p1[q] += prob
+    
+    # Find the bitstring with highest probability
+    best_state_int = int(np.argmax(probs))
+    
+    # Convert to bitstring (LSB first, like Qiskit)
+    binary = np.zeros(n_qubits, dtype=int)
+    for q in range(n_qubits):
+        binary[q] = (best_state_int >> q) & 1
+    
     if verbose:
-        print(f"    Marginal P(1): {p1}")
-    return (p1 >= threshold).astype(int)
+        print(f"    Probabilities (top 4): {[(i, probs[i]) for i in np.argsort(probs)[-4:][::-1]]}")
+        print(f"    Most likely: state {best_state_int} (binary: {binary}), prob={probs[best_state_int]:.6f}")
+    
+    return binary
 
 
 def solve_qaoa(
