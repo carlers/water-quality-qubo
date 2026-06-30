@@ -4,6 +4,7 @@ openjij
 numpy
 scipy
 gurobipy
+optuna
 matplotlib
 seaborn
 pandas
