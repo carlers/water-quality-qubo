@@ -443,7 +443,7 @@ def solve_greedy(
 
 
 # -----------------------------------------------------------------------------
-# SOLVER: SIMULATED ANNEALING (SA)
+# SOLVER: SIMULATED ANNEALING (SA) with custom schedule support
 # -----------------------------------------------------------------------------
 
 def solve_sa(
@@ -457,6 +457,7 @@ def solve_sa(
     pairwise_data: Dict,
     num_reads: int = 100,
     num_sweeps: int = 1000,
+    schedule: Optional[List] = None,
     seed: Optional[int] = None,
     verbose: bool = False,
 ) -> Dict[str, Any]:
@@ -473,7 +474,10 @@ def solve_sa(
         N_total: Total number of candidates.
         pairwise_data: Output from compute_pairwise_terms() (for MIQP energy).
         num_reads: Number of annealing runs.
-        num_sweeps: Number of sweeps per run.
+        num_sweeps: Number of sweeps per run (ignored if schedule is provided).
+        schedule: Optional custom annealing schedule as list of [beta, steps] or (beta, steps)
+                  pairs, where beta = inverse temperature. If provided, num_sweeps is ignored.
+                  Example: [[0.1, 10], [1.0, 20], [5.0, 20], [10.0, 10]]
         seed: Random seed for reproducibility.
         verbose: Print progress.
 
@@ -486,7 +490,7 @@ def solve_sa(
             - "solver": "SA".
             - "status": "OPTIMAL", "FEASIBLE", or "FAILED".
             - "violations": dict from compute_violations().
-            - "details": dict with num_reads, num_sweeps, response_info.
+            - "details": dict with num_reads, num_sweeps (or schedule), response_info.
     """
     try:
         import openjij as oj
@@ -496,7 +500,11 @@ def solve_sa(
     start_time = time.time()
 
     if verbose:
-        print(f"\n[SA] num_reads={num_reads}, num_sweeps={num_sweeps}")
+        print(f"\n[SA] num_reads={num_reads}")
+        if schedule is not None:
+            print(f"[SA] Custom schedule: {schedule}")
+        else:
+            print(f"[SA] num_sweeps={num_sweeps}")
         if seed is not None:
             print(f"[SA] Seed: {seed}")
 
@@ -506,12 +514,22 @@ def solve_sa(
     # Run SA
     try:
         sampler = oj.SASampler()
-        response = sampler.sample_qubo(
-            Q,
-            num_reads=num_reads,
-            num_sweeps=num_sweeps,
-            seed=seed,
-        )
+        if schedule is not None:
+            # Convert to list of tuples (beta, steps)
+            schedule_converted = [(float(beta), int(steps)) for beta, steps in schedule]
+            response = sampler.sample_qubo(
+                Q,
+                num_reads=num_reads,
+                schedule=schedule_converted,
+                seed=seed,
+            )
+        else:
+            response = sampler.sample_qubo(
+                Q,
+                num_reads=num_reads,
+                num_sweeps=num_sweeps,
+                seed=seed,
+            )
     except Exception as e:
         if verbose:
             print(f"[SA] ERROR: {e}")
@@ -590,7 +608,8 @@ def solve_sa(
             "violations": violations,
             "details": {
                 "num_reads": num_reads,
-                "num_sweeps": num_sweeps,
+                "num_sweeps": num_sweeps if schedule is None else None,
+                "schedule": schedule,
                 "seed": seed,
                 "response_info": getattr(response, "info", {}),
             },
