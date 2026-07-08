@@ -620,25 +620,17 @@ def build_qubo_manual(
     for i in free_indices:
         add_linear(i, lambda2)
 
-    # Quadratic: -lambda2 for each (i, j) where j is in N_i AND j is free
-    # For fixed neighbors, they contribute to linear: -lambda2 * x_i (since x_j = 1)
+    # Quadratic: -lambda2 for each encounter.
+    # Because the neighborhood graph is mutual, each free-free pair is encountered 
+    # twice (once at i, once at j), correctly accumulating to -2 * lambda2.
     for i in free_indices:
-        if i not in neighbors:
-            continue
-        for j in neighbors[i]:
+       if i not in neighbors:
+           continue
+       for j in neighbors[i]:
             if j in M_indices:
-                # j is fixed: contributes -lambda2 * x_i
                 add_linear(i, -lambda2)
             elif j in free_indices and i != j:
-                # both free: contributes -lambda2 * x_i * x_j
-                # We only add once when i < j to maintain symmetry
-                if i < j:
-                    add_quad(i, j, -lambda2)
-                else:
-                    # i > j, we add when i < j, so skip this direction.
-                    # But we need to ensure it's added. Let's use a simpler approach:
-                    # Add directly with min/max ordering
-                    add_quad(i, j, -lambda2)
+                add_quad(i, j, -lambda2)
 
     if verbose:
         print(f"[QUBO_Manual] Built: {len(h)} linear, {len(J)} quadratic, constant={constant:.4f}")
