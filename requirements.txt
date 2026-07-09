@@ -1,13 +1,22 @@
-jijmodeling
-jijmodeling-transpiler
-openjij
-numpy
-scipy
-gurobipy
-optuna
-matplotlib
-seaborn
-pandas
+# Core scientific stack (compatible versions)
+numpy>=1.24,<3.0
+scipy>=1.9
+pandas>=2.0,<4.0
+matplotlib>=3.5
+seaborn>=0.12
+
+# Optimization & Quantum
+openjij>=0.3
+jijmodeling>=0.2
+jijmodeling-transpiler>=0.2
+optuna>=3.0
+gurobipy>=10.0
+
+# Quantum computing
 qiskit>=0.45
 qiskit-optimization
-qiskit-aer>=0.13.0        # <-- ADD THIS (required for Sampler/Estimator)
+qiskit-aer>=0.13.0
+
+# Utilities
+packaging
+tqdm
