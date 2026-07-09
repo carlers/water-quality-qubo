@@ -1,5 +1,5 @@
 # Core scientific stack (compatible versions)
-numpy>=1.24,<3.0
+numpy>=1.24,<2.0
 scipy>=1.9
 pandas>=2.0,<4.0
 matplotlib>=3.5
