@@ -487,22 +487,29 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
 
 def plot_convergence_profile(best_sharpen, convergence_data, GUROBI_MIQP,
                              save_path, dpi=100):
-    """
-    Generate convergence profile plot.
-    
-    Args:
-        best_sharpen: Best sharpening result dict
-        convergence_data: Dict of convergence data from sharpening
-        GUROBI_MIQP: Gurobi baseline MIQP value
-        save_path: Path to save the plot
-        dpi: Resolution
-    """
     conv_key = f"trial_{best_sharpen['trial']}_run_{best_sharpen['run']}"
     conv_data = convergence_data.get(conv_key)
     
     if conv_data is None:
-        print("  ⚠️ No convergence data available")
+        print(f"  ⚠️ No convergence data for key: {conv_key}")
+        print(f"  Available keys: {list(convergence_data.keys())[:5]}...")
         return
+    
+    cumulative = conv_data['cumulative_best']
+    
+    # DEBUG
+    print(f"\n  🔍 CONVERGENCE PLOT DEBUG:")
+    print(f"    Key: {conv_key}")
+    print(f"    Cumulative length: {len(cumulative)}")
+    clean = [x for x in cumulative if x != float('inf')]
+    print(f"    Feasible samples: {len(clean)}/{len(cumulative)}")
+    if len(clean) > 0:
+        print(f"    First 5: {clean[:5]}")
+        print(f"    Last 5: {clean[-5:]}")
+        print(f"    Min: {min(clean):.6f}, Max: {max(clean):.6f}")
+        print(f"    GUROBI_MIQP: {GUROBI_MIQP:.6f}")
+        sqrs = [x / GUROBI_MIQP for x in clean]
+        print(f"    SQR range: [{min(sqrs):.6f}, {max(sqrs):.6f}]")
     
     fig, ax1 = plt.subplots(1, 1, figsize=(10, 6))
     cumulative = conv_data['cumulative_best']
