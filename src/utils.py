@@ -206,147 +206,69 @@ def build_config(seed, test_mode, **kwargs):
 # 5. SPEARMAN CORRELATION COMPUTATION
 # ============================================================================
 
-def compute_spearman_correlation(study, validation_results, pairwise, K_new, 
-                                  M_indices, free_indices, neighbors, N_total,
-                                  GUROBI_MIQP, VAL_READS, VAL_SEED,
-                                  verbose=True):
+def compute_spearman_correlation(study, validation_results, verbose=True):
     """
-    Compute stratified Spearman correlation between tuning and validation.
+    Compute Spearman correlation between tuning scores and validation SQRs.
+    
+    Uses the existing validation results (no need to re-run SA).
     
     Args:
         study: Optuna study object
-        validation_results: List of validation results
-        pairwise: Pairwise data from compute_pairwise_terms()
-        K_new: Number of new stations
-        M_indices: Existing station indices
-        free_indices: Free variable indices
-        neighbors: Neighbor dict from pairwise
-        N_total: Total number of candidates
-        GUROBI_MIQP: Gurobi baseline MIQP value
-        VAL_READS: Number of reads per validation trial
-        VAL_SEED: Seed for validation
+        validation_results: List of validation results from Phase 2
         verbose: Print progress
     
     Returns:
         dict with 'rho', 'p', 'n', 'significant' or None if insufficient data
     """
-    from src.model import build_qubo, compute_energy
-    from src.solvers import compute_violations
-    
     trials_df = study.trials_dataframe()
     trials_df['trial_number'] = trials_df.index
     
-    can_run = (
-        'user_attrs_score' in trials_df.columns and
-        not trials_df['user_attrs_score'].isna().all() and
-        trials_df['user_attrs_score'].max() > 0.0 and
-        len(trials_df) > 5
-    )
-    
-    if not can_run:
+    # Check if we have tunable trials
+    if 'user_attrs_score' not in trials_df.columns or trials_df['user_attrs_score'].isna().all():
         if verbose:
-            print("  ⚠️ Skipping Spearman correlation (insufficient feasible trials).")
+            print("  ⚠️ Skipping Spearman correlation (no tuning scores found).")
         return None
     
-    all_trials_df = trials_df[trials_df['user_attrs_score'].notna()]
-    all_trials_df = all_trials_df.sort_values('user_attrs_score', ascending=False)
-    all_trials_df['trial_number'] = all_trials_df.index
-    n_total = len(all_trials_df)
+    # Build mapping: trial_number -> tuning_score
+    tuning_scores = {}
+    for _, row in trials_df.iterrows():
+        tn = row['trial_number']
+        if not pd.isna(row.get('user_attrs_score', np.nan)):
+            tuning_scores[tn] = row['user_attrs_score']
+    
+    # Build mapping: trial_number -> validation best_sqr
+    validation_sqrs = {}
+    for val in validation_results:
+        trial_num = val.get('trial')
+        best_sqr = val.get('best_sqr')
+        if trial_num is not None and trial_num >= 0 and best_sqr is not None and not np.isnan(best_sqr):
+            validation_sqrs[trial_num] = best_sqr
+    
+    # Find trials that have both tuning and validation scores
+    common_trials = set(tuning_scores.keys()) & set(validation_sqrs.keys())
+    
+    if len(common_trials) < 3:
+        if verbose:
+            print(f"  ⚠️ Insufficient common trials (need > 2, got {len(common_trials)}). Skipping Spearman.")
+        return None
     
     if verbose:
-        print(f"  Total trials with score: {n_total}")
-        print(f"  Stratified sample: Top 10, Middle 10, Bottom 10")
+        print(f"  Computing Spearman on {len(common_trials)} validated trials...")
     
-    # Stratified sampling
-    SPEARMAN_TOP_N = 10
-    SPEARMAN_MID_N = 10
-    SPEARMAN_BOT_N = 10
-    
-    top_sample = all_trials_df.head(SPEARMAN_TOP_N)
-    mid_start = max(0, n_total // 2 - SPEARMAN_MID_N // 2)
-    mid_end = min(n_total, mid_start + SPEARMAN_MID_N)
-    mid_sample = all_trials_df.iloc[mid_start:mid_end]
-    bot_sample = all_trials_df.tail(SPEARMAN_BOT_N)
-    stratified_df = pd.concat([top_sample, mid_sample, bot_sample])
-    
-    def validate_trial(trial_num):
-        """Run validation for a single trial."""
-        row = all_trials_df[all_trials_df['trial_number'] == trial_num].iloc[0]
-        lam1 = row['params_lam1']
-        lam2 = row['params_lam2']
-        beta_min = row['params_beta_min']
-        beta_max = row['params_beta_max']
-        sweeps = int(row['user_attrs_num_sweeps_actual'])
-        steps = int(row['user_attrs_num_steps_actual'])
-        power = row['params_cooling_power']
-        
-        qubo = build_qubo(pairwise, K_new, lam1, lam2, use_jijmodeling=False, verbose=False)
-        h, J, constant = qubo['h'], qubo['J'], qubo['constant']
-        Q = {(i, i): coeff for i, coeff in h.items()}
-        for (i, j), coeff in J.items():
-            Q[(i, j)] = coeff
-        
-        progress = np.linspace(0.0, 1.0, steps) ** power
-        betas = beta_min + (beta_max - beta_min) * progress
-        sweeps_per_step = sweeps // steps
-        schedule = [[float(b), sweeps_per_step] for b in betas]
-        remaining = sweeps - (steps * sweeps_per_step)
-        if remaining > 0:
-            schedule[-1][1] += remaining
-        
-        try:
-            import openjij as oj
-            sampler = oj.SASampler()
-            response = sampler.sample_qubo(Q, num_reads=VAL_READS, schedule=schedule, seed=VAL_SEED)
-        except:
-            return np.nan
-        
-        miqp_list = []
-        for i in range(response.record.shape[0]):
-            sample_arr = response.record['sample'][i]
-            x_full = np.zeros(N_total, dtype=int)
-            for m in M_indices:
-                x_full[m] = 1
-            for var_idx, val in zip(response.indices, sample_arr):
-                if var_idx < N_total:
-                    x_full[var_idx] = int(round(val))
-            viol = compute_violations(x_full, free_indices, M_indices, neighbors, K_new)
-            if viol['feasible']:
-                miqp = compute_energy(x_full, pairwise, K_new, lambda1=None, lambda2=None)
-                miqp_list.append(miqp)
-        
-        if not miqp_list:
-            return np.nan
-        return np.mean(miqp_list) / GUROBI_MIQP
-    
-    # Compute validation SQRs for stratified trials
-    stratified_sqrs = []
-    stratified_scores = []
-    
-    for _, row in stratified_df.iterrows():
-        trial_num = int(row['trial_number'])
-        tuning_score = row['user_attrs_score']
-        existing = next((r for r in validation_results if r['trial'] == trial_num), None)
-        if existing:
-            val_sqr = existing['best_sqr']
-        else:
-            val_sqr = validate_trial(trial_num)
-        if not np.isnan(val_sqr):
-            stratified_sqrs.append(val_sqr)
-            stratified_scores.append(tuning_score)
-    
-    if len(stratified_sqrs) <= 2:
-        if verbose:
-            print(f"  ⚠️ Not enough valid results (need > 2, got {len(stratified_sqrs)})")
-        return None
+    # Extract paired scores
+    scores_list = []
+    sqrs_list = []
+    for trial_num in common_trials:
+        scores_list.append(tuning_scores[trial_num])
+        sqrs_list.append(validation_sqrs[trial_num])
     
     # Compute Spearman correlation
-    spearman_rho, spearman_p = stats.spearmanr(stratified_scores, stratified_sqrs)
+    spearman_rho, spearman_p = stats.spearmanr(scores_list, sqrs_list)
     
     if verbose:
-        print(f"\n  Spearman ρ (tuning best vs validation best): {spearman_rho:.4f}")
-        print(f"  P-value:                                    {spearman_p:.4f}")
-        print(f"  N:                                          {len(stratified_sqrs)}")
+        print(f"\n  Spearman ρ (tuning score vs validation SQR): {spearman_rho:.4f}")
+        print(f"  P-value:                                      {spearman_p:.4f}")
+        print(f"  N:                                            {len(common_trials)}")
         
         if spearman_p < 0.05:
             print(f"  ✓ Statistically significant (p < 0.05)")
@@ -365,10 +287,9 @@ def compute_spearman_correlation(study, validation_results, pairwise, K_new,
     return {
         'rho': float(spearman_rho),
         'p': float(spearman_p),
-        'n': int(len(stratified_sqrs)),
+        'n': int(len(common_trials)),
         'significant': bool(spearman_p < 0.05)
     }
-
 
 # ============================================================================
 # 6. CHAMPION EXTRACTION
