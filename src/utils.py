@@ -11,6 +11,9 @@ This module provides:
     5. Spearman correlation computation
     6. Champion extraction
     7. Plotting functions (validation grid, convergence, deployment)
+    8. Optuna posterior plots (save only)
+    9. Sensitivity analysis plot (save only)
+    10. Display saved plots (display only)
 
 All functions preserve verbose logging and error handling.
 """
@@ -419,7 +422,7 @@ def get_solutions_for_params(trials, pairwise, K_new, M_indices, N_total, seed=4
 
 
 # ============================================================================
-# 8. PLOTTING FUNCTIONS
+# 8. PLOTTING FUNCTIONS (GENERATE ONLY - NO plt.show())
 # ============================================================================
 
 def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
@@ -427,6 +430,8 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
                          save_path, dpi=100):
     """
     Generate 2x2 validation grid comparing Gurobi vs Top 3.
+    
+    Saves to disk only. Does NOT display inline.
     
     Args:
         coords: (N, 2) array of coordinates
@@ -481,12 +486,24 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
     fig.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.5, -0.02), ncol=3, fontsize=10)
     plt.tight_layout(rect=[0, 0.03, 1, 1])
     plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
-    plt.show()
+    # ✅ REMOVED: plt.show()
     plt.close(fig)
 
 
 def plot_convergence_profile(best_sharpen, convergence_data, GUROBI_MIQP,
                              save_path, dpi=100):
+    """
+    Generate convergence profile plot.
+    
+    Saves to disk only. Does NOT display inline.
+    
+    Args:
+        best_sharpen: Best sharpening result dict
+        convergence_data: Dict of convergence data from sharpening
+        GUROBI_MIQP: Gurobi baseline MIQP value
+        save_path: Path to save the plot
+        dpi: Resolution
+    """
     conv_key = f"trial_{best_sharpen['trial']}_run_{best_sharpen['run']}"
     conv_data = convergence_data.get(conv_key)
     
@@ -543,7 +560,7 @@ def plot_convergence_profile(best_sharpen, convergence_data, GUROBI_MIQP,
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
-    plt.show()
+    # ✅ REMOVED: plt.show()
     plt.close(fig)
 
 
@@ -553,6 +570,8 @@ def plot_final_deployment(coords, U, best_solution, M_indices, selected_new,
                           save_path, dpi=100):
     """
     Generate final deployment plot with utility landscape.
+    
+    Saves to disk only. Does NOT display inline.
     
     Args:
         coords: (N, 2) array of coordinates
@@ -658,29 +677,192 @@ def plot_final_deployment(coords, U, best_solution, M_indices, selected_new,
     
     plt.tight_layout(rect=[0, 0, 0.68, 1])
     plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
-    plt.show()
+    # ✅ REMOVED: plt.show()
     plt.close(fig)
 
 
+# ============================================================================
+# 9. OPTUNA POSTERIOR PLOTS (SAVE ONLY)
+# ============================================================================
+
+def save_optuna_plots(study, seed_dir, dpi=150):
+    """
+    Generate and save Optuna posterior plots.
+    
+    Saves to disk only. Does NOT display inline.
+    
+    Args:
+        study: Optuna study object
+        seed_dir: Directory to save plots
+        dpi: Resolution
+    """
+    print("\n" + "-" * 70)
+    print("📊 Generating Optuna posterior plots...")
+    print("-" * 70)
+    
+    if study is None or len(study.trials) < 5:
+        print("  ⚠️ Insufficient trials (<5). Skipping Optuna plots.")
+        return
+    
+    try:
+        from optuna.visualization.matplotlib import plot_param_importances, plot_parallel_coordinate, plot_slice
+        
+        def save_optuna_plot(plot_func, save_path, *args, **kwargs):
+            """
+            Call an Optuna matplotlib plotting function and save the result robustly.
+            
+            Handles:
+                - Figure objects directly
+                - Axes objects (extract .figure)
+                - ndarray of Axes (extract figure from first element)
+                - Generic fallback
+            """
+            result = plot_func(*args, **kwargs)
+            
+            # Determine the figure
+            fig = None
+            if hasattr(result, 'savefig'):          # It's a Figure
+                fig = result
+            elif hasattr(result, 'figure'):          # It's an Axes
+                fig = result.figure
+            elif isinstance(result, np.ndarray):
+                # Assume it's an array of Axes; get figure from the first one
+                if len(result) > 0 and hasattr(result[0], 'figure'):
+                    fig = result[0].figure
+            
+            # Fallback: try generic methods
+            if fig is None:
+                if hasattr(result, 'get_figure'):
+                    fig = result.get_figure()
+                elif hasattr(result, 'fig'):
+                    fig = result.fig
+            
+            if fig is None:
+                raise ValueError(f"Could not extract figure from result of type {type(result)}")
+            
+            fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+            plt.close(fig)
+            print(f"  ✓ {save_path.name}")
+
+        # Generate all three plots using the helper
+        save_optuna_plot(plot_param_importances, seed_dir / "optuna_param_importance.png", study)
+        save_optuna_plot(plot_parallel_coordinate, seed_dir / "optuna_parallel_coordinate.png", study)
+        save_optuna_plot(plot_slice, seed_dir / "optuna_slice.png", study)
+
+        # Learning curve (custom)
+        best_values = [t.value for t in study.trials if t.value is not None]
+        if best_values:
+            cumulative_best = np.minimum.accumulate(best_values)
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(range(1, len(cumulative_best)+1), cumulative_best, 'b-', linewidth=2)
+            ax.set_xlabel('Trial Number')
+            ax.set_ylabel('Best Objective (1 - score)')
+            ax.set_title(f'Optuna Learning Curve')
+            ax.grid(True, alpha=0.3)
+            fig.savefig(seed_dir / "optuna_learning_curve.png", dpi=dpi, bbox_inches='tight')
+            plt.close(fig)
+            print("  ✓ optuna_learning_curve.png")
+
+        print("  ✅ Optuna posterior plots complete.")
+
+    except ImportError as e:
+        print(f"  ⚠️ optuna.visualization.matplotlib not available: {e}")
+        print("  (Skipping Optuna plots)")
+    except Exception as e:
+        print(f"  ⚠️ Optuna plotting failed: {e}")
+
+
+# ============================================================================
+# 10. SENSITIVITY ANALYSIS PLOT (SAVE ONLY)
+# ============================================================================
+
+def save_sensitivity_plot(results_df, baseline_sqr, seed_dir, dpi=150):
+    """
+    Generate and save hyperparameter sensitivity analysis plot.
+    
+    Saves to disk only. Does NOT display inline.
+    
+    Args:
+        results_df: Pandas DataFrame with columns ['param', 'fraction', 'best_sqr', 'feas_rate']
+        baseline_sqr: Champion SQR (for horizontal line)
+        seed_dir: Directory to save the plot
+        dpi: Resolution
+    """
+    print("\n" + "-" * 70)
+    print("📊 Generating sensitivity analysis plot...")
+    print("-" * 70)
+    
+    if results_df is None or len(results_df) == 0:
+        print("  ⚠️ No sensitivity results to plot.")
+        return
+    
+    params = ['lam1', 'lam2', 'beta_min', 'beta_max', 'num_sweeps', 'cooling_power']
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    axes_flat = axes.flatten()
+    
+    for i, param in enumerate(params):
+        ax = axes_flat[i]
+        subset = results_df[results_df['param'] == param]
+        if len(subset) > 0:
+            # Plot SQR vs fraction
+            ax.plot(subset['fraction'], subset['best_sqr'], 'o-', linewidth=2, color='blue', markersize=8)
+            # Add feasibility as text annotations
+            for _, row in subset.iterrows():
+                ax.annotate(f"{row['feas_rate']*100:.0f}%",
+                            (row['fraction'], row['best_sqr']),
+                            textcoords="offset points", xytext=(0, 8),
+                            ha='center', fontsize=8, color='gray')
+            # Horizontal line at champion SQR
+            ax.axhline(y=baseline_sqr, color='red', linestyle='--', alpha=0.7, label='Champion')
+            ax.set_xlabel('Fraction of champion value')
+            ax.set_ylabel('Best SQR')
+            ax.set_title(param)
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(0.75, 1.25)
+            if i == 0:
+                ax.legend()
+        else:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(param)
+    
+    plt.tight_layout()
+    plt.savefig(seed_dir / "sensitivity_analysis.png", dpi=dpi, bbox_inches='tight')
+    # ✅ REMOVED: plt.show()
+    plt.close(fig)
+    print("  ✅ sensitivity_analysis.png")
+
+
+# ============================================================================
+# 11. DISPLAY SAVED PLOTS (DISPLAY ONLY)
+# ============================================================================
+
 def display_saved_plots(seed_dir):
-    """Display all three saved plots from a completed seed."""
+    """
+    Display all saved plots from a completed seed.
+    
+    Reads PNGs from disk and renders them inline. Does NOT generate or save.
+    
+    Args:
+        seed_dir: Directory containing the saved plot files
+    """
     print("\n" + "-" * 70)
     print(f"📊 DISPLAYING SAVED PLOTS (mode: {seed_dir.parent.name}/{seed_dir.name})")
     print("-" * 70)
     
     plots = [
-      # 1. Optuna posterior plots (Phase 1)
-      ("optuna_param_importance.png", "Optuna: Parameter Importance"),
-      ("optuna_parallel_coordinate.png", "Optuna: Parallel Coordinate"),
-      ("optuna_slice.png", "Optuna: Slice Plots"),
-      ("optuna_learning_curve.png", "Optuna: Learning Curve"),
-      # 2. Final visualization plots (existing)
-      ("phase2_validation_2x2.png", "2×2 Validation Grid (Gurobi + Top 3)"),
-      ("phase3_convergence.png", "Convergence Profile (Best Sharpening Run)"),
-      ("phase3_deployment_solution.png", "Final Deployment Solution"),
-      # 3. Sensitivity analysis (Phase 4)
-      ("sensitivity_analysis.png", "Hyperparameter Sensitivity Analysis"),
-  ]
+        # 1. Optuna posterior plots (Phase 1)
+        ("optuna_param_importance.png", "Optuna: Parameter Importance"),
+        ("optuna_parallel_coordinate.png", "Optuna: Parallel Coordinate"),
+        ("optuna_slice.png", "Optuna: Slice Plots"),
+        ("optuna_learning_curve.png", "Optuna: Learning Curve"),
+        # 2. Final visualization plots
+        ("phase2_validation_2x2.png", "2×2 Validation Grid (Gurobi + Top 3)"),
+        ("phase3_convergence.png", "Convergence Profile (Best Sharpening Run)"),
+        ("phase3_deployment_solution.png", "Final Deployment Solution"),
+        # 3. Sensitivity analysis (Phase 4)
+        ("sensitivity_analysis.png", "Hyperparameter Sensitivity Analysis"),
+    ]
     
     for filename, title in plots:
         filepath = seed_dir / filename
@@ -701,7 +883,7 @@ def display_saved_plots(seed_dir):
 
 
 # ============================================================================
-# 9. LOADED SEED SUMMARY
+# 12. LOADED SEED SUMMARY
 # ============================================================================
 
 def print_loaded_seed_summary(results, seed, mode):
@@ -787,7 +969,7 @@ def print_loaded_seed_summary(results, seed, mode):
 
 
 # ============================================================================
-# 10. DYNAMIC SUMMARY N
+# 13. DYNAMIC SUMMARY N
 # ============================================================================
 
 def get_summary_n(n_total, max_n=10):
@@ -811,7 +993,8 @@ def get_summary_n(n_total, max_n=10):
         return max(5, n_total // 5)
     else:
         return max_n
-    
+
+
 def cleanup_tqdm():
     """Clean up tqdm instances to prevent display clutter."""
     try:
@@ -822,7 +1005,7 @@ def cleanup_tqdm():
 
 
 # ============================================================================
-# 11. MODULE EXPORTS
+# 14. MODULE EXPORTS
 # ============================================================================
 
 __all__ = [
@@ -845,10 +1028,14 @@ __all__ = [
     'get_solution_for_params',
     'get_solutions_for_params',
     
-    # Plotting
+    # Plotting (generate)
     'plot_validation_grid',
     'plot_convergence_profile',
     'plot_final_deployment',
+    'save_optuna_plots',
+    'save_sensitivity_plot',
+    
+    # Plotting (display)
     'display_saved_plots',
     
     # Summary
