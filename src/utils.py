@@ -669,10 +669,18 @@ def display_saved_plots(seed_dir):
     print("-" * 70)
     
     plots = [
-        ("phase2_validation_2x2.png", "2×2 Validation Plot (Gurobi + Top 3)"),
-        ("phase3_convergence.png", "Convergence Profile (Best Sharpening Run)"),
-        ("phase3_deployment_solution.png", "Final Deployment Solution"),
-    ]
+      # 1. Optuna posterior plots (Phase 1)
+      ("optuna_param_importance.png", "Optuna: Parameter Importance"),
+      ("optuna_parallel_coordinate.png", "Optuna: Parallel Coordinate"),
+      ("optuna_slice.png", "Optuna: Slice Plots"),
+      ("optuna_learning_curve.png", "Optuna: Learning Curve"),
+      # 2. Final visualization plots (existing)
+      ("phase2_validation_2x2.png", "2×2 Validation Grid (Gurobi + Top 3)"),
+      ("phase3_convergence.png", "Convergence Profile (Best Sharpening Run)"),
+      ("phase3_deployment_solution.png", "Final Deployment Solution"),
+      # 3. Sensitivity analysis (Phase 4)
+      ("sensitivity_analysis.png", "Hyperparameter Sensitivity Analysis"),
+  ]
     
     for filename, title in plots:
         filepath = seed_dir / filename
