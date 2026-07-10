@@ -875,6 +875,14 @@ def get_summary_n(n_total, max_n=10):
         return max(5, n_total // 5)
     else:
         return max_n
+    
+def cleanup_tqdm():
+    """Clean up tqdm instances to prevent display clutter."""
+    try:
+        from tqdm import tqdm
+        tqdm._instances.clear()
+    except:
+        pass
 
 
 # ============================================================================
@@ -910,4 +918,5 @@ __all__ = [
     # Summary
     'print_loaded_seed_summary',
     'get_summary_n',
+    'cleanup_tqdm'
 ]
