@@ -8,6 +8,7 @@ This module provides:
     2. Simulated Annealing (SA) via OpenJij
     3. Simulated Quantum Annealing (SQA) via OpenJij
     4. Constraint violation metrics for debugging
+    5. Annealing schedule builder
 
 All solvers accept the same QUBO representation (h, J, constant) and return
 a standardized result dictionary for fair comparison.
@@ -30,6 +31,56 @@ import warnings
 from typing import Dict, List, Optional, Tuple, Union, Any
 
 import numpy as np
+
+# -----------------------------------------------------------------------------
+# ANNEALING SCHEDULE BUILDER
+# -----------------------------------------------------------------------------
+
+
+def build_schedule(
+    beta_min: float,
+    beta_max: float,
+    num_sweeps: int,
+    num_steps: int,
+    cooling_power: float,
+) -> List[List[float]]:
+    """
+    Build annealing schedule for SA/SQA.
+
+    Args:
+        beta_min: Initial inverse temperature.
+        beta_max: Final inverse temperature.
+        num_sweeps: Total number of sweeps.
+        num_steps: Number of schedule steps.
+        cooling_power: Power for temperature progression (0.5-3.0).
+
+    Returns:
+        List of [beta, sweeps_per_step] pairs.
+
+    Example:
+        schedule = build_schedule(0.01, 40.0, 15000, 120, 1.8)
+        # Returns [[0.01, 125], [0.02, 125], ...] where each step has 125 sweeps.
+    """
+    if num_steps <= 0:
+        raise ValueError("num_steps must be positive")
+    if num_sweeps <= 0:
+        raise ValueError("num_sweeps must be positive")
+    
+    # Progress from 0 to 1, then raised to cooling_power
+    progress = np.linspace(0.0, 1.0, num_steps) ** cooling_power
+    betas = beta_min + (beta_max - beta_min) * progress
+    
+    # Distribute sweeps evenly
+    sweeps_per_step = num_sweeps // num_steps
+    schedule = [[float(b), sweeps_per_step] for b in betas]
+    
+    # Add remaining sweeps to the last step
+    remaining = num_sweeps - (num_steps * sweeps_per_step)
+    if remaining > 0:
+        schedule[-1][1] += remaining
+    
+    return schedule
+
 
 # -----------------------------------------------------------------------------
 # CONSTRAINT VIOLATION METRICS
@@ -443,7 +494,7 @@ def solve_greedy(
 
 
 # -----------------------------------------------------------------------------
-# SOLVER: SIMULATED ANNEALING (SA) with custom schedule support
+# SOLVER: SIMULATED ANNEALING (SA) with return_all support
 # -----------------------------------------------------------------------------
 
 def solve_sa(
@@ -456,9 +507,9 @@ def solve_sa(
     N_total: int,
     pairwise_data: Dict,
     num_reads: int = 100,
-    num_sweeps: int = 1000,
     schedule: Optional[List] = None,
     seed: Optional[int] = None,
+    return_all: bool = False,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -474,23 +525,26 @@ def solve_sa(
         N_total: Total number of candidates.
         pairwise_data: Output from compute_pairwise_terms() (for MIQP energy).
         num_reads: Number of annealing runs.
-        num_sweeps: Number of sweeps per run (ignored if schedule is provided).
         schedule: Optional custom annealing schedule as list of [beta, steps] or (beta, steps)
                   pairs, where beta = inverse temperature. If provided, num_sweeps is ignored.
                   Example: [[0.1, 10], [1.0, 20], [5.0, 20], [10.0, 10]]
         seed: Random seed for reproducibility.
+        return_all: If True, also return a list of all samples with their MIQP energies
+                    and violations (useful for feasibility rate computation).
         verbose: Print progress.
 
     Returns:
         Dict with keys:
-            - "solution": np.ndarray of length N_total (binary).
-            - "qubo_energy": float (with penalties).
-            - "miqp_energy": float (without penalties, for SQR).
+            - "solution": np.ndarray of length N_total (binary) of the best feasible solution.
+            - "qubo_energy": float (with penalties) of the best solution.
+            - "miqp_energy": float (without penalties) of the best solution.
             - "time": float (wall-clock seconds).
             - "solver": "SA".
             - "status": "OPTIMAL", "FEASIBLE", or "FAILED".
-            - "violations": dict from compute_violations().
-            - "details": dict with num_reads, num_sweeps (or schedule), response_info.
+            - "violations": dict from compute_violations() for the best solution.
+            - "details": dict with num_reads, schedule, seed, response_info.
+            - If return_all=True: "all_samples": List[Dict] with keys:
+                "solution", "miqp_energy", "violations", "qubo_energy", "is_feasible"
     """
     try:
         import openjij as oj
@@ -504,9 +558,11 @@ def solve_sa(
         if schedule is not None:
             print(f"[SA] Custom schedule: {schedule}")
         else:
-            print(f"[SA] num_sweeps={num_sweeps}")
+            print(f"[SA] Warning: No schedule provided; using OpenJij default.")
         if seed is not None:
             print(f"[SA] Seed: {seed}")
+        if return_all:
+            print(f"[SA] return_all=True: will return all samples.")
 
     # Build OpenJij QUBO dict
     Q = _build_openjij_dict(h, J, constant)
@@ -524,10 +580,10 @@ def solve_sa(
                 seed=seed,
             )
         else:
+            # Use default schedule
             response = sampler.sample_qubo(
                 Q,
                 num_reads=num_reads,
-                num_sweeps=num_sweeps,
                 seed=seed,
             )
     except Exception as e:
@@ -553,90 +609,91 @@ def solve_sa(
             "details": {"error": str(e)},
         }
 
-    # Extract best sample
-    try:
-        best_sample = response.first.sample
-        best_energy = response.first.energy
+    # --- Process all samples ---
+    all_samples = []
+    best_feasible_miqp = float('inf')
+    best_feasible_solution = None
+    best_feasible_violations = None
+    best_feasible_qubo = float('inf')
 
-        if verbose:
-            print(f"[SA] Best energy: {best_energy:.8f}")
-            print(f"[SA] Best sample: {best_sample}")
+    # Neighbors for violations
+    neighbors = pairwise_data.get("neighbors", {})
 
+    for idx in range(response.record.shape[0]):
+        sample_arr = response.record['sample'][idx]
         # Build full solution
-        x_full = _build_full_solution(best_sample, free_indices, M_indices, N_total)
+        x_full = np.zeros(N_total, dtype=int)
+        for m in M_indices:
+            x_full[m] = 1
+        for var_idx, val in zip(response.indices, sample_arr):
+            if var_idx < N_total:
+                x_full[var_idx] = int(round(val))
 
-        # Validate energy
-        computed_energy = _compute_qubo_energy(x_full, h, J, constant)
-        energy_diff = abs(computed_energy - best_energy)
+        # Compute violations and MIQP energy
+        viol = compute_violations(x_full, free_indices, M_indices, neighbors, K_new)
+        miqp = _compute_miqp_energy(x_full, pairwise_data)
+        qubo = _compute_qubo_energy(x_full, h, J, constant)
 
-        if energy_diff > 1e-6:
-            warnings.warn(
-                f"[SA] Energy mismatch: computed={computed_energy:.8f}, "
-                f"reported={best_energy:.8f}, diff={energy_diff:.2e}"
-            )
-
-        # Compute MIQP energy (without penalties)
-        miqp_energy = _compute_miqp_energy(x_full, pairwise_data)
-
-        # Compute violations
-        neighbors = pairwise_data.get("neighbors", {})
-        violations = compute_violations(
-            x_full=x_full,
-            free_indices=free_indices,
-            M_indices=M_indices,
-            neighbors=neighbors,
-            K_new=K_new,
-        )
-
-        elapsed_time = time.time() - start_time
-
-        if verbose:
-            print(f"[SA] Computed QUBO energy: {computed_energy:.8f}")
-            print(f"[SA] MIQP energy: {miqp_energy:.8f}")
-            print(f"[SA] Time: {elapsed_time:.4f}s")
-            print(f"[SA] Violations: feasible={violations['feasible']}, "
-                  f"budget_err={violations['budget_violation']}, "
-                  f"isolated={violations['num_isolated']}")
-
-        return {
-            "solution": x_full,
-            "qubo_energy": computed_energy,
-            "miqp_energy": miqp_energy,
-            "time": elapsed_time,
-            "solver": "SA",
-            "status": "OPTIMAL",
-            "violations": violations,
-            "details": {
-                "num_reads": num_reads,
-                "num_sweeps": num_sweeps if schedule is None else None,
-                "schedule": schedule,
-                "seed": seed,
-                "response_info": getattr(response, "info", {}),
-            },
+        sample_info = {
+            "solution": x_full.copy(),
+            "miqp_energy": miqp,
+            "qubo_energy": qubo,
+            "violations": viol,
+            "is_feasible": viol['feasible'],
         }
+        all_samples.append(sample_info)
 
-    except Exception as e:
+        # Track best feasible solution
+        if viol['feasible'] and miqp < best_feasible_miqp:
+            best_feasible_miqp = miqp
+            best_feasible_solution = x_full.copy()
+            best_feasible_violations = viol
+            best_feasible_qubo = qubo
+
+    # If no feasible solution, use the best overall (might be infeasible)
+    if best_feasible_solution is None:
+        # Fallback: use the sample with lowest MIQP (could be infeasible)
+        # Find the sample with minimum miqp
+        min_miqp_idx = min(range(len(all_samples)), key=lambda i: all_samples[i]['miqp_energy'])
+        best_sample = all_samples[min_miqp_idx]
+        best_feasible_solution = best_sample["solution"]
+        best_feasible_miqp = best_sample["miqp_energy"]
+        best_feasible_violations = best_sample["violations"]
+        best_feasible_qubo = best_sample["qubo_energy"]
         if verbose:
-            print(f"[SA] Extraction error: {e}")
-            import traceback
-            traceback.print_exc()
-        return {
-            "solution": np.zeros(N_total, dtype=int),
-            "qubo_energy": float("inf"),
-            "miqp_energy": float("inf"),
-            "time": time.time() - start_time,
-            "solver": "SA",
-            "status": "FAILED",
-            "violations": {
-                "budget_violation": float("inf"),
-                "num_isolated": float("inf"),
-                "max_isolated_penalty": float("inf"),
-                "feasible": False,
-                "total_selected_new": 0,
-                "isolated_indices": [],
-            },
-            "details": {"error": str(e)},
-        }
+            print("[SA] No feasible solution found; returning best overall (infeasible).")
+
+    elapsed_time = time.time() - start_time
+
+    if verbose:
+        print(f"[SA] Best MIQP energy: {best_feasible_miqp:.8f}")
+        print(f"[SA] Time: {elapsed_time:.4f}s")
+        print(f"[SA] Violations: feasible={best_feasible_violations['feasible']}, "
+              f"budget_err={best_feasible_violations['budget_violation']}, "
+              f"isolated={best_feasible_violations['num_isolated']}")
+
+    result = {
+        "solution": best_feasible_solution,
+        "qubo_energy": best_feasible_qubo,
+        "miqp_energy": best_feasible_miqp,
+        "time": elapsed_time,
+        "solver": "SA",
+        "status": "OPTIMAL" if best_feasible_violations['feasible'] else "FEASIBLE" if best_feasible_solution is not None else "FAILED",
+        "violations": best_feasible_violations,
+        "details": {
+            "num_reads": num_reads,
+            "schedule": schedule,
+            "seed": seed,
+            "response_info": getattr(response, "info", {}),
+            "feasible_count": sum(1 for s in all_samples if s['is_feasible']),
+            "total_samples": len(all_samples),
+        },
+    }
+
+    if return_all:
+        result["all_samples"] = all_samples
+
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -942,6 +999,11 @@ def solve_all_classical(
         verbose=verbose,
     )
 
+    # Build a default schedule for SA if not provided
+    # Use a simple geometric schedule: 100 steps, total sweeps = num_sweeps
+    # Here we use num_sweeps as total sweeps
+    schedule = build_schedule(0.01, 40.0, num_sweeps, 120, 1.8)
+
     # Run SA
     if verbose:
         print("\n" + "=" * 60)
@@ -955,7 +1017,7 @@ def solve_all_classical(
         N_total=N_total,
         pairwise_data=pairwise_data,
         num_reads=num_reads,
-        num_sweeps=num_sweeps,
+        schedule=schedule,
         seed=seed,
         verbose=verbose,
     )
@@ -1014,6 +1076,7 @@ def solve_all_classical(
 # -----------------------------------------------------------------------------
 
 __all__ = [
+    "build_schedule",
     "compute_violations",
     "solve_greedy",
     "solve_sa",
