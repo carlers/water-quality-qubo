@@ -5,7 +5,7 @@ Classical solvers for the water quality monitoring QUBO problem.
 
 This module provides:
     1. Greedy selection (simple top-K and marginal gain)
-    2. Simulated Annealing (SA) via OpenJij
+    2. Simulated Annealing (SA) via OpenJij with optional seed fix
     3. Simulated Quantum Annealing (SQA) via OpenJij
     4. Constraint violation metrics for debugging
     5. Annealing schedule builder
@@ -494,7 +494,7 @@ def solve_greedy(
 
 
 # -----------------------------------------------------------------------------
-# SOLVER: SIMULATED ANNEALING (SA) with return_all support
+# SOLVER: SIMULATED ANNEALING (SA) with return_all and seed fix support
 # -----------------------------------------------------------------------------
 
 def solve_sa(
@@ -510,6 +510,7 @@ def solve_sa(
     schedule: Optional[List] = None,
     seed: Optional[int] = None,
     return_all: bool = False,
+    use_seed_none: bool = True,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -528,9 +529,12 @@ def solve_sa(
         schedule: Optional custom annealing schedule as list of [beta, steps] or (beta, steps)
                   pairs, where beta = inverse temperature. If provided, num_sweeps is ignored.
                   Example: [[0.1, 10], [1.0, 20], [5.0, 20], [10.0, 10]]
-        seed: Random seed for reproducibility.
+        seed: Random seed for reproducibility (ignored if use_seed_none=True).
         return_all: If True, also return a list of all samples with their MIQP energies
                     and violations (useful for feasibility rate computation).
+        use_seed_none: If True (default), set seed=None in OpenJij to avoid the
+                       "identical reads" bug. If False, use the loop workaround
+                       with num_reads=1 and distinct seeds.
         verbose: Print progress.
 
     Returns:
@@ -560,140 +564,239 @@ def solve_sa(
         else:
             print(f"[SA] Warning: No schedule provided; using OpenJij default.")
         if seed is not None:
-            print(f"[SA] Seed: {seed}")
+            print(f"[SA] Provided seed: {seed}")
+        print(f"[SA] use_seed_none={use_seed_none}")
         if return_all:
             print(f"[SA] return_all=True: will return all samples.")
 
-    # Build OpenJij QUBO dict
-    Q = _build_openjij_dict(h, J, constant)
-
-    # Run SA
-    try:
-        sampler = oj.SASampler()
-        if schedule is not None:
-            # Convert to list of tuples (beta, steps)
-            schedule_converted = [(float(beta), int(steps)) for beta, steps in schedule]
-            response = sampler.sample_qubo(
-                Q,
-                num_reads=num_reads,
-                schedule=schedule_converted,
-                seed=seed,
-            )
-        else:
-            # Use default schedule
-            response = sampler.sample_qubo(
-                Q,
-                num_reads=num_reads,
-                seed=seed,
-            )
-    except Exception as e:
-        if verbose:
-            print(f"[SA] ERROR: {e}")
-            import traceback
-            traceback.print_exc()
-        return {
-            "solution": np.zeros(N_total, dtype=int),
-            "qubo_energy": float("inf"),
-            "miqp_energy": float("inf"),
-            "time": time.time() - start_time,
-            "solver": "SA",
-            "status": "FAILED",
-            "violations": {
-                "budget_violation": float("inf"),
-                "num_isolated": float("inf"),
-                "max_isolated_penalty": float("inf"),
-                "feasible": False,
-                "total_selected_new": 0,
-                "isolated_indices": [],
-            },
-            "details": {"error": str(e)},
-        }
-
-    # --- Process all samples ---
-    all_samples = []
-    best_feasible_miqp = float('inf')
-    best_feasible_solution = None
-    best_feasible_violations = None
-    best_feasible_qubo = float('inf')
-
-    # Neighbors for violations
     neighbors = pairwise_data.get("neighbors", {})
 
-    for idx in range(response.record.shape[0]):
-        sample_arr = response.record['sample'][idx]
-        # Build full solution
-        x_full = np.zeros(N_total, dtype=int)
-        for m in M_indices:
-            x_full[m] = 1
-        for var_idx, val in zip(response.indices, sample_arr):
-            if var_idx < N_total:
-                x_full[var_idx] = int(round(val))
-
-        # Compute violations and MIQP energy
-        viol = compute_violations(x_full, free_indices, M_indices, neighbors, K_new)
-        miqp = _compute_miqp_energy(x_full, pairwise_data)
-        qubo = _compute_qubo_energy(x_full, h, J, constant)
-
-        sample_info = {
-            "solution": x_full.copy(),
-            "miqp_energy": miqp,
-            "qubo_energy": qubo,
-            "violations": viol,
-            "is_feasible": viol['feasible'],
-        }
-        all_samples.append(sample_info)
-
-        # Track best feasible solution
-        if viol['feasible'] and miqp < best_feasible_miqp:
-            best_feasible_miqp = miqp
-            best_feasible_solution = x_full.copy()
-            best_feasible_violations = viol
-            best_feasible_qubo = qubo
-
-    # If no feasible solution, use the best overall (might be infeasible)
-    if best_feasible_solution is None:
-        # Fallback: use the sample with lowest MIQP (could be infeasible)
-        # Find the sample with minimum miqp
-        min_miqp_idx = min(range(len(all_samples)), key=lambda i: all_samples[i]['miqp_energy'])
-        best_sample = all_samples[min_miqp_idx]
-        best_feasible_solution = best_sample["solution"]
-        best_feasible_miqp = best_sample["miqp_energy"]
-        best_feasible_violations = best_sample["violations"]
-        best_feasible_qubo = best_sample["qubo_energy"]
+    # ------------------------------------------------------------------------
+    # Case 1: use_seed_none = True -> set seed=None, do a single call with num_reads
+    # ------------------------------------------------------------------------
+    if use_seed_none:
         if verbose:
-            print("[SA] No feasible solution found; returning best overall (infeasible).")
+            print("[SA] Using seed=None to avoid identical reads bug.")
+        Q = _build_openjij_dict(h, J, constant)
+        try:
+            sampler = oj.SASampler()
+            if schedule is not None:
+                schedule_converted = [(float(beta), int(steps)) for beta, steps in schedule]
+                response = sampler.sample_qubo(
+                    Q,
+                    num_reads=num_reads,
+                    schedule=schedule_converted,
+                    seed=None,  # <-- FIX: avoid fixed seed causing identical reads
+                )
+            else:
+                response = sampler.sample_qubo(
+                    Q,
+                    num_reads=num_reads,
+                    seed=None,
+                )
+        except Exception as e:
+            if verbose:
+                print(f"[SA] ERROR: {e}")
+                import traceback
+                traceback.print_exc()
+            return {
+                "solution": np.zeros(N_total, dtype=int),
+                "qubo_energy": float("inf"),
+                "miqp_energy": float("inf"),
+                "time": time.time() - start_time,
+                "solver": "SA",
+                "status": "FAILED",
+                "violations": {
+                    "budget_violation": float("inf"),
+                    "num_isolated": float("inf"),
+                    "max_isolated_penalty": float("inf"),
+                    "feasible": False,
+                    "total_selected_new": 0,
+                    "isolated_indices": [],
+                },
+                "details": {"error": str(e)},
+            }
 
-    elapsed_time = time.time() - start_time
+        # Process response as normal (same as original code)
+        all_samples = []
+        best_feasible_miqp = float('inf')
+        best_feasible_solution = None
+        best_feasible_violations = None
+        best_feasible_qubo = float('inf')
 
-    if verbose:
-        print(f"[SA] Best MIQP energy: {best_feasible_miqp:.8f}")
-        print(f"[SA] Time: {elapsed_time:.4f}s")
-        print(f"[SA] Violations: feasible={best_feasible_violations['feasible']}, "
-              f"budget_err={best_feasible_violations['budget_violation']}, "
-              f"isolated={best_feasible_violations['num_isolated']}")
+        for idx in range(response.record.shape[0]):
+            sample_arr = response.record['sample'][idx]
+            x_full = np.zeros(N_total, dtype=int)
+            for m in M_indices:
+                x_full[m] = 1
+            for var_idx, val in zip(response.indices, sample_arr):
+                if var_idx < N_total:
+                    x_full[var_idx] = int(round(val))
 
-    result = {
-        "solution": best_feasible_solution,
-        "qubo_energy": best_feasible_qubo,
-        "miqp_energy": best_feasible_miqp,
-        "time": elapsed_time,
-        "solver": "SA",
-        "status": "OPTIMAL" if best_feasible_violations['feasible'] else "FEASIBLE" if best_feasible_solution is not None else "FAILED",
-        "violations": best_feasible_violations,
-        "details": {
-            "num_reads": num_reads,
-            "schedule": schedule,
-            "seed": seed,
-            "response_info": getattr(response, "info", {}),
-            "feasible_count": sum(1 for s in all_samples if s['is_feasible']),
-            "total_samples": len(all_samples),
-        },
-    }
+            viol = compute_violations(x_full, free_indices, M_indices, neighbors, K_new)
+            miqp = _compute_miqp_energy(x_full, pairwise_data)
+            qubo = _compute_qubo_energy(x_full, h, J, constant)
 
-    if return_all:
-        result["all_samples"] = all_samples
+            sample_info = {
+                "solution": x_full.copy(),
+                "miqp_energy": miqp,
+                "qubo_energy": qubo,
+                "violations": viol,
+                "is_feasible": viol['feasible'],
+            }
+            all_samples.append(sample_info)
 
-    return result
+            if viol['feasible'] and miqp < best_feasible_miqp:
+                best_feasible_miqp = miqp
+                best_feasible_solution = x_full.copy()
+                best_feasible_violations = viol
+                best_feasible_qubo = qubo
+
+        if best_feasible_solution is None:
+            # fallback to best overall (lowest miqp)
+            best_sample = min(all_samples, key=lambda s: s['miqp_energy'])
+            best_feasible_solution = best_sample["solution"]
+            best_feasible_miqp = best_sample["miqp_energy"]
+            best_feasible_violations = best_sample["violations"]
+            best_feasible_qubo = best_sample["qubo_energy"]
+            if verbose:
+                print("[SA] No feasible solution found; returning best overall (infeasible).")
+
+        elapsed_time = time.time() - start_time
+        if verbose:
+            print(f"[SA] Best MIQP energy: {best_feasible_miqp:.8f}")
+            print(f"[SA] Time: {elapsed_time:.4f}s")
+            print(f"[SA] Violations: feasible={best_feasible_violations['feasible']}, "
+                  f"budget_err={best_feasible_violations['budget_violation']}, "
+                  f"isolated={best_feasible_violations['num_isolated']}")
+
+        result = {
+            "solution": best_feasible_solution,
+            "qubo_energy": best_feasible_qubo,
+            "miqp_energy": best_feasible_miqp,
+            "time": elapsed_time,
+            "solver": "SA",
+            "status": "OPTIMAL" if best_feasible_violations['feasible'] else "FEASIBLE" if best_feasible_solution is not None else "FAILED",
+            "violations": best_feasible_violations,
+            "details": {
+                "num_reads": num_reads,
+                "schedule": schedule,
+                "seed": seed,  # note: seed was ignored
+                "response_info": getattr(response, "info", {}),
+                "feasible_count": sum(1 for s in all_samples if s['is_feasible']),
+                "total_samples": len(all_samples),
+                "use_seed_none": True,
+            },
+        }
+        if return_all:
+            result["all_samples"] = all_samples
+        return result
+
+    # ------------------------------------------------------------------------
+    # Case 2: use_seed_none = False -> loop over seeds with num_reads=1
+    # ------------------------------------------------------------------------
+    else:
+        if verbose:
+            print("[SA] Using loop over distinct seeds to avoid identical reads bug.")
+        all_samples = []
+        # Use the provided seed if given, else start from a random base
+        base_seed = seed if seed is not None else 42
+        for i in range(num_reads):
+            seed_i = base_seed + i
+            Q = _build_openjij_dict(h, J, constant)
+            sampler = oj.SASampler()
+            try:
+                if schedule is not None:
+                    schedule_converted = [(float(beta), int(steps)) for beta, steps in schedule]
+                    response = sampler.sample_qubo(
+                        Q,
+                        num_reads=1,
+                        schedule=schedule_converted,
+                        seed=seed_i,
+                    )
+                else:
+                    response = sampler.sample_qubo(
+                        Q,
+                        num_reads=1,
+                        seed=seed_i,
+                    )
+            except Exception as e:
+                if verbose:
+                    print(f"[SA] ERROR at read {i}: {e}")
+                continue
+
+            # Extract the single sample
+            sample_arr = response.record['sample'][0]
+            x_full = np.zeros(N_total, dtype=int)
+            for m in M_indices:
+                x_full[m] = 1
+            for var_idx, val in zip(response.indices, sample_arr):
+                if var_idx < N_total:
+                    x_full[var_idx] = int(round(val))
+
+            viol = compute_violations(x_full, free_indices, M_indices, neighbors, K_new)
+            miqp = _compute_miqp_energy(x_full, pairwise_data)
+            qubo = _compute_qubo_energy(x_full, h, J, constant)
+
+            all_samples.append({
+                "solution": x_full.copy(),
+                "miqp_energy": miqp,
+                "qubo_energy": qubo,
+                "violations": viol,
+                "is_feasible": viol['feasible'],
+            })
+
+        # Now process all_samples
+        best_feasible_miqp = float('inf')
+        best_feasible_solution = None
+        best_feasible_violations = None
+        best_feasible_qubo = float('inf')
+        for sample in all_samples:
+            if sample['is_feasible'] and sample['miqp_energy'] < best_feasible_miqp:
+                best_feasible_miqp = sample['miqp_energy']
+                best_feasible_solution = sample['solution'].copy()
+                best_feasible_violations = sample['violations']
+                best_feasible_qubo = sample['qubo_energy']
+
+        if best_feasible_solution is None:
+            # fallback to best overall (lowest miqp)
+            best_sample = min(all_samples, key=lambda s: s['miqp_energy'])
+            best_feasible_solution = best_sample["solution"]
+            best_feasible_miqp = best_sample["miqp_energy"]
+            best_feasible_violations = best_sample["violations"]
+            best_feasible_qubo = best_sample["qubo_energy"]
+            if verbose:
+                print("[SA] No feasible solution found; returning best overall (infeasible).")
+
+        elapsed_time = time.time() - start_time
+        if verbose:
+            print(f"[SA] Best MIQP energy: {best_feasible_miqp:.8f}")
+            print(f"[SA] Time: {elapsed_time:.4f}s")
+            print(f"[SA] Violations: feasible={best_feasible_violations['feasible']}, "
+                  f"budget_err={best_feasible_violations['budget_violation']}, "
+                  f"isolated={best_feasible_violations['num_isolated']}")
+
+        result = {
+            "solution": best_feasible_solution,
+            "qubo_energy": best_feasible_qubo,
+            "miqp_energy": best_feasible_miqp,
+            "time": elapsed_time,
+            "solver": "SA",
+            "status": "OPTIMAL" if best_feasible_violations['feasible'] else "FEASIBLE" if best_feasible_solution is not None else "FAILED",
+            "violations": best_feasible_violations,
+            "details": {
+                "num_reads": num_reads,
+                "schedule": schedule,
+                "seed": seed,  # original seed provided
+                "response_info": {},
+                "feasible_count": sum(1 for s in all_samples if s['is_feasible']),
+                "total_samples": len(all_samples),
+                "use_seed_none": False,
+            },
+        }
+        if return_all:
+            result["all_samples"] = all_samples
+        return result
 
 
 # -----------------------------------------------------------------------------
@@ -927,6 +1030,7 @@ def solve_all_classical(
     num_sweeps: int = 1000,
     trotter: int = 32,
     seed: Optional[int] = None,
+    use_seed_none: bool = True,
     verbose: bool = True,
 ) -> Dict[str, Dict]:
     """
@@ -942,6 +1046,7 @@ def solve_all_classical(
         num_sweeps: Number of sweeps for SA/SQA.
         trotter: Trotter slices for SQA.
         seed: Random seed for reproducibility.
+        use_seed_none: If True, pass seed=None to OpenJij to avoid identical reads.
         verbose: Print progress.
 
     Returns:
@@ -1019,6 +1124,7 @@ def solve_all_classical(
         num_reads=num_reads,
         schedule=schedule,
         seed=seed,
+        use_seed_none=use_seed_none,
         verbose=verbose,
     )
 
