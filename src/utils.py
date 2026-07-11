@@ -423,9 +423,10 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions, top3_trials
                 fontsize=10, verticalalignment='top', horizontalalignment='right',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    # ------------------------------------------------------------------------
-    # INFO TEXT BOX BELOW PLOTS
-    # ------------------------------------------------------------------------
+    # =========================================================================
+    # INFO TEXT BOX BELOW PLOTS (ENHANCED)
+    # =========================================================================
+
     # Build info lines for each panel (Gurobi + 3 trials)
     info_lines = []
 
@@ -434,29 +435,43 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions, top3_trials
 
     # Trials
     for i, t in enumerate(top3_trials[:3]):
-        trial_str = f"Trial {t['trial']:4d}"
+        trial_num = t.get('trial', '?')
+        sqr = t.get('best_sqr', None)
+        feas = t.get('feas_rate', None)
         lam1 = t.get('lam1', None)
         lam2 = t.get('lam2', None)
-        feas = t.get('feas_rate', None)
-        sqr = t.get('best_sqr', None)
+        beta_min = t.get('beta_min', None)
+        beta_max = t.get('beta_max', None)
+        num_sweeps = t.get('num_sweeps', None)
+        num_steps = t.get('num_steps', None)
+        cooling_power = t.get('cooling_power', None)
 
-        # Format values with fallback
+        # Format all values
+        sqr_str = f"{sqr:.4f}" if isinstance(sqr, float) else "N/A"
+        feas_str = f"{feas*100:.1f}%" if isinstance(feas, float) else "N/A"
         lam1_str = f"{lam1:.4f}" if isinstance(lam1, float) else "N/A"
         lam2_str = f"{lam2:.4f}" if isinstance(lam2, float) else "N/A"
-        feas_str = f"{feas*100:.1f}%" if isinstance(feas, float) else "N/A"
-        sqr_str = f"{sqr:.4f}" if isinstance(sqr, float) else "N/A"
+        beta_min_str = f"{beta_min:.4f}" if isinstance(beta_min, float) else "N/A"
+        beta_max_str = f"{beta_max:.1f}" if isinstance(beta_max, float) else "N/A"
+        sweeps_str = str(num_sweeps) if isinstance(num_sweeps, (int, float)) else "N/A"
+        steps_str = str(num_steps) if isinstance(num_steps, (int, float)) else "N/A"
+        power_str = f"{cooling_power:.3f}" if isinstance(cooling_power, float) else "N/A"
 
-        line = (f"{trial_str}  λ₁={lam1_str}  λ₂={lam2_str}  "
-                f"Feas={feas_str}  SQR={sqr_str}")
+        line = (
+            f"Trial {trial_num:4d}  SQR={sqr_str}  Feas={feas_str}  "
+            f"λ₁={lam1_str}  λ₂={lam2_str}  "
+            f"β=[{beta_min_str}, {beta_max_str}]  "
+            f"Sweeps={sweeps_str}  Steps={steps_str}  Power={power_str}"
+        )
         info_lines.append(line)
 
     # Combine into a single multiline string
     info_text = "\n".join(info_lines)
 
-    # Place below the subplots
-    fig.text(0.5, 0.04, info_text, ha='center', va='bottom', fontsize=9,
-             bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9),
-             linespacing=1.5)
+    # Place below the subplots (adjust y position to accommodate more text)
+    fig.text(0.5, 0.04, info_text, ha='center', va='bottom', fontsize=8,
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9),
+            linespacing=1.3)
 
     # Legend for markers
     handles = [Patch(facecolor='red', edgecolor='black', label='New'),
