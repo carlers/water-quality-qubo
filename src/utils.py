@@ -14,8 +14,7 @@ This module provides:
     8. Optuna posterior plots (save only)
     9. Sensitivity analysis plot (save only)
     10. Display saved plots (display only)
-    11. Build annealing schedule (NEW in v4.15)
-    12. Get solution for params
+    11. Loaded seed summary
 
 All functions preserve verbose logging and error handling.
 """
@@ -362,132 +361,7 @@ def extract_top3_champions(validation_results, champion, sharpen_top_k=3):
 
 
 # ============================================================================
-# 7. BUILD ANNEALING SCHEDULE (NEW in v4.15)
-# ============================================================================
-
-def build_schedule(
-    beta_min: float,
-    beta_max: float,
-    num_sweeps: int,
-    num_steps: int,
-    cooling_power: float,
-) -> List[List[float]]:
-    """
-    Build annealing schedule for SA/SQA.
-
-    Args:
-        beta_min: Initial inverse temperature.
-        beta_max: Final inverse temperature.
-        num_sweeps: Total number of sweeps.
-        num_steps: Number of schedule steps.
-        cooling_power: Power for temperature progression (0.5-3.0).
-
-    Returns:
-        List of [beta, sweeps_per_step] pairs.
-
-    Example:
-        schedule = build_schedule(0.01, 40.0, 15000, 120, 1.8)
-        # Returns [[0.01, 125], [0.02, 125], ...] where each step has 125 sweeps.
-    """
-    if num_steps <= 0:
-        raise ValueError("num_steps must be positive")
-    if num_sweeps <= 0:
-        raise ValueError("num_sweeps must be positive")
-    
-    # Progress from 0 to 1, then raised to cooling_power
-    progress = np.linspace(0.0, 1.0, num_steps) ** cooling_power
-    betas = beta_min + (beta_max - beta_min) * progress
-    
-    # Distribute sweeps evenly
-    sweeps_per_step = num_sweeps // num_steps
-    schedule = [[float(b), sweeps_per_step] for b in betas]
-    
-    # Add remaining sweeps to the last step
-    remaining = num_sweeps - (num_steps * sweeps_per_step)
-    if remaining > 0:
-        schedule[-1][1] += remaining
-    
-    return schedule
-
-
-# ============================================================================
-# 8. GET SOLUTION FOR PARAMS
-# ============================================================================
-
-def get_solution_for_params(params, pairwise, K_new, M_indices, N_total, seed=42):
-    """
-    Run SA for a single set of parameters and return the best solution.
-    
-    Args:
-        params: Dict with lam1, lam2, beta_min, beta_max, num_sweeps, num_steps, cooling_power
-        pairwise: Pairwise data from compute_pairwise_terms()
-        K_new: Number of new stations
-        M_indices: Existing station indices
-        N_total: Total number of candidates
-        seed: Random seed
-    
-    Returns:
-        Binary solution vector of length N_total
-    """
-    from src.model import build_qubo
-    
-    lam1 = params['lam1']
-    lam2 = params['lam2']
-    beta_min = params['beta_min']
-    beta_max = params['beta_max']
-    sweeps = params['num_sweeps']
-    steps = params['num_steps']
-    power = params['cooling_power']
-    
-    qubo = build_qubo(pairwise, K_new, lam1, lam2, use_jijmodeling=False, verbose=False)
-    h, J, constant = qubo['h'], qubo['J'], qubo['constant']
-    Q = {(i, i): coeff for i, coeff in h.items()}
-    for (i, j), coeff in J.items():
-        Q[(i, j)] = coeff
-    
-    # Build schedule using the new function
-    schedule = build_schedule(beta_min, beta_max, sweeps, steps, power)
-    
-    try:
-        import openjij as oj
-        sampler = oj.SASampler()
-        response = sampler.sample_qubo(Q, num_reads=1, schedule=schedule, seed=seed)
-        best = response.first
-        x_sample = best.sample
-        x_full = np.zeros(N_total, dtype=int)
-        for m in M_indices:
-            x_full[m] = 1
-        for idx_val, val in x_sample.items():
-            if idx_val < N_total:
-                x_full[idx_val] = int(round(val))
-        return x_full
-    except:
-        x_full = np.zeros(N_total, dtype=int)
-        for m in M_indices:
-            x_full[m] = 1
-        return x_full
-
-
-def get_solutions_for_params(trials, pairwise, K_new, M_indices, N_total, seed=42):
-    """Get solutions for a list of trials."""
-    solutions = []
-    for trial in trials:
-        params = {
-            'lam1': trial['lam1'],
-            'lam2': trial['lam2'],
-            'beta_min': trial['beta_min'],
-            'beta_max': trial['beta_max'],
-            'num_sweeps': trial['num_sweeps'],
-            'num_steps': trial['num_steps'],
-            'cooling_power': trial['cooling_power'],
-        }
-        sol = get_solution_for_params(params, pairwise, K_new, M_indices, N_total, seed)
-        solutions.append(sol)
-    return solutions
-
-
-# ============================================================================
-# 9. PLOTTING FUNCTIONS (GENERATE ONLY - NO plt.show())
+# 7. PLOTTING FUNCTIONS (GENERATE ONLY - NO plt.show())
 # ============================================================================
 
 def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
@@ -744,7 +618,7 @@ def plot_final_deployment(coords, U, best_solution, M_indices, selected_new,
 
 
 # ============================================================================
-# 10. OPTUNA POSTERIOR PLOTS (SAVE ONLY)
+# 8. OPTUNA POSTERIOR PLOTS (SAVE ONLY)
 # ============================================================================
 
 def save_optuna_plots(study, seed_dir, dpi=150):
@@ -835,7 +709,7 @@ def save_optuna_plots(study, seed_dir, dpi=150):
 
 
 # ============================================================================
-# 11. SENSITIVITY ANALYSIS PLOT (SAVE ONLY)
+# 9. SENSITIVITY ANALYSIS PLOT (SAVE ONLY)
 # ============================================================================
 
 def save_sensitivity_plot(results_df, baseline_sqr, seed_dir, dpi=150):
@@ -895,7 +769,7 @@ def save_sensitivity_plot(results_df, baseline_sqr, seed_dir, dpi=150):
 
 
 # ============================================================================
-# 12. DISPLAY SAVED PLOTS (DISPLAY ONLY)
+# 10. DISPLAY SAVED PLOTS (DISPLAY ONLY)
 # ============================================================================
 
 def display_saved_plots(seed_dir):
@@ -944,7 +818,7 @@ def display_saved_plots(seed_dir):
 
 
 # ============================================================================
-# 13. LOADED SEED SUMMARY
+# 11. LOADED SEED SUMMARY
 # ============================================================================
 
 def print_loaded_seed_summary(results, seed, mode):
@@ -1030,7 +904,7 @@ def print_loaded_seed_summary(results, seed, mode):
 
 
 # ============================================================================
-# 14. DYNAMIC SUMMARY N
+# 12. DYNAMIC SUMMARY N
 # ============================================================================
 
 def get_summary_n(n_total, max_n=10):
@@ -1066,7 +940,7 @@ def cleanup_tqdm():
 
 
 # ============================================================================
-# 15. MODULE EXPORTS
+# 13. MODULE EXPORTS
 # ============================================================================
 
 __all__ = [
@@ -1086,11 +960,6 @@ __all__ = [
     # Computation
     'compute_spearman_correlation',
     'extract_top3_champions',
-    'get_solution_for_params',
-    'get_solutions_for_params',
-    
-    # Schedule builder (NEW)
-    'build_schedule',
     
     # Plotting (generate)
     'plot_validation_grid',
