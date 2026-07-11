@@ -14,6 +14,8 @@ This module provides:
     8. Optuna posterior plots (save only)
     9. Sensitivity analysis plot (save only)
     10. Display saved plots (display only)
+    11. Build annealing schedule (NEW in v4.15)
+    12. Get solution for params
 
 All functions preserve verbose logging and error handling.
 """
@@ -221,7 +223,12 @@ def compute_spearman_correlation(study, validation_results, verbose=True):
         verbose: Print progress
     
     Returns:
-        dict with 'rho', 'p', 'n', 'significant' or None if insufficient data
+        dict with keys:
+            'rho': float or None if insufficient data
+            'p': float or None if insufficient data
+            'n': int (number of common trials)
+            'significant': bool (True if p < 0.05)
+            'available': bool (True if correlation was computed)
     """
     trials_df = study.trials_dataframe()
     trials_df['trial_number'] = trials_df.index
@@ -230,7 +237,13 @@ def compute_spearman_correlation(study, validation_results, verbose=True):
     if 'user_attrs_score' not in trials_df.columns or trials_df['user_attrs_score'].isna().all():
         if verbose:
             print("  ⚠️ Skipping Spearman correlation (no tuning scores found).")
-        return None
+        return {
+            'rho': None,
+            'p': None,
+            'n': 0,
+            'significant': False,
+            'available': False
+        }
     
     # Build mapping: trial_number -> tuning_score
     tuning_scores = {}
@@ -253,7 +266,13 @@ def compute_spearman_correlation(study, validation_results, verbose=True):
     if len(common_trials) < 3:
         if verbose:
             print(f"  ⚠️ Insufficient common trials (need > 2, got {len(common_trials)}). Skipping Spearman.")
-        return None
+        return {
+            'rho': None,
+            'p': None,
+            'n': int(len(common_trials)),
+            'significant': False,
+            'available': False
+        }
     
     if verbose:
         print(f"  Computing Spearman on {len(common_trials)} validated trials...")
@@ -291,8 +310,10 @@ def compute_spearman_correlation(study, validation_results, verbose=True):
         'rho': float(spearman_rho),
         'p': float(spearman_p),
         'n': int(len(common_trials)),
-        'significant': bool(spearman_p < 0.05)
+        'significant': bool(spearman_p < 0.05),
+        'available': True
     }
+
 
 # ============================================================================
 # 6. CHAMPION EXTRACTION
@@ -341,7 +362,56 @@ def extract_top3_champions(validation_results, champion, sharpen_top_k=3):
 
 
 # ============================================================================
-# 7. GET SOLUTION FOR PARAMS
+# 7. BUILD ANNEALING SCHEDULE (NEW in v4.15)
+# ============================================================================
+
+def build_schedule(
+    beta_min: float,
+    beta_max: float,
+    num_sweeps: int,
+    num_steps: int,
+    cooling_power: float,
+) -> List[List[float]]:
+    """
+    Build annealing schedule for SA/SQA.
+
+    Args:
+        beta_min: Initial inverse temperature.
+        beta_max: Final inverse temperature.
+        num_sweeps: Total number of sweeps.
+        num_steps: Number of schedule steps.
+        cooling_power: Power for temperature progression (0.5-3.0).
+
+    Returns:
+        List of [beta, sweeps_per_step] pairs.
+
+    Example:
+        schedule = build_schedule(0.01, 40.0, 15000, 120, 1.8)
+        # Returns [[0.01, 125], [0.02, 125], ...] where each step has 125 sweeps.
+    """
+    if num_steps <= 0:
+        raise ValueError("num_steps must be positive")
+    if num_sweeps <= 0:
+        raise ValueError("num_sweeps must be positive")
+    
+    # Progress from 0 to 1, then raised to cooling_power
+    progress = np.linspace(0.0, 1.0, num_steps) ** cooling_power
+    betas = beta_min + (beta_max - beta_min) * progress
+    
+    # Distribute sweeps evenly
+    sweeps_per_step = num_sweeps // num_steps
+    schedule = [[float(b), sweeps_per_step] for b in betas]
+    
+    # Add remaining sweeps to the last step
+    remaining = num_sweeps - (num_steps * sweeps_per_step)
+    if remaining > 0:
+        schedule[-1][1] += remaining
+    
+    return schedule
+
+
+# ============================================================================
+# 8. GET SOLUTION FOR PARAMS
 # ============================================================================
 
 def get_solution_for_params(params, pairwise, K_new, M_indices, N_total, seed=42):
@@ -375,13 +445,8 @@ def get_solution_for_params(params, pairwise, K_new, M_indices, N_total, seed=42
     for (i, j), coeff in J.items():
         Q[(i, j)] = coeff
     
-    progress = np.linspace(0.0, 1.0, steps) ** power
-    betas = beta_min + (beta_max - beta_min) * progress
-    sweeps_per_step = sweeps // steps
-    schedule = [[float(b), sweeps_per_step] for b in betas]
-    remaining = sweeps - (steps * sweeps_per_step)
-    if remaining > 0:
-        schedule[-1][1] += remaining
+    # Build schedule using the new function
+    schedule = build_schedule(beta_min, beta_max, sweeps, steps, power)
     
     try:
         import openjij as oj
@@ -422,7 +487,7 @@ def get_solutions_for_params(trials, pairwise, K_new, M_indices, N_total, seed=4
 
 
 # ============================================================================
-# 8. PLOTTING FUNCTIONS (GENERATE ONLY - NO plt.show())
+# 9. PLOTTING FUNCTIONS (GENERATE ONLY - NO plt.show())
 # ============================================================================
 
 def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
@@ -486,7 +551,6 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
     fig.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.5, -0.02), ncol=3, fontsize=10)
     plt.tight_layout(rect=[0, 0.03, 1, 1])
     plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
-    # ✅ REMOVED: plt.show()
     plt.close(fig)
 
 
@@ -560,7 +624,6 @@ def plot_convergence_profile(best_sharpen, convergence_data, GUROBI_MIQP,
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
-    # ✅ REMOVED: plt.show()
     plt.close(fig)
 
 
@@ -677,12 +740,11 @@ def plot_final_deployment(coords, U, best_solution, M_indices, selected_new,
     
     plt.tight_layout(rect=[0, 0, 0.68, 1])
     plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
-    # ✅ REMOVED: plt.show()
     plt.close(fig)
 
 
 # ============================================================================
-# 9. OPTUNA POSTERIOR PLOTS (SAVE ONLY)
+# 10. OPTUNA POSTERIOR PLOTS (SAVE ONLY)
 # ============================================================================
 
 def save_optuna_plots(study, seed_dir, dpi=150):
@@ -773,7 +835,7 @@ def save_optuna_plots(study, seed_dir, dpi=150):
 
 
 # ============================================================================
-# 10. SENSITIVITY ANALYSIS PLOT (SAVE ONLY)
+# 11. SENSITIVITY ANALYSIS PLOT (SAVE ONLY)
 # ============================================================================
 
 def save_sensitivity_plot(results_df, baseline_sqr, seed_dir, dpi=150):
@@ -828,13 +890,12 @@ def save_sensitivity_plot(results_df, baseline_sqr, seed_dir, dpi=150):
     
     plt.tight_layout()
     plt.savefig(seed_dir / "sensitivity_analysis.png", dpi=dpi, bbox_inches='tight')
-    # ✅ REMOVED: plt.show()
     plt.close(fig)
     print("  ✅ sensitivity_analysis.png")
 
 
 # ============================================================================
-# 11. DISPLAY SAVED PLOTS (DISPLAY ONLY)
+# 12. DISPLAY SAVED PLOTS (DISPLAY ONLY)
 # ============================================================================
 
 def display_saved_plots(seed_dir):
@@ -883,7 +944,7 @@ def display_saved_plots(seed_dir):
 
 
 # ============================================================================
-# 12. LOADED SEED SUMMARY
+# 13. LOADED SEED SUMMARY
 # ============================================================================
 
 def print_loaded_seed_summary(results, seed, mode):
@@ -952,8 +1013,8 @@ def print_loaded_seed_summary(results, seed, mode):
     else:
         print(f"  Feasibility:           {feas_rate}")
     
-    # Spearman correlation - safe handling
-    if spearman and spearman.get('rho') is not None:
+    # Spearman correlation - safe handling with new dict structure
+    if spearman and spearman.get('available', False):
         print(f"  Spearman ρ:            {spearman['rho']:.4f}")
     else:
         print(f"  Spearman ρ:            N/A")
@@ -969,7 +1030,7 @@ def print_loaded_seed_summary(results, seed, mode):
 
 
 # ============================================================================
-# 13. DYNAMIC SUMMARY N
+# 14. DYNAMIC SUMMARY N
 # ============================================================================
 
 def get_summary_n(n_total, max_n=10):
@@ -1005,7 +1066,7 @@ def cleanup_tqdm():
 
 
 # ============================================================================
-# 14. MODULE EXPORTS
+# 15. MODULE EXPORTS
 # ============================================================================
 
 __all__ = [
@@ -1027,6 +1088,9 @@ __all__ = [
     'extract_top3_champions',
     'get_solution_for_params',
     'get_solutions_for_params',
+    
+    # Schedule builder (NEW)
+    'build_schedule',
     
     # Plotting (generate)
     'plot_validation_grid',
