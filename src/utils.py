@@ -364,20 +364,20 @@ def extract_top3_champions(validation_results, champion, sharpen_top_k=3):
 # 7. PLOTTING FUNCTIONS (GENERATE ONLY - NO plt.show())
 # ============================================================================
 
-def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
-                         top3_trials, M_indices, DOMAIN_SIZE,
-                         save_path, dpi=100):
+def plot_validation_grid(coords, U, gurobi_solution, top3_solutions, top3_trials,
+                         M_indices, DOMAIN_SIZE, save_path, dpi=100):
     """
     Generate 2x2 validation grid comparing Gurobi vs Top 3.
-    
-    Saves to disk only. Does NOT display inline.
-    
+    Adds a text box below the plots with hyperparameters and metrics.
+
     Args:
         coords: (N, 2) array of coordinates
         U: (N,) array of utility scores
         gurobi_solution: Binary vector from Gurobi
         top3_solutions: List of 3 binary solution vectors
-        top3_trials: List of 3 trial dicts with 'trial' and 'best_sqr'
+        top3_trials: List of 3 trial dicts. Must contain:
+            'trial', 'best_sqr', and optionally 'lam1', 'lam2', 'feas_rate'
+            If missing, will show 'N/A'.
         M_indices: Existing station indices
         DOMAIN_SIZE: Domain size in km
         save_path: Path to save the plot
@@ -387,43 +387,83 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
     grid_x = np.linspace(0, DOMAIN_SIZE, 100)
     grid_y = np.linspace(0, DOMAIN_SIZE, 100)
     grid_z = griddata(coords, U, (grid_x[None, :], grid_y[:, None]), method='cubic')
-    
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    # Adjust layout to leave space at bottom for info text
+    plt.subplots_adjust(bottom=0.15)
+
     titles = ["Gurobi (Exact)"] + [f"Trial {t['trial']} (Rank {i+1})" for i, t in enumerate(top3_trials[:3])]
     solutions = [gurobi_solution] + top3_solutions
     sqrs = ["1.0000"] + [f"{t['best_sqr']:.4f}" for t in top3_trials[:3]]
-    
+
     for ax, title, x, sqr in zip(axes.flat, titles, solutions, sqrs):
         ax.contourf(grid_x, grid_y, grid_z, levels=20, cmap='viridis', alpha=0.3)
         ax.scatter(coords[:, 0], coords[:, 1], c='lightgray', s=30, alpha=0.6,
                    edgecolor='gray', linewidth=0.3)
-        
+
         selected = [i for i in range(N_total) if x[i] == 1]
         selected_new = [i for i in selected if i not in M_indices]
         selected_m = [i for i in selected if i in M_indices]
-        
+
         if selected_m:
             ax.scatter(coords[selected_m, 0], coords[selected_m, 1],
                        c='blue', s=120, marker='s', edgecolor='black', label='Existing (M)')
         if selected_new:
             ax.scatter(coords[selected_new, 0], coords[selected_new, 1],
                        c='red', s=150, marker='o', edgecolor='black', label='New')
-        
+
         ax.set_title(title, fontsize=12, fontweight='bold')
         ax.set_xlabel("X (km)")
         ax.set_ylabel("Y (km)")
         ax.set_aspect('equal')
         ax.set_xlim(-2, DOMAIN_SIZE + 2)
         ax.set_ylim(-2, DOMAIN_SIZE + 2)
-        ax.text(0.02, 0.98, f'SQR = {sqr}', transform=ax.transAxes,
-                fontsize=10, verticalalignment='top',
+        # Top-right SQR label (existing)
+        ax.text(0.98, 0.98, f'SQR = {sqr}', transform=ax.transAxes,
+                fontsize=10, verticalalignment='top', horizontalalignment='right',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    
+
+    # ------------------------------------------------------------------------
+    # INFO TEXT BOX BELOW PLOTS
+    # ------------------------------------------------------------------------
+    # Build info lines for each panel (Gurobi + 3 trials)
+    info_lines = []
+
+    # Gurobi line
+    info_lines.append("Gurobi (Exact) — SQR = 1.0000")
+
+    # Trials
+    for i, t in enumerate(top3_trials[:3]):
+        trial_str = f"Trial {t['trial']:4d}"
+        lam1 = t.get('lam1', None)
+        lam2 = t.get('lam2', None)
+        feas = t.get('feas_rate', None)
+        sqr = t.get('best_sqr', None)
+
+        # Format values with fallback
+        lam1_str = f"{lam1:.4f}" if isinstance(lam1, float) else "N/A"
+        lam2_str = f"{lam2:.4f}" if isinstance(lam2, float) else "N/A"
+        feas_str = f"{feas*100:.1f}%" if isinstance(feas, float) else "N/A"
+        sqr_str = f"{sqr:.4f}" if isinstance(sqr, float) else "N/A"
+
+        line = (f"{trial_str}  λ₁={lam1_str}  λ₂={lam2_str}  "
+                f"Feas={feas_str}  SQR={sqr_str}")
+        info_lines.append(line)
+
+    # Combine into a single multiline string
+    info_text = "\n".join(info_lines)
+
+    # Place below the subplots
+    fig.text(0.5, 0.04, info_text, ha='center', va='bottom', fontsize=9,
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9),
+             linespacing=1.5)
+
+    # Legend for markers
     handles = [Patch(facecolor='red', edgecolor='black', label='New'),
                Patch(facecolor='blue', edgecolor='black', label='Existing (M)'),
                Patch(facecolor='lightgray', edgecolor='gray', label='Candidates')]
     fig.legend(handles=handles, loc='lower center', bbox_to_anchor=(0.5, -0.02), ncol=3, fontsize=10)
-    plt.tight_layout(rect=[0, 0.03, 1, 1])
+
     plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
     plt.close(fig)
 
