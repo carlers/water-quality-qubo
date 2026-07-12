@@ -15,6 +15,7 @@ This module provides:
     9. Sensitivity analysis plot (save only)
     10. Display saved plots (display only)
     11. Loaded seed summary
+    12. QUBO parameter calibration (v4.20)
 
 All functions preserve verbose logging and error handling.
 """
@@ -33,6 +34,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch, Circle
 import matplotlib.image as mpimg
 from scipy.interpolate import griddata
+from scipy.spatial.distance import cdist
 import scipy.stats as stats
 
 # Global phase timing dictionary (used by execute_phase context manager)
@@ -361,23 +363,222 @@ def extract_top3_champions(validation_results, champion, sharpen_top_k=3):
 
 
 # ============================================================================
-# 7. PLOTTING FUNCTIONS (GENERATE ONLY - NO plt.show())
+# 7. QUBO PARAMETER CALIBRATION (NEW v4.20)
 # ============================================================================
 
-def plot_validation_grid(coords, U, gurobi_solution, top3_solutions, top3_trials,
-                         M_indices, DOMAIN_SIZE, save_path, dpi=100):
+def calibrate_qubo_parameters(
+    coords: np.ndarray,
+    U: np.ndarray,
+    M_indices: List[int],
+    K_new: int,
+    L_w: float,
+    current_vector: Tuple[float, float],
+    beta: float,
+    delta: float,
+    L_c_candidates: Optional[List[float]] = None,
+    qir_target: float = 0.25,
+    conn_multiplier: float = 2.0,
+    alpha: float = 1.5,
+    verbose: bool = True,
+) -> Dict:
+    """
+    Calibrate QUBO parameters by performing a QIR sweep over L_c candidates.
+    
+    This function:
+        1. Computes the mean nearest-neighbor distance and sets connectivity_range.
+        2. For each L_c, builds pairwise terms and base QUBO (no penalties).
+        3. Computes QIR = sum(|J|) / (sum(|h|) + sum(|J|)).
+        4. Selects the smallest L_c with QIR >= qir_target (fallback: max QIR).
+        5. Computes native scales S_h, S_J and theoretical penalties.
+        6. Returns calibrated parameters including Q_sum and dual bounds.
+
+    Args:
+        coords: (N, 2) array of coordinates
+        U: (N,) array of utility scores
+        M_indices: List of fixed existing station indices
+        K_new: Number of new stations to select
+        L_w: Wake persistence length (km)
+        current_vector: (dx, dy) direction of dominant current
+        beta: Redundancy penalty weight
+        delta: Wake penalty weight
+        L_c_candidates: List of L_c values to sweep (default: [2.5, 4.0, 5.0, 6.0, 7.5, 10.0, 12.0, 15.0])
+        qir_target: Minimum QIR threshold (default: 0.25)
+        conn_multiplier: Multiplier for mean NN distance to set connectivity_range
+        alpha: Scaling factor for theoretical penalties (λ = α × S)
+        verbose: Print progress
+
+    Returns:
+        dict with keys:
+            'L_c_star': float,
+            'Q_sum': float,
+            'S_h': float,
+            'S_J': float,
+            'lambda1_theory': float,
+            'lambda2_theory': float,
+            'qir_results': List[Dict],
+            'selected_qir': float,
+            'connectivity_range': float,
+            'mean_nn_dist': float,
+            'heuristic_bounds': Tuple[float, float],
+            'analytical_bounds_lam1': Tuple[float, float],
+            'analytical_bounds_lam2': Tuple[float, float],
+    """
+    from src.model import compute_pairwise_terms, build_qubo
+
+    if L_c_candidates is None:
+        L_c_candidates = [2.5, 4.0, 5.0, 6.0, 7.5, 10.0, 12.0, 15.0]
+
+    # Compute mean nearest-neighbor distance
+    dist_matrix = cdist(coords, coords)
+    np.fill_diagonal(dist_matrix, np.inf)
+    mean_nn_dist = np.mean(np.min(dist_matrix, axis=1))
+    connectivity_range = conn_multiplier * mean_nn_dist
+
+    if verbose:
+        print(f"\n[Calibration] Mean nearest-neighbor distance: {mean_nn_dist:.2f} km")
+        print(f"[Calibration] Connectivity_range: {connectivity_range:.2f} km")
+        print("[Calibration] QIR sweep over L_c:")
+        print("-" * 60)
+
+    qir_results = []
+    N_total = coords.shape[0]
+
+    for L_c in L_c_candidates:
+        pairwise = compute_pairwise_terms(
+            coords=coords, U=U, M_indices=M_indices,
+            L_c=L_c, L_w=L_w,
+            current_vector=current_vector,
+            beta=beta, delta=delta,
+            connectivity_range=connectivity_range,
+            verbose=False,
+        )
+        # Build base QUBO (no penalties)
+        qubo_base = build_qubo(pairwise, K_new, lambda1=0.0, lambda2=0.0,
+                               use_jijmodeling=False, verbose=False)
+        h = qubo_base["h"]
+        J = qubo_base["J"]
+
+        sum_h = sum(abs(v) for v in h.values()) if h else 0.0
+        sum_J = sum(abs(v) for v in J.values()) if J else 0.0
+        non_zero_J = [abs(v) for v in J.values() if abs(v) > 1e-6]
+        nz_count = len(non_zero_J)
+        nz_mean = np.mean(non_zero_J) if nz_count > 0 else 0.0
+
+        QIR = sum_J / (sum_h + sum_J) if (sum_h + sum_J) > 0 else 0.0
+
+        qir_results.append({
+            "L_c": L_c,
+            "sum_h": sum_h,
+            "sum_J": sum_J,
+            "QIR": QIR,
+            "nz_count": nz_count,
+            "nz_mean": nz_mean,
+        })
+        if verbose:
+            print(f"  L_c={L_c:4.1f} | QIR={QIR:.3f} | nz_J={nz_count:4d} | mean_J={nz_mean:.6f}")
+
+    # Select smallest L_c with QIR >= target
+    L_c_star = None
+    selected_qir = None
+    for row in qir_results:
+        if row["QIR"] >= qir_target:
+            L_c_star = row["L_c"]
+            selected_qir = row["QIR"]
+            break
+
+    if L_c_star is None:
+        # Fallback to max QIR
+        best = max(qir_results, key=lambda x: x["QIR"])
+        L_c_star = best["L_c"]
+        selected_qir = best["QIR"]
+        if verbose:
+            print(f"  ⚠️ QIR never reached {qir_target}. Using max QIR at L_c={L_c_star:.1f}.")
+    else:
+        if verbose:
+            print(f"\n  ✅ Selected L_c* = {L_c_star:.1f} km  (QIR = {selected_qir:.3f})")
+
+    # Rebuild pairwise & base QUBO with L_c_star
+    pairwise_star = compute_pairwise_terms(
+        coords=coords, U=U, M_indices=M_indices,
+        L_c=L_c_star, L_w=L_w,
+        current_vector=current_vector,
+        beta=beta, delta=delta,
+        connectivity_range=connectivity_range,
+        verbose=False,
+    )
+    qubo_base_star = build_qubo(pairwise_star, K_new, lambda1=0.0, lambda2=0.0,
+                                use_jijmodeling=False, verbose=False)
+    h_star = qubo_base_star["h"]
+    J_star = qubo_base_star["J"]
+
+    # Native scales with safety floor
+    S_h = max(float(np.std(U)), 1e-4)
+    non_zero_J_star = [abs(v) for v in J_star.values() if abs(v) > 1e-6]
+    S_J = max(float(np.mean(non_zero_J_star)) if non_zero_J_star else 0.0, 1e-4)
+
+    # Theoretical penalties
+    lambda1_theory = alpha * S_h
+    lambda2_theory = alpha * S_J
+
+    # Q_sum (heuristic upper bound)
+    sum_abs_h = sum(abs(v) for v in h_star.values()) if h_star else 0.0
+    sum_abs_J = sum(abs(v) for v in J_star.values()) if J_star else 0.0
+    Q_sum = sum_abs_h + sum_abs_J
+    Q_sum = max(Q_sum, 1.0)  # safety floor
+
+    # Dual bounds
+    heuristic_bounds = (0.0, Q_sum)
+    analytical_bounds_lam1 = (0.5 * lambda1_theory, 2.0 * lambda1_theory)
+    analytical_bounds_lam2 = (0.5 * lambda2_theory, 2.0 * lambda2_theory)
+
+    if verbose:
+        print(f"\n[Calibration] Native scales:")
+        print(f"  S_h (std U)        : {S_h:.4f}")
+        print(f"  S_J (mean |J|)     : {S_J:.4f}")
+        print(f"  Q_sum              : {Q_sum:.4f}")
+        print(f"\n[Calibration] Theoretical penalties (α={alpha}):")
+        print(f"  λ₁* = {lambda1_theory:.4f}")
+        print(f"  λ₂* = {lambda2_theory:.4f}")
+        print(f"\n[Calibration] Dual bounds:")
+        print(f"  Heuristic (SA): λ₁, λ₂ ∈ [{heuristic_bounds[0]:.4f}, {heuristic_bounds[1]:.4f}]")
+        print(f"  Analytical (Gurobi): λ₁ ∈ [{analytical_bounds_lam1[0]:.4f}, {analytical_bounds_lam1[1]:.4f}], "
+              f"λ₂ ∈ [{analytical_bounds_lam2[0]:.4f}, {analytical_bounds_lam2[1]:.4f}]")
+
+    return {
+        "L_c_star": L_c_star,
+        "Q_sum": Q_sum,
+        "S_h": S_h,
+        "S_J": S_J,
+        "lambda1_theory": lambda1_theory,
+        "lambda2_theory": lambda2_theory,
+        "qir_results": qir_results,
+        "selected_qir": selected_qir,
+        "connectivity_range": connectivity_range,
+        "mean_nn_dist": mean_nn_dist,
+        "heuristic_bounds": heuristic_bounds,
+        "analytical_bounds_lam1": analytical_bounds_lam1,
+        "analytical_bounds_lam2": analytical_bounds_lam2,
+    }
+
+
+# ============================================================================
+# 8. PLOTTING FUNCTIONS (GENERATE ONLY - NO plt.show())
+# ============================================================================
+
+def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
+                         top3_trials, M_indices, DOMAIN_SIZE,
+                         save_path, dpi=100):
     """
     Generate 2x2 validation grid comparing Gurobi vs Top 3.
-    Adds a text box below the plots with hyperparameters and metrics.
-
+    
+    Saves to disk only. Does NOT display inline.
+    
     Args:
         coords: (N, 2) array of coordinates
         U: (N,) array of utility scores
         gurobi_solution: Binary vector from Gurobi
         top3_solutions: List of 3 binary solution vectors
-        top3_trials: List of 3 trial dicts. Must contain:
-            'trial', 'best_sqr', and optionally 'lam1', 'lam2', 'feas_rate'
-            If missing, will show 'N/A'.
+        top3_trials: List of 3 trial dicts with 'trial' and 'best_sqr'
         M_indices: Existing station indices
         DOMAIN_SIZE: Domain size in km
         save_path: Path to save the plot
@@ -387,7 +588,7 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions, top3_trials
     grid_x = np.linspace(0, DOMAIN_SIZE, 100)
     grid_y = np.linspace(0, DOMAIN_SIZE, 100)
     grid_z = griddata(coords, U, (grid_x[None, :], grid_y[:, None]), method='cubic')
-
+    
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
     # Adjust layout to leave space at bottom for info text
     plt.subplots_adjust(bottom=0.15)
@@ -423,11 +624,9 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions, top3_trials
                 fontsize=10, verticalalignment='top', horizontalalignment='right',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    # =========================================================================
+    # ------------------------------------------------------------------------
     # INFO TEXT BOX BELOW PLOTS (ENHANCED)
-    # =========================================================================
-
-    # Build info lines for each panel (Gurobi + 3 trials)
+    # ------------------------------------------------------------------------
     info_lines = []
 
     # Gurobi line
@@ -468,10 +667,10 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions, top3_trials
     # Combine into a single multiline string
     info_text = "\n".join(info_lines)
 
-    # Place below the subplots (adjust y position to accommodate more text)
+    # Place below the subplots
     fig.text(0.5, 0.04, info_text, ha='center', va='bottom', fontsize=8,
-            bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9),
-            linespacing=1.3)
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9),
+             linespacing=1.3)
 
     # Legend for markers
     handles = [Patch(facecolor='red', edgecolor='black', label='New'),
@@ -673,7 +872,7 @@ def plot_final_deployment(coords, U, best_solution, M_indices, selected_new,
 
 
 # ============================================================================
-# 8. OPTUNA POSTERIOR PLOTS (SAVE ONLY)
+# 9. OPTUNA POSTERIOR PLOTS (SAVE ONLY)
 # ============================================================================
 
 def save_optuna_plots(study, seed_dir, dpi=150):
@@ -764,7 +963,7 @@ def save_optuna_plots(study, seed_dir, dpi=150):
 
 
 # ============================================================================
-# 9. SENSITIVITY ANALYSIS PLOT (SAVE ONLY)
+# 10. SENSITIVITY ANALYSIS PLOT (SAVE ONLY)
 # ============================================================================
 
 def save_sensitivity_plot(results_df, baseline_sqr, seed_dir, dpi=150):
@@ -824,7 +1023,7 @@ def save_sensitivity_plot(results_df, baseline_sqr, seed_dir, dpi=150):
 
 
 # ============================================================================
-# 10. DISPLAY SAVED PLOTS (DISPLAY ONLY)
+# 11. DISPLAY SAVED PLOTS (DISPLAY ONLY)
 # ============================================================================
 
 def display_saved_plots(seed_dir):
@@ -873,7 +1072,7 @@ def display_saved_plots(seed_dir):
 
 
 # ============================================================================
-# 11. LOADED SEED SUMMARY
+# 12. LOADED SEED SUMMARY
 # ============================================================================
 
 def print_loaded_seed_summary(results, seed, mode):
@@ -959,7 +1158,7 @@ def print_loaded_seed_summary(results, seed, mode):
 
 
 # ============================================================================
-# 12. DYNAMIC SUMMARY N
+# 13. DYNAMIC SUMMARY N
 # ============================================================================
 
 def get_summary_n(n_total, max_n=10):
@@ -995,7 +1194,7 @@ def cleanup_tqdm():
 
 
 # ============================================================================
-# 13. MODULE EXPORTS
+# 14. MODULE EXPORTS
 # ============================================================================
 
 __all__ = [
@@ -1015,6 +1214,9 @@ __all__ = [
     # Computation
     'compute_spearman_correlation',
     'extract_top3_champions',
+    
+    # Calibration (new v4.20)
+    'calibrate_qubo_parameters',
     
     # Plotting (generate)
     'plot_validation_grid',
