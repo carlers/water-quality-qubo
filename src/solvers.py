@@ -507,6 +507,8 @@ def solve_sa(
     N_total: int,
     pairwise_data: Dict,
     num_reads: int = 100,
+    num_sweeps: int = 1000,                      # NEW: required for beta_range
+    beta_range: Optional[List[float]] = None,    # NEW: [beta_min, beta_max]
     schedule: Optional[List] = None,
     seed: Optional[int] = None,
     return_all: bool = False,
@@ -515,6 +517,13 @@ def solve_sa(
 ) -> Dict[str, Any]:
     """
     Solve QUBO using OpenJij Simulated Annealing (SA).
+
+    New parameters:
+        num_sweeps: int – total sweeps (required when using beta_range)
+        beta_range: Optional[List[float]] – [beta_min, beta_max] to pass directly
+
+    If beta_range is provided, it takes precedence over schedule.
+    If neither is provided, OpenJij uses its default scheduling (not recommended).
 
     Args:
         h: Linear coefficients dict {i: coeff}.
@@ -526,9 +535,10 @@ def solve_sa(
         N_total: Total number of candidates.
         pairwise_data: Output from compute_pairwise_terms() (for MIQP energy).
         num_reads: Number of annealing runs.
+        num_sweeps: Number of sweeps per run (required for beta_range).
+        beta_range: Optional [beta_min, beta_max] in inverse temperature.
         schedule: Optional custom annealing schedule as list of [beta, steps] or (beta, steps)
-                  pairs, where beta = inverse temperature. If provided, num_sweeps is ignored.
-                  Example: [[0.1, 10], [1.0, 20], [5.0, 20], [10.0, 10]]
+                  pairs. If provided, overrides beta_range.
         seed: Random seed for reproducibility (ignored if use_seed_none=True).
         return_all: If True, also return a list of all samples with their MIQP energies
                     and violations (useful for feasibility rate computation).
@@ -558,11 +568,13 @@ def solve_sa(
     start_time = time.time()
 
     if verbose:
-        print(f"\n[SA] num_reads={num_reads}")
-        if schedule is not None:
-            print(f"[SA] Custom schedule: {schedule}")
+        print(f"\n[SA] num_reads={num_reads}, num_sweeps={num_sweeps}")
+        if beta_range is not None:
+            print(f"[SA] beta_range=[{beta_range[0]:.6f}, {beta_range[1]:.6f}]")
+        elif schedule is not None:
+            print(f"[SA] Custom schedule provided")
         else:
-            print(f"[SA] Warning: No schedule provided; using OpenJij default.")
+            print(f"[SA] Using OpenJij default schedule (no beta_range or schedule).")
         if seed is not None:
             print(f"[SA] Provided seed: {seed}")
         print(f"[SA] use_seed_none={use_seed_none}")
@@ -570,6 +582,7 @@ def solve_sa(
             print(f"[SA] return_all=True: will return all samples.")
 
     neighbors = pairwise_data.get("neighbors", {})
+    Q = _build_openjij_dict(h, J, constant)
 
     # ------------------------------------------------------------------------
     # Case 1: use_seed_none = True -> set seed=None, do a single call with num_reads
@@ -577,21 +590,35 @@ def solve_sa(
     if use_seed_none:
         if verbose:
             print("[SA] Using seed=None to avoid identical reads bug.")
-        Q = _build_openjij_dict(h, J, constant)
         try:
             sampler = oj.SASampler()
-            if schedule is not None:
+            
+            # Choose sampling strategy
+            if beta_range is not None:
+                if verbose:
+                    print(f"[SA] Calling sample_qubo with beta_range={beta_range} and num_sweeps={num_sweeps}")
+                response = sampler.sample_qubo(
+                    Q,
+                    num_reads=num_reads,
+                    num_sweeps=num_sweeps,
+                    beta_range=beta_range,
+                    seed=None,
+                )
+            elif schedule is not None:
                 schedule_converted = [(float(beta), int(steps)) for beta, steps in schedule]
                 response = sampler.sample_qubo(
                     Q,
                     num_reads=num_reads,
                     schedule=schedule_converted,
-                    seed=None,  # <-- FIX: avoid fixed seed causing identical reads
+                    seed=None,
                 )
             else:
+                if verbose:
+                    print("[SA] No beta_range or schedule provided; using OpenJij default.")
                 response = sampler.sample_qubo(
                     Q,
                     num_reads=num_reads,
+                    num_sweeps=num_sweeps,
                     seed=None,
                 )
         except Exception as e:
@@ -680,6 +707,8 @@ def solve_sa(
             "violations": best_feasible_violations,
             "details": {
                 "num_reads": num_reads,
+                "num_sweeps": num_sweeps,
+                "beta_range": beta_range,
                 "schedule": schedule,
                 "seed": seed,  # note: seed was ignored
                 "response_info": getattr(response, "info", {}),
@@ -706,7 +735,15 @@ def solve_sa(
             Q = _build_openjij_dict(h, J, constant)
             sampler = oj.SASampler()
             try:
-                if schedule is not None:
+                if beta_range is not None:
+                    response = sampler.sample_qubo(
+                        Q,
+                        num_reads=1,
+                        num_sweeps=num_sweeps,
+                        beta_range=beta_range,
+                        seed=seed_i,
+                    )
+                elif schedule is not None:
                     schedule_converted = [(float(beta), int(steps)) for beta, steps in schedule]
                     response = sampler.sample_qubo(
                         Q,
@@ -718,6 +755,7 @@ def solve_sa(
                     response = sampler.sample_qubo(
                         Q,
                         num_reads=1,
+                        num_sweeps=num_sweeps,
                         seed=seed_i,
                     )
             except Exception as e:
@@ -786,6 +824,8 @@ def solve_sa(
             "violations": best_feasible_violations,
             "details": {
                 "num_reads": num_reads,
+                "num_sweeps": num_sweeps,
+                "beta_range": beta_range,
                 "schedule": schedule,
                 "seed": seed,  # original seed provided
                 "response_info": {},
@@ -1105,8 +1145,9 @@ def solve_all_classical(
     )
 
     # Build a default schedule for SA if not provided
-    # Use a simple geometric schedule: 100 steps, total sweeps = num_sweeps
-    # Here we use num_sweeps as total sweeps
+    # Here we use a geometric schedule with the provided num_sweeps
+    # and reasonable beta range (heuristic, but we still use schedule for compatibility)
+    # In practice, the pipeline will pass beta_range directly.
     schedule = build_schedule(0.01, 40.0, num_sweeps, 120, 1.8)
 
     # Run SA
@@ -1122,6 +1163,8 @@ def solve_all_classical(
         N_total=N_total,
         pairwise_data=pairwise_data,
         num_reads=num_reads,
+        num_sweeps=num_sweeps,      # pass sweeps
+        # beta_range is not passed here; we use schedule for backward compatibility
         schedule=schedule,
         seed=seed,
         use_seed_none=use_seed_none,
