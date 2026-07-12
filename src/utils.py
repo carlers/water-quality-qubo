@@ -16,6 +16,7 @@ This module provides:
     10. Display saved plots (display only)
     11. Loaded seed summary
     12. QUBO parameter calibration (v4.20)
+    13. Physics-informed beta range (v4.21)
 
 All functions preserve verbose logging and error handling.
 """
@@ -204,6 +205,7 @@ def build_config(seed, test_mode, **kwargs):
         'sharpen_repeats': kwargs.get('sharpen_repeats', 3),
         'penalty_regime': 'upper_bound_mentor',
         'Q_sum': kwargs.get('Q_sum', None),
+        'version': kwargs.get('version', '4.21'),
     }
     return config
 
@@ -363,7 +365,7 @@ def extract_top3_champions(validation_results, champion, sharpen_top_k=3):
 
 
 # ============================================================================
-# 7. QUBO PARAMETER CALIBRATION (NEW v4.20)
+# 7. QUBO PARAMETER CALIBRATION
 # ============================================================================
 
 def calibrate_qubo_parameters(
@@ -625,7 +627,7 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     # ------------------------------------------------------------------------
-    # INFO TEXT BOX BELOW PLOTS (ENHANCED)
+    # INFO TEXT BOX BELOW PLOTS (UPDATED v4.21)
     # ------------------------------------------------------------------------
     info_lines = []
 
@@ -639,28 +641,32 @@ def plot_validation_grid(coords, U, gurobi_solution, top3_solutions,
         feas = t.get('feas_rate', None)
         lam1 = t.get('lam1', None)
         lam2 = t.get('lam2', None)
-        beta_min = t.get('beta_min', None)
-        beta_max = t.get('beta_max', None)
+        
+        # NEW v4.21: Check for multipliers first
+        beta_min_mult = t.get('beta_min_mult', None)
+        beta_max_mult = t.get('beta_max_mult', None)
         num_sweeps = t.get('num_sweeps', None)
-        num_steps = t.get('num_steps', None)
-        cooling_power = t.get('cooling_power', None)
+        
+        # Fallback to legacy keys if multipliers not found
+        if beta_min_mult is None:
+            beta_min_mult = t.get('beta_min', 'N/A')
+            beta_max_mult = t.get('beta_max', 'N/A')
+            sweeps_str = str(num_sweeps) if num_sweeps is not None else "N/A"
+            beta_display = f"β=[{beta_min_mult:.4f}, {beta_max_mult:.4f}] (legacy)"
+        else:
+            sweeps_str = str(num_sweeps) if num_sweeps is not None else "N/A"
+            beta_display = f"β_mult=[{beta_min_mult:.4f}, {beta_max_mult:.4f}] (v4.21)"
 
         # Format all values
         sqr_str = f"{sqr:.4f}" if isinstance(sqr, float) else "N/A"
         feas_str = f"{feas*100:.1f}%" if isinstance(feas, float) else "N/A"
         lam1_str = f"{lam1:.4f}" if isinstance(lam1, float) else "N/A"
         lam2_str = f"{lam2:.4f}" if isinstance(lam2, float) else "N/A"
-        beta_min_str = f"{beta_min:.4f}" if isinstance(beta_min, float) else "N/A"
-        beta_max_str = f"{beta_max:.1f}" if isinstance(beta_max, float) else "N/A"
-        sweeps_str = str(num_sweeps) if isinstance(num_sweeps, (int, float)) else "N/A"
-        steps_str = str(num_steps) if isinstance(num_steps, (int, float)) else "N/A"
-        power_str = f"{cooling_power:.3f}" if isinstance(cooling_power, float) else "N/A"
 
         line = (
             f"Trial {trial_num:4d}  SQR={sqr_str}  Feas={feas_str}  "
             f"λ₁={lam1_str}  λ₂={lam2_str}  "
-            f"β=[{beta_min_str}, {beta_max_str}]  "
-            f"Sweeps={sweeps_str}  Steps={steps_str}  Power={power_str}"
+            f"{beta_display}  Sweeps={sweeps_str}"
         )
         info_lines.append(line)
 
@@ -846,16 +852,30 @@ def plot_final_deployment(coords, U, best_solution, M_indices, selected_new,
                Patch(facecolor='lightgray', edgecolor='gray', label='Candidates')]
     ax.legend(handles=handles, loc='upper left', bbox_to_anchor=(1.2, 1.0), fontsize=10)
     
-    # Info text
+    # ------------------------------------------------------------------------
+    # INFO TEXT BOX (UPDATED v4.21)
+    # ------------------------------------------------------------------------
+    # NEW v4.21: Check for multipliers first
+    beta_min_mult = best_sharpen.get('beta_min_mult', None)
+    beta_max_mult = best_sharpen.get('beta_max_mult', None)
+    num_sweeps = best_sharpen.get('num_sweeps', 'N/A')
+    
+    # Fallback to legacy keys if multipliers not found
+    if beta_min_mult is None:
+        beta_min_mult = best_sharpen.get('beta_min', 'N/A')
+        beta_max_mult = best_sharpen.get('beta_max', 'N/A')
+        beta_display = f"β=[{beta_min_mult:.4f}, {beta_max_mult:.4f}] (legacy)"
+    else:
+        beta_display = f"β_mult=[{beta_min_mult:.4f}, {beta_max_mult:.4f}] (v4.21)"
+    
     info_text = (
-        f"Best Deployment Solution\n"
+        f"Best Deployment Solution (v4.21)\n"
         f"{'─' * 30}\n"
         f"Trial: #{best_sharpen['trial']} (Run {best_sharpen['run']})\n"
         f"λ₁ = {best_sharpen['lam1']:.4f}\n"
         f"λ₂ = {best_sharpen['lam2']:.4f}\n"
-        f"Sweeps: {champion['num_sweeps']}\n"
-        f"Steps: {champion['num_steps']}\n"
-        f"Power: {champion['cooling_power']:.4f}\n"
+        f"{beta_display}\n"
+        f"Sweeps: {num_sweeps}\n"
         f"Seed: {best_sharpen['seed']}\n"
         f"Feasibility: {best_sharpen['feas_rate']*100:.1f}%\n"
         f"{'─' * 30}\n"
@@ -986,7 +1006,7 @@ def save_sensitivity_plot(results_df, baseline_sqr, seed_dir, dpi=150):
         print("  ⚠️ No sensitivity results to plot.")
         return
     
-    params = ['lam1', 'lam2', 'beta_min', 'beta_max', 'num_sweeps', 'cooling_power']
+    params = ['lam1', 'lam2', 'num_sweeps', 'beta_min_mult', 'beta_max_mult']
     
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     axes_flat = axes.flatten()
@@ -1015,6 +1035,10 @@ def save_sensitivity_plot(results_df, baseline_sqr, seed_dir, dpi=150):
         else:
             ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
             ax.set_title(param)
+    
+    # Hide unused subplot (last one)
+    if len(params) < 6:
+        axes_flat[len(params)].set_visible(False)
     
     plt.tight_layout()
     plt.savefig(seed_dir / "sensitivity_analysis.png", dpi=dpi, bbox_inches='tight')
@@ -1072,12 +1096,14 @@ def display_saved_plots(seed_dir):
 
 
 # ============================================================================
-# 12. LOADED SEED SUMMARY
+# 12. LOADED SEED SUMMARY (UPDATED v4.21)
 # ============================================================================
 
 def print_loaded_seed_summary(results, seed, mode):
     """
     Print a rich summary table for a loaded seed.
+    
+    Supports both legacy (v4.20 and earlier) and v4.21 result formats.
     
     Args:
         results: Dictionary loaded from deployment_results.json
@@ -1090,6 +1116,7 @@ def print_loaded_seed_summary(results, seed, mode):
     best_sharpen = results.get('best_sharpen', {})
     champion = results.get('champion', {})
     spearman = results.get('spearman', {})
+    version = results.get('version', 'unknown')
     
     # Best SQR
     best_sqr = best_sharpen.get('best_sqr', 'N/A')
@@ -1100,8 +1127,9 @@ def print_loaded_seed_summary(results, seed, mode):
     
     # Champion info
     print(f"  Champion Trial:        {champion.get('trial', 'N/A')}")
+    print(f"  Version:               {version}")
     
-    # Hyperparameters
+    # Hyperparameters - NEW v4.21: check for multipliers first
     lam1 = champion.get('lam1', 'N/A')
     lam2 = champion.get('lam2', 'N/A')
     if isinstance(lam1, float) and isinstance(lam2, float):
@@ -1109,20 +1137,53 @@ def print_loaded_seed_summary(results, seed, mode):
     else:
         print(f"  λ₁:                    {lam1},  λ₂: {lam2}")
     
-    beta_min = champion.get('beta_min', 'N/A')
-    beta_max = champion.get('beta_max', 'N/A')
-    if isinstance(beta_min, float) and isinstance(beta_max, float):
-        print(f"  β_min:                 {beta_min:.4f},  β_max: {beta_max:.2f}")
-    else:
-        print(f"  β_min:                 {beta_min},  β_max: {beta_max}")
+    # Check for v4.21 multipliers
+    beta_min_mult = champion.get('beta_min_mult', None)
+    beta_max_mult = champion.get('beta_max_mult', None)
     
-    sweeps = champion.get('num_sweeps', 'N/A')
-    steps = champion.get('num_steps', 'N/A')
-    power = champion.get('cooling_power', 'N/A')
-    if isinstance(power, float):
-        print(f"  Sweeps:                {sweeps},  Steps: {steps},  Power: {power:.4f}")
+    if beta_min_mult is not None and beta_max_mult is not None:
+        # v4.21 format
+        if isinstance(beta_min_mult, float) and isinstance(beta_max_mult, float):
+            print(f"  β_min_mult:            {beta_min_mult:.4f},  β_max_mult: {beta_max_mult:.4f}")
+        else:
+            print(f"  β_min_mult:            {beta_min_mult},  β_max_mult: {beta_max_mult}")
+        
+        # Show absolute betas if available
+        beta_min_abs = champion.get('beta_min_abs', None)
+        beta_max_abs = champion.get('beta_max_abs', None)
+        if beta_min_abs is not None and beta_max_abs is not None:
+            if isinstance(beta_min_abs, float) and isinstance(beta_max_abs, float):
+                print(f"  β_min_abs:             {beta_min_abs:.4f},  β_max_abs: {beta_max_abs:.4f}")
+    
+    # Fallback to legacy keys
     else:
-        print(f"  Sweeps:                {sweeps},  Steps: {steps},  Power: {power}")
+        beta_min = champion.get('beta_min', 'N/A')
+        beta_max = champion.get('beta_max', 'N/A')
+        if isinstance(beta_min, float) and isinstance(beta_max, float):
+            print(f"  β_min:                 {beta_min:.4f},  β_max: {beta_max:.4f}")
+        else:
+            print(f"  β_min:                 {beta_min},  β_max: {beta_max}")
+        
+        # Legacy cooling power
+        power = champion.get('cooling_power', 'N/A')
+        if isinstance(power, float):
+            print(f"  Cooling Power:         {power:.4f}")
+        else:
+            print(f"  Cooling Power:         {power}")
+        
+        # Legacy num_steps
+        steps = champion.get('num_steps', 'N/A')
+        if isinstance(steps, (int, float)):
+            print(f"  Steps:                 {steps}")
+        else:
+            print(f"  Steps:                 {steps}")
+    
+    # Sweeps (common to both versions)
+    sweeps = champion.get('num_sweeps', 'N/A')
+    if isinstance(sweeps, (int, float)):
+        print(f"  Sweeps:                {sweeps}")
+    else:
+        print(f"  Sweeps:                {sweeps}")
     
     # Selected stations
     selected = champion.get('selected_new', 'N/A')
@@ -1141,7 +1202,7 @@ def print_loaded_seed_summary(results, seed, mode):
     else:
         print(f"  Feasibility:           {feas_rate}")
     
-    # Spearman correlation - safe handling with new dict structure
+    # Spearman correlation
     if spearman and spearman.get('available', False):
         print(f"  Spearman ρ:            {spearman['rho']:.4f}")
     else:
@@ -1215,7 +1276,7 @@ __all__ = [
     'compute_spearman_correlation',
     'extract_top3_champions',
     
-    # Calibration (new v4.20)
+    # Calibration
     'calibrate_qubo_parameters',
     
     # Plotting (generate)
