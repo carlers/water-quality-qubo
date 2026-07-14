@@ -4,20 +4,23 @@ src/experiment.py
 Level 2 orchestration layer for the water quality monitoring QUBO project.
 
 This module provides reusable functions for:
-    1. evaluate_qubo      – Builds QUBO, computes ESR/MCR, runs SA.
+    1. evaluate_qubo      – Builds QUBO, computes ESR/MCR, runs SA, returns raw SQR.
     2. make_objective     – Returns an Optuna objective callable.
     3. run_optuna_study   – Creates/loads an Optuna study with RDBStorage.
     4. validate_study     – Validates top trials, computes Spearman correlation.
     5. run_ablation_experiment – Full tuning + validation pipeline for experiments.
 
 All functions import only from Level 1 (model, solvers, utils, environment, plotting).
+
+CRITICAL: SQR is now computed using the RAW MIQP energy (pairwise_raw), not the
+normalized energy. This ensures a fair comparison to the Gurobi baseline.
 """
 
 import time
 import gc
+import json
 import warnings
 from pathlib import Path
-import json
 from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 
 import numpy as np
@@ -38,9 +41,9 @@ from src.plotting import (
 
 warnings.filterwarnings('ignore')
 
+
 # -----------------------------------------------------------------------------
-# Helper: Build full Q matrix from h, J (duplicated from environment.py to avoid
-# circular import, but it's a simple function)
+# Helper: Build full Q matrix from h, J
 # -----------------------------------------------------------------------------
 
 def _build_full_Q(h: Dict[int, float], J: Dict[Tuple[int, int], float], N: int) -> np.ndarray:
@@ -61,7 +64,31 @@ def _build_full_Q(h: Dict[int, float], J: Dict[Tuple[int, int], float], N: int) 
 
 
 # -----------------------------------------------------------------------------
-# 1. evaluate_qubo – Core evaluation function
+# Helper: Compute raw MIQP energy from a solution
+# -----------------------------------------------------------------------------
+
+def _compute_raw_energy(
+    solution: np.ndarray,
+    pairwise_raw: Dict,
+) -> float:
+    """
+    Compute the raw MIQP energy (no penalties) for a given solution.
+    Uses the original (un‑normalized) linear and quadratic coefficients.
+    """
+    energy = 0.0
+    # Linear terms
+    for i, coeff in pairwise_raw['linear'].items():
+        if i < len(solution):
+            energy += coeff * solution[i]
+    # Quadratic terms (symmetric, i < j)
+    for (i, j), coeff in pairwise_raw['quad'].items():
+        if i < len(solution) and j < len(solution):
+            energy += coeff * solution[i] * solution[j]
+    return energy
+
+
+# -----------------------------------------------------------------------------
+# 1. evaluate_qubo – Core evaluation function (UPDATED: raw SQR)
 # -----------------------------------------------------------------------------
 
 def evaluate_qubo(
@@ -87,28 +114,36 @@ def evaluate_qubo(
 ) -> Dict:
     """
     Builds QUBO from env['pairwise_norm'] and given lambdas, runs SA,
-    and returns a result dict with:
-        - best_miqp, best_sqr, avg_sqr, p10_sqr
-        - feas_rate, best_solution
-        - ESR, MCR (if compute_esr_mcr=True)
-        - all_samples (if return_all=True)
+    and returns a result dict. SQR is computed using the RAW MIQP energy.
+
+    Returns:
+        dict with keys:
+            - best_sqr: raw SQR of best feasible solution
+            - best_raw_miqp: raw MIQP energy of best feasible solution
+            - avg_sqr: mean raw SQR of all feasible solutions
+            - p10_sqr: 10th percentile raw SQR
+            - feas_rate: fraction of feasible samples
+            - best_solution: binary vector of the best solution
+            - ESR, MCR (if compute_esr_mcr=True)
+            - all_samples (if return_all=True)
     """
     pairwise_norm = env['pairwise_norm']
+    pairwise_raw = env['pairwise_raw']
     K_new = env['config']['K_new']
     free_indices = pairwise_norm['free_indices']
     M_indices = env['M_indices']
     N_total = len(env['coords'])
     gurobi_miqp = env['gurobi_miqp']
-    Q_obj = env['Q_obj']
+    Q_obj = env['Q_obj']  # from normalized objective
 
-    # 1. Build QUBO
+    # 1. Build QUBO (normalized)
     qubo = build_qubo(pairwise_norm, K_new, lambda1=lam1, lambda2=lam2,
                       use_jijmodeling=False, verbose=False)
     h = qubo['h']
     J = qubo['J']
     constant = qubo['constant']
 
-    # 2. Compute ESR/MCR (pure penalty isolation)
+    # 2. Compute ESR/MCR (from normalized QUBO, for diagnostics)
     esr = None
     mcr = None
     if compute_esr_mcr:
@@ -132,7 +167,7 @@ def evaluate_qubo(
             free_indices=free_indices,
             M_indices=M_indices,
             N_total=N_total,
-            pairwise_data=pairwise_norm,
+            pairwise_data=pairwise_norm,  # used only for normalized energy (optional)
             num_reads=num_reads,
             num_sweeps=num_sweeps,
             schedule=schedule,
@@ -186,22 +221,25 @@ def evaluate_qubo(
     else:
         raise ValueError(f"Unknown schedule_type: {schedule_type}")
 
-    # 4. Process samples
     all_samples = result.get('all_samples', [])
+    best_solution = result.get('solution')
+    feas_rate = result.get('violations', {}).get('feasible', False)
+    norm_best_miqp = result.get('miqp_energy')  # normalized MIQP (for reference)
+
+    # If return_all=True but no samples, fallback to single solution
     if return_all and not all_samples:
-        # Fallback: only a single sample was returned
-        miqp = result.get('miqp_energy')
-        feasible = result.get('violations', {}).get('feasible', False)
-        if miqp is not None and np.isfinite(miqp) and miqp != float('inf') and feasible:
-            best_sqr = miqp / gurobi_miqp if gurobi_miqp else 0.0
+        # Use the best solution (if feasible) and compute raw energy
+        if best_solution is not None and feas_rate:
+            raw_miqp = _compute_raw_energy(best_solution, pairwise_raw)
+            best_sqr = raw_miqp / gurobi_miqp if gurobi_miqp else 0.0
             return {
-                'best_miqp': miqp,
+                'best_miqp': raw_miqp,
                 'best_sqr': best_sqr,
                 'avg_sqr': best_sqr,
                 'p10_sqr': best_sqr,
-                'best_solution': result.get('solution'),
+                'best_solution': best_solution,
                 'feas_rate': 1.0,
-                'feasible_miqps': [miqp],
+                'feasible_miqps': [raw_miqp],
                 'ESR': esr,
                 'MCR': mcr,
                 'all_samples': all_samples,
@@ -220,51 +258,57 @@ def evaluate_qubo(
                 'all_samples': all_samples,
             }
 
-    feasible_miqps = []
-    best_miqp = float('inf')
-    best_solution = None
+    # Process all_samples to compute raw energies for feasible solutions
+    feasible_raw_miqps = []
+    best_raw_miqp = float('inf')
+    best_sol = None
     for sample in all_samples:
         if sample.get('violations', {}).get('feasible', False):
-            miqp = sample.get('miqp_energy')
-            if miqp is not None and np.isfinite(miqp) and miqp != float('inf'):
-                feasible_miqps.append(miqp)
-                if miqp < best_miqp:
-                    best_miqp = miqp
-                    best_solution = sample.get('solution')
+            sol = sample.get('solution')
+            if sol is not None:
+                raw_e = _compute_raw_energy(sol, pairwise_raw)
+                feasible_raw_miqps.append(raw_e)
+                if raw_e < best_raw_miqp:
+                    best_raw_miqp = raw_e
+                    best_sol = sol
 
-    feas_rate = len(feasible_miqps) / len(all_samples) if all_samples else 0.0
+    feas_rate = len(feasible_raw_miqps) / len(all_samples) if all_samples else 0.0
 
-    if feasible_miqps and np.isfinite(best_miqp) and best_miqp != float('inf'):
-        best_sqr = best_miqp / gurobi_miqp if gurobi_miqp else 0.0
-        avg_sqr = np.mean([m / gurobi_miqp for m in feasible_miqps]) if feasible_miqps else 0.0
-        p10_sqr = np.percentile([m / gurobi_miqp for m in feasible_miqps], 10) if feasible_miqps else 0.0
+    if feasible_raw_miqps and np.isfinite(best_raw_miqp) and best_raw_miqp != float('inf'):
+        best_sqr = best_raw_miqp / gurobi_miqp if gurobi_miqp else 0.0
+        avg_sqr = np.mean([e / gurobi_miqp for e in feasible_raw_miqps]) if feasible_raw_miqps else 0.0
+        p10_sqr = np.percentile([e / gurobi_miqp for e in feasible_raw_miqps], 10) if feasible_raw_miqps else 0.0
+        best_solution = best_sol if best_sol is not None else best_solution
     else:
+        best_raw_miqp = float('inf')
         best_sqr = 0.0
         avg_sqr = 0.0
         p10_sqr = 0.0
+        best_solution = None
 
     return {
-        'best_miqp': best_miqp,
-        'best_sqr': best_sqr,
+        'best_miqp': best_raw_miqp,          # raw MIQP energy
+        'best_sqr': best_sqr,                # raw SQR
         'avg_sqr': avg_sqr,
         'p10_sqr': p10_sqr,
         'best_solution': best_solution,
         'feas_rate': feas_rate,
-        'feasible_miqps': feasible_miqps,
+        'feasible_miqps': feasible_raw_miqps,
         'ESR': esr,
         'MCR': mcr,
         'all_samples': all_samples if return_all else None,
+        'norm_best_miqp': norm_best_miqp,    # for debugging
     }
 
 
 # -----------------------------------------------------------------------------
-# 2. make_objective – Optuna objective factory
+# 2. make_objective – Optuna objective factory (unchanged logic, uses raw SQR)
 # -----------------------------------------------------------------------------
 
 def make_objective(
     env: Dict,
     schedule_type: str,
-    objective_type: str,  # 'BestOnly', 'Lin', 'Sq', 'Cube', 'Avg', 'Pctl10', 'Penalty-0.1', 'Penalty-0.5', 'Multi'
+    objective_type: str,
     tuning_reads: int,
     tuning_seed: int,
     use_seed_none: bool = True,
@@ -272,14 +316,14 @@ def make_objective(
 ) -> Callable:
     """
     Returns a callable objective function for Optuna.
-    For multi-objective, returns a function that returns a list of two values.
+    The objective uses raw SQR from evaluate_qubo.
     """
     Q_sum = env['Q_sum']
 
     def objective(trial):
         # Suggest hyperparameters
-        lam1 = trial.suggest_float('lam1', 1e-3, Q_sum, log=True)
-        lam2 = trial.suggest_float('lam2', 1e-3, Q_sum, log=True)
+        lam1 = trial.suggest_float('lam1', 1e-4, Q_sum, log=True)
+        lam2 = trial.suggest_float('lam2', 1e-4, Q_sum, log=True)
         num_sweeps = trial.suggest_int('num_sweeps', 5000, 30000, step=500)
 
         trial.set_user_attr('lam1', lam1)
@@ -311,7 +355,7 @@ def make_objective(
                 'beta_max_mult': beta_max_mult,
             }
 
-        # Run evaluation
+        # Run evaluation (returns raw SQR)
         try:
             result = evaluate_qubo(
                 env=env,
@@ -344,7 +388,6 @@ def make_objective(
         esr = result.get('ESR', np.nan)
         mcr = result.get('MCR', np.nan)
 
-        # Store user attrs
         trial.set_user_attr('feas_rate', feas_rate)
         trial.set_user_attr('best_sqr', best_sqr)
         trial.set_user_attr('avg_sqr', avg_sqr)
@@ -352,7 +395,7 @@ def make_objective(
         trial.set_user_attr('ESR', esr)
         trial.set_user_attr('MCR', mcr)
 
-        # Compute objective value
+        # Compute objective value (now using raw SQR)
         if objective_type == 'BestOnly':
             return 1.0 - best_sqr
         elif objective_type == 'Lin':
@@ -380,7 +423,7 @@ def make_objective(
 
 
 # -----------------------------------------------------------------------------
-# 3. run_optuna_study – Create/load and run study
+# 3. run_optuna_study – Create/load and run study (unchanged)
 # -----------------------------------------------------------------------------
 
 def run_optuna_study(
@@ -394,10 +437,7 @@ def run_optuna_study(
     load_if_exists: bool = False,
     verbose: bool = True,
 ) -> 'optuna.Study':
-    """
-    Create or load an Optuna study with RDBStorage.
-    Returns the study object.
-    """
+    """Create or load an Optuna study with RDBStorage."""
     import optuna
     from optuna.storages import RDBStorage
 
@@ -405,20 +445,14 @@ def run_optuna_study(
     storage_dir.mkdir(parents=True, exist_ok=True)
     db_path = storage_dir / f"{experiment_name}.db"
 
-    # Determine directions
     if directions is None:
-        if isinstance(objective, optuna.study.BaseObjective) or hasattr(objective, '__name__'):
-            # Try to infer from objective type (single vs multi)
-            directions = ['minimize']
-        else:
-            directions = ['minimize']
+        directions = ['minimize']
 
     storage = RDBStorage(
         url=f"sqlite:///{db_path}",
         engine_kwargs={'connect_args': {'timeout': 60, 'check_same_thread': False}}
     )
 
-    # Sampler
     if sampler_type == 'TPE':
         sampler = optuna.samplers.TPESampler(multivariate=True, seed=seed)
     elif sampler_type == 'NSGAII':
@@ -434,33 +468,23 @@ def run_optuna_study(
         load_if_exists=load_if_exists,
     )
 
-    if verbose:
-        print(f"  Study: {experiment_name}")
-        print(f"  DB: {db_path}")
-        print(f"  Trials so far: {len(study.trials)}")
-        print(f"  Target trials: {n_trials}")
-        print("  Optimizing...")
-
-    # Only run if we have not reached the target
     existing_trials = len(study.trials)
     if existing_trials < n_trials:
+        if verbose:
+            print(f"  Optimizing {n_trials - existing_trials} more trials...")
         try:
             study.optimize(objective, n_trials=n_trials - existing_trials, show_progress_bar=True)
         except Exception as e:
             print(f"  ⚠️ Optimization failed: {e}")
-            # Still return the study with whatever trials we have
     else:
         if verbose:
             print(f"  ✅ Study already has {existing_trials} trials. Skipping optimization.")
-
-    if verbose:
-        print(f"  ✅ Study complete. Total trials: {len(study.trials)}")
 
     return study
 
 
 # -----------------------------------------------------------------------------
-# 4. validate_study – Validate top trials
+# 4. validate_study – Validate top trials (unchanged, uses raw SQR from evaluate_qubo)
 # -----------------------------------------------------------------------------
 
 def validate_study(
@@ -475,16 +499,11 @@ def validate_study(
     verbose: bool = True,
 ) -> Dict:
     """
-    Extract top_k trials from the study and re-evaluate them with val_reads.
-    Returns a validation results dict with:
-        - best_sqr, avg_top5_sqr, feas_rate
-        - spearman_rho, spearman_p
-        - trials: list of validated trial details (lam1, lam2, best_sqr, feas_rate, ESR, MCR)
+    Extract top_k trials and re-evaluate with more reads.
+    Returns validation results with raw SQR.
     """
-    # Determine directions and get best trials
     directions = study.directions
     if len(directions) == 1:
-        # Single objective: sort by value
         valid_trials = [t for t in study.trials if t.value is not None and np.isfinite(t.value)]
         if valid_trials:
             sorted_trials = sorted(valid_trials, key=lambda t: t.value)
@@ -493,7 +512,6 @@ def validate_study(
             sorted_trials = sorted(valid_trials, key=lambda t: t.user_attrs.get('best_sqr', 0.0), reverse=True)
         top_trials = sorted_trials[:top_k]
     else:
-        # Multi-objective: use Pareto front
         pareto_trials = study.best_trials
         feasible_pareto = [t for t in pareto_trials if t.user_attrs.get('feas_rate', 0.0) > 0.01]
         if feasible_pareto:
@@ -522,7 +540,6 @@ def validate_study(
         print(f"  Validating {len(top_trials)} trials with {val_reads} reads...")
 
     for trial in top_trials:
-        # Extract trial parameters
         lam1 = trial.params.get('lam1', 1.0)
         lam2 = trial.params.get('lam2', 1.0)
         num_sweeps = trial.params.get('num_sweeps', 10000)
@@ -546,14 +563,11 @@ def validate_study(
                 'beta_max_mult': beta_max_mult,
             }
 
-        # Get tuning score
         if len(directions) == 1:
             tuning_score = trial.value if trial.value is not None else 1.0
         else:
-            # For multi-objective, use the first objective (1 - best_sqr)
             tuning_score = 1.0 - trial.user_attrs.get('best_sqr', 0.0)
 
-        # Evaluate with more reads
         try:
             result = evaluate_qubo(
                 env=env,
@@ -593,19 +607,13 @@ def validate_study(
         tuning_scores.append(tuning_score)
         validation_sqrs.append(best_sqr)
 
-    # Compute summary statistics
-    if val_results:
-        valid_best_sqrs = [r['best_sqr'] for r in val_results if np.isfinite(r['best_sqr']) and r['best_sqr'] > 0]
-        if valid_best_sqrs:
-            best_idx = np.argmax(valid_best_sqrs)
-            best_sqr = valid_best_sqrs[best_idx]
-            # Find the corresponding trial
-            best_trial = next((r for r in val_results if r['best_sqr'] == best_sqr), None)
-            feas_rate = best_trial['feas_rate'] if best_trial else np.nan
-        else:
-            best_sqr = np.nan
-            feas_rate = np.nan
-
+    # Summary stats
+    valid_best_sqrs = [r['best_sqr'] for r in val_results if np.isfinite(r['best_sqr']) and r['best_sqr'] > 0]
+    if valid_best_sqrs:
+        best_sqr = max(valid_best_sqrs)
+        # Find corresponding trial
+        best_trial = next((r for r in val_results if r['best_sqr'] == best_sqr), None)
+        feas_rate = best_trial['feas_rate'] if best_trial else np.nan
         top5_sqrs = sorted(valid_best_sqrs, reverse=True)[:5]
         avg_top5 = np.mean(top5_sqrs) if top5_sqrs else np.nan
     else:
@@ -613,7 +621,6 @@ def validate_study(
         avg_top5 = np.nan
         feas_rate = np.nan
 
-    # Spearman correlation
     paired = [(ts, vs) for ts, vs in zip(tuning_scores, validation_sqrs)
               if np.isfinite(vs) and vs > 0 and np.isfinite(ts)]
     if len(paired) >= 3:
@@ -661,21 +668,11 @@ def run_ablation_experiment(
     verbose: bool = True,
 ) -> Tuple[Dict, 'optuna.Study']:
     """
-    Full pipeline for a single ablation/comparison experiment:
-        1. Build objective function.
-        2. Run Optuna study (or load existing).
-        3. Validate top trials.
-        4. Save results to storage_dir.
-        5. Generate standard plots:
-            - Optuna parameter importance, parallel, slice, learning curve
-            - Performance scatter (SQR vs ESR, Feasibility vs MCR)
-            - QUBO matrix heatmap for the best trial
-        6. Return validation_results, study.
+    Full pipeline for a single ablation/comparison experiment.
     """
     storage_dir = Path(storage_dir)
     storage_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build objective
     objective = make_objective(
         env=env,
         schedule_type=schedule_type,
@@ -686,11 +683,9 @@ def run_ablation_experiment(
         compute_esr_mcr=compute_esr_mcr,
     )
 
-    # Determine if multi-objective
     directions = ['minimize'] if objective_type != 'Multi' else ['minimize', 'minimize']
     sampler_type = 'TPE' if objective_type != 'Multi' else 'NSGAII'
 
-    # Run study
     study = run_optuna_study(
         experiment_name=experiment_name,
         objective=objective,
@@ -703,7 +698,6 @@ def run_ablation_experiment(
         verbose=verbose,
     )
 
-    # Validate
     val_results = validate_study(
         study=study,
         env=env,
@@ -716,11 +710,10 @@ def run_ablation_experiment(
         verbose=verbose,
     )
 
-    # Save validation results
     val_path = storage_dir / f"{experiment_name}_val.pkl"
     safe_save_pickle(val_path, val_results, verbose=verbose)
 
-    # Also save a JSON summary
+    # JSON summary
     json_path = storage_dir / f"{experiment_name}_val.json"
     json_data = {
         'experiment_name': experiment_name,
@@ -744,20 +737,14 @@ def run_ablation_experiment(
     plot_dir = storage_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Optuna posterior plots
     save_optuna_plots(study, plot_dir, show_fig=show_plots)
-
-    # 2. Learning curve
     plot_optuna_learning_curve(study, plot_dir / "learning_curve.png", show_fig=show_plots)
 
-    # 3. Performance scatter (SQR vs ESR, Feasibility vs MCR)
     if val_results['trials']:
         scatter_path = plot_dir / "performance_scatter.png"
         plot_performance_scatter(val_results, scatter_path, show_fig=show_plots)
 
-        # 4. QUBO matrix for the best trial (if available)
         if val_results['best_sqr'] > 0:
-            # Find the trial with best SQR
             best_trial = next((t for t in val_results['trials'] if t['best_sqr'] == val_results['best_sqr']), None)
             if best_trial:
                 lam1 = best_trial['lam1']
@@ -773,9 +760,9 @@ def run_ablation_experiment(
     return val_results, study
 
 
-# ============================================================================
+# -----------------------------------------------------------------------------
 # Module exports
-# ============================================================================
+# -----------------------------------------------------------------------------
 
 __all__ = [
     'evaluate_qubo',

@@ -293,6 +293,7 @@ def get_environment(
         'coords': coords,
         'U': U,
         'M_indices': M_indices,
+        'pairwise_raw': pairwise_raw, 
         'pairwise_norm': pairwise_norm,
         'Q_obj': Q_obj,
         'gurobi_miqp': gurobi_miqp,
