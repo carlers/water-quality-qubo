@@ -1,11 +1,17 @@
-#@title 🧪 OBJECTIVE ABLATION v5 – 9 Objectives (Normalized QUBO)
+#@title 🧪 OBJECTIVE ABLATION v6 – Refactored (Normalized QUBO)
 """
 ================================================================================
-OBJECTIVE ABLATION v5 – 9 Objectives (Normalized QUBO)
+OBJECTIVE ABLATION v6 – Refactored (Normalized QUBO)
 ================================================================================
 
-This script tests 9 different objective functions on the normalized QUBO
-environment, using the winning schedule from schedule_comparison_v5.py.
+This script tests 9 objective functions on the normalized QUBO environment
+using the winning schedule from schedule_comparison_v5.py.
+
+Key features:
+    - Uses get_environment() for normalized QUBO (fixed L_c).
+    - Uses run_ablation_experiment() for tuning + validation.
+    - Uses plotting.py for visualizations.
+    - FORCE_RERUN flag: deletes all existing results for a clean slate.
 
 Objectives tested:
     - BestOnly    : maximize best_sqr
@@ -18,18 +24,20 @@ Objectives tested:
     - Penalty-0.5 : best_sqr - 0.5*(1-feas_rate)
     - Multi       : Pareto [1-best_sqr, 1-feas_rate] (NSGA-II)
 
-Trial budget: 150 trials per objective.
-Validation: 256 reads on top 15 trials.
+Configuration:
+    - SEED, K_new, L_c, CONNECTIVITY_RANGE are fixed physical parameters.
+    - WINNING_SCHEDULE: set to the winner from schedule_comparison_v5.py.
+    - 150 trials per objective (balanced speed/statistics).
+    - Validation: top 15 trials with 256 reads.
 
-Results are saved to: results/ablation_v5/
+Results saved to: results/ablation_v6/
 ================================================================================
 """
 
 import sys
 import os
-import time
+import shutil
 import gc
-import json
 import warnings
 from pathlib import Path
 
@@ -41,7 +49,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, "/content")
 os.chdir("/content")
 
-# Import Level 2 modules (refactored)
+# Import refactored modules
 from src.environment import get_environment
 from src.experiment import run_ablation_experiment
 from src.plotting import plot_experiment_comparison_table, display_saved_plots
@@ -50,26 +58,23 @@ from src.utils import safe_save_pickle, NumpyEncoder
 warnings.filterwarnings('ignore')
 
 # ============================================================================
-# CONFIGURATION
+# USER CONFIGURATION
 # ============================================================================
 
-# Experiment config
+# --- Physical parameters ---
 SEED = 42
 K_NEW = 5
-L_C = 5.0
-CONNECTIVITY_RANGE = 8.0  # km (adjust as needed)
-N_TRIALS = 150            # Per objective
-TUNING_READS = 100
-VAL_READS = 256
-VAL_TOP_K = 15
-TUNING_SEED = 42
-VAL_SEED = 43
-USE_SEED_NONE = True
+L_C = 5.0                        # FIXED (km)
+CONNECTIVITY_RANGE = 8.0         # FIXED (km)
+L_W = 1.0
+CURRENT_VECTOR = (1.0, 0.0)
+BETA = 1.0
+DELTA = 1.0
 
-# --- IMPORTANT: Set this to the winning schedule from schedule_comparison_v5 ---
-WINNING_SCHEDULE = "new"  # 'new' or 'old' – update based on comparison results
+# --- Winning schedule from schedule_comparison_v5 ---
+WINNING_SCHEDULE = "new"         # 'new' or 'old' – update after running comparison
 
-# Objectives to test (9 total)
+# --- Experiment parameters ---
 OBJECTIVE_TYPES = [
     "BestOnly",
     "Lin",
@@ -81,27 +86,71 @@ OBJECTIVE_TYPES = [
     "Penalty-0.5",
     "Multi",
 ]
+N_TRIALS = 150                   # Per objective
+TUNING_READS = 100
+VAL_READS = 256
+VAL_TOP_K = 15
+TUNING_SEED = 42
+VAL_SEED = 43
+USE_SEED_NONE = True
 
-# Storage
-SAVE_DIR = Path("results/ablation_v5")
+# --- Force rerun flag ---
+FORCE_RERUN = True               # If True, delete all existing ablation results
+
+# --- Output ---
+SAVE_DIR = Path("results/ablation_v6")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
+# ============================================================================
+# PRINT CONFIGURATION
+# ============================================================================
+
 print("=" * 80)
-print("🧪 OBJECTIVE ABLATION v5 – 9 Objectives (Normalized QUBO)")
+print("🧪 OBJECTIVE ABLATION v6 – Refactored (Normalized QUBO)")
 print("=" * 80)
 print(f"\n[Configuration]")
 print(f"  Seed: {SEED}")
 print(f"  K_new: {K_NEW}")
 print(f"  L_c: {L_C} km (FIXED)")
-print(f"  Connectivity range: {CONNECTIVITY_RANGE} km")
+print(f"  Connectivity range: {CONNECTIVITY_RANGE} km (FIXED)")
 print(f"  Winning schedule: {WINNING_SCHEDULE}")
+print(f"  Objectives: {OBJECTIVE_TYPES}")
 print(f"  Trials per objective: {N_TRIALS}")
 print(f"  Tuning reads: {TUNING_READS}")
 print(f"  Validation reads: {VAL_READS}")
 print(f"  Val top K: {VAL_TOP_K}")
 print(f"  USE_SEED_NONE: {USE_SEED_NONE}")
-print(f"  Objectives: {OBJECTIVE_TYPES}")
+print(f"  FORCE_RERUN: {FORCE_RERUN}")
 print(f"  Results directory: {SAVE_DIR.resolve()}")
+
+# ============================================================================
+# CLEANUP IF FORCE_RERUN
+# ============================================================================
+
+if FORCE_RERUN:
+    print("\n" + "-" * 80)
+    print("[Cleanup] FORCE_RERUN enabled – deleting existing files...")
+    print("-" * 80)
+    
+    # Remove entire ablation subdirectories
+    for obj in OBJECTIVE_TYPES:
+        obj_dir = SAVE_DIR / obj
+        if obj_dir.exists():
+            shutil.rmtree(obj_dir)
+            print(f"  Deleted: {obj_dir}")
+    
+    # Remove any top-level comparison files
+    for file in SAVE_DIR.glob("ablation_*"):
+        file.unlink()
+        print(f"  Deleted: {file}")
+    
+    # Remove progress pickle if exists
+    progress_file = SAVE_DIR / "ablation_progress.pkl"
+    if progress_file.exists():
+        progress_file.unlink()
+        print(f"  Deleted: {progress_file}")
+    
+    print("  ✅ Cleanup complete.")
 
 # ============================================================================
 # PHASE 1: Load/Create Environment
@@ -115,13 +164,14 @@ env = get_environment(
     seed=SEED,
     K_new=K_NEW,
     L_c=L_C,
-    L_w=1.0,
-    beta=1.0,
-    delta=1.0,
+    L_w=L_W,
+    beta=BETA,
+    delta=DELTA,
     connectivity_range=CONNECTIVITY_RANGE,
-    current_vector=(1.0, 0.0),
-    force_recompute=False,
+    current_vector=CURRENT_VECTOR,
+    force_recompute=FORCE_RERUN,
     verbose=True,
+    gdrive_base=None,              # Set to GDrive path if needed
 )
 
 print(f"\n  ✅ Environment loaded.")
@@ -159,17 +209,14 @@ for objective_type in OBJECTIVE_TYPES:
             tuning_seed=TUNING_SEED,
             use_seed_none=USE_SEED_NONE,
             compute_esr_mcr=True,
-            force_retune=True,
-            show_plots=True,
+            force_retune=True,                # Always retune (fresh run)
+            show_plots=True,                  # Display plots inline
             verbose=True,
         )
-
         all_results[objective_type] = result
         study_objects[objective_type] = study
-
     except Exception as e:
         print(f"  ❌ {objective_type} failed: {e}")
-        # Store placeholder result
         all_results[objective_type] = {
             'best_sqr': np.nan,
             'avg_top5_sqr': np.nan,
@@ -180,12 +227,11 @@ for objective_type in OBJECTIVE_TYPES:
             'trials': [],
             'error': str(e),
         }
-
-    # Periodic saving of progress
+    # Save progress after each objective
     safe_save_pickle(SAVE_DIR / "ablation_progress.pkl", all_results)
 
 # ============================================================================
-# PHASE 3: Comparison and Visualization
+# PHASE 3: Comparison and Ranking
 # ============================================================================
 
 print("\n" + "-" * 80)
@@ -217,7 +263,7 @@ print(f"  ✅ Results saved to {csv_path}")
 
 # Print rich table to terminal
 print("\n" + "=" * 80)
-print("🏆 OBJECTIVE ABLATION RESULTS (v5)")
+print("🏆 OBJECTIVE ABLATION RESULTS (v6)")
 print("=" * 80)
 print(df_sorted.to_string(index=False, float_format="%.4f"))
 
@@ -251,6 +297,9 @@ if len(valid_rows) > 0:
             print(f"     Spearman ρ = {tie_winner_row['Spearman ρ']:.4f}")
             print(f"     Best SQR = {tie_winner_row['Best SQR']:.4f}")
             winner = tie_winner
+            best_rho = tie_winner_row['Spearman ρ']
+            best_sqr = tie_winner_row['Best SQR']
+            best_feas = tie_winner_row['Feas Rate']
 
     # Save winner
     with open(SAVE_DIR / "ablation_winner.txt", "w") as f:
@@ -306,7 +355,7 @@ else:
     print(f"\n  ⚠️ No plots found for {winner_name}")
 
 # ============================================================================
-# PHASE 5: Additional analysis – Extract best λ values
+# PHASE 5: Extract best hyperparameters from winner
 # ============================================================================
 
 print("\n" + "-" * 80)
@@ -314,21 +363,23 @@ print("[5] Extracting best hyperparameters from winner...")
 print("-" * 80)
 
 if winner_name in study_objects:
-    study = study_objects[winner_name]
-    # Get best trial from validation
     winner_result = all_results[winner_name]
     if winner_result.get('trials'):
+        # The first trial in the list is the best (we sorted by best_sqr in validation)
         best_trial = winner_result['trials'][0]
         print(f"  Best validated trial for {winner_name}:")
-        print(f"    λ₁ = {best_trial['lam1']:.4f}")
-        print(f"    λ₂ = {best_trial['lam2']:.4f}")
+        print(f"    λ₁ = {best_trial.get('lam1', np.nan):.4f}")
+        print(f"    λ₂ = {best_trial.get('lam2', np.nan):.4f}")
         print(f"    num_sweeps = {best_trial.get('num_sweeps', 'N/A')}")
         if 'ESR' in best_trial and not np.isnan(best_trial['ESR']):
             print(f"    ESR = {best_trial['ESR']:.4f}")
         if 'MCR' in best_trial and not np.isnan(best_trial['MCR']):
             print(f"    MCR = {best_trial['MCR']:.4f}")
+    else:
+        print(f"  ⚠️ No validated trials found for {winner_name}")
 
-    # Also get best from Optuna study directly (for comparison)
+    # Also get best from Optuna study directly (tuning)
+    study = study_objects[winner_name]
     if study:
         best_trial_optuna = study.best_trial
         print(f"\n  Best Optuna trial for {winner_name} (tuning):")
@@ -341,7 +392,7 @@ if winner_name in study_objects:
 # ============================================================================
 
 print("\n" + "=" * 80)
-print("✅ OBJECTIVE ABLATION v5 COMPLETE!")
+print("✅ OBJECTIVE ABLATION v6 COMPLETE!")
 print("=" * 80)
 print(f"\n📁 Results saved to: {SAVE_DIR.resolve()}")
 print("   - ablation_results.csv (ranked summary table)")
@@ -351,13 +402,14 @@ print("   - {objective}/ (detailed results + plots for each objective)")
 
 # Save a summary JSON with all metrics
 summary = {
-    'experiment': 'objective_ablation_v5',
+    'experiment': 'objective_ablation_v6',
     'seed': SEED,
     'winning_schedule': WINNING_SCHEDULE,
     'winner': winner_name if 'winner_name' in locals() else None,
     'results': df_sorted.to_dict('records'),
 }
 with open(SAVE_DIR / "ablation_summary.json", "w") as f:
+    import json
     json.dump(summary, f, indent=2, cls=NumpyEncoder)
 
 # Clean up
