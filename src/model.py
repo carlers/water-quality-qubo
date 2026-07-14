@@ -1,3 +1,4 @@
+#@title Updated model.py with Two-Step Normalization
 """
 src/model.py
 
@@ -9,6 +10,13 @@ This module provides:
     2. MIQP builder (Gurobi) with explicit constraints for exact baseline.
     3. QUBO builder (JijModeling + transpiler, with manual fallback).
     4. Utility functions for solution extraction and energy evaluation.
+    5. Two-step QUBO normalization (Lee et al. 2025 + unit variance scaling).
+
+NEW in this version:
+    - compute_objective_variance: Var(h + J) over random binary assignments
+    - balance_quadratic_variance: Scale J to match Var(h) (Lee et al. 2025)
+    - normalize_objective_to_unit_variance: Normalize total objective to unit variance
+    - prepare_normalized_qubo: Orchestrator for both steps
 
 All functions are designed to be:
     - Fully deterministic (seeded).
@@ -19,7 +27,6 @@ All functions are designed to be:
 
 import json
 import pickle
-from tabnanny import verbose
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
@@ -27,9 +34,9 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 import numpy as np
 from scipy.spatial import cKDTree
 
-# -----------------------------------------------------------------------------
-# Core Pairwise Term Computation
-# -----------------------------------------------------------------------------
+# ============================================================================
+# Core Pairwise Term Computation (UNCHANGED)
+# ============================================================================
 
 def compute_pairwise_terms(
     coords: np.ndarray,
@@ -142,8 +149,6 @@ def compute_pairwise_terms(
             W_ij = 0.0
 
         # Compute W_ji (reverse direction)
-        cos_theta_rev = (dx * v_unit[0] + dy * v_unit[1]) / d  # Actually same as above since dx is from i to j.
-        # For W_ji, we need vector from j to i: (-dx, -dy)
         cos_theta_ji = (-dx * v_unit[0] + -dy * v_unit[1]) / d
         cos_theta_ji = np.clip(cos_theta_ji, -1.0, 1.0)
         if cos_theta_ji > 0.7071:
@@ -203,7 +208,6 @@ def compute_pairwise_terms(
             if i < j:
                 key = (i, j)
                 if key in raw_quad:
-                    # raw_quad is already symmetrized, so we can just use it.
                     quad[key] = raw_quad[key]
 
     if verbose:
@@ -238,9 +242,221 @@ def compute_pairwise_terms(
     }
 
 
-# -----------------------------------------------------------------------------
-# Gurobi MIQP Builder (Exact Baseline)
-# -----------------------------------------------------------------------------
+# ============================================================================
+# NEW: Two-Step QUBO Normalization (Lee et al. 2025 + Unit Variance)
+# ============================================================================
+
+def compute_objective_variance(
+    h: Dict[int, float],
+    J: Dict[Tuple[int, int], float],
+    n_samples: int = 10000,
+    seed: int = 42,
+) -> Tuple[float, float]:
+    """
+    Compute variance of total objective energy E = Σ h_i x_i + Σ J_ij x_i x_j
+    over random binary assignments.
+
+    Args:
+        h: dict {i: coeff} for linear terms
+        J: dict {(i,j): coeff} for quadratic terms (i < j)
+        n_samples: number of random assignments
+        seed: random seed
+
+    Returns:
+        var_total: float (variance of the total objective energy)
+        scale: float = sqrt(var_total)
+    """
+    rng = np.random.RandomState(seed)
+
+    # Determine dimension from keys
+    max_idx = max(h.keys()) if h else 0
+    max_idx = max(max_idx, max([max(k) for k in J.keys()]) if J else 0)
+    N = max_idx + 1
+
+    # Generate random binary vectors
+    samples = rng.randint(0, 2, size=(n_samples, N))
+
+    # Compute energies for each sample
+    energies = np.zeros(n_samples)
+
+    # Linear terms
+    for idx, coeff in h.items():
+        energies += coeff * samples[:, idx]
+
+    # Quadratic terms
+    for (i, j), coeff in J.items():
+        energies += coeff * samples[:, i] * samples[:, j]
+
+    var_total = np.var(energies)
+    scale = np.sqrt(var_total) if var_total > 0 else 1.0
+
+    return var_total, scale
+
+
+def balance_quadratic_variance(
+    h: Dict[int, float],
+    J: Dict[Tuple[int, int], float],
+    n_samples: int = 10000,
+    seed: int = 42,
+) -> Tuple[Dict[Tuple[int, int], float], float, float, float, float]:
+    """
+    Scale J to match variance of h (Lee et al. 2025).
+
+    Args:
+        h: dict {i: coeff} for linear terms
+        J: dict {(i,j): coeff} for quadratic terms (i < j)
+        n_samples: number of random assignments
+        seed: random seed
+
+    Returns:
+        J_balanced: dict with scaled coefficients
+        j_scale: float (the scaling factor applied)
+        var_h: float (original Var(h))
+        var_J_original: float (original Var(J))
+        var_J_balanced: float (Var(J) after scaling)
+    """
+    # Compute Var(h) and Var(J) separately
+    var_h, _ = compute_objective_variance(h, {}, n_samples, seed)
+    var_J_original, _ = compute_objective_variance({}, J, n_samples, seed)
+
+    # Compute scaling factor
+    if var_J_original > 0:
+        j_scale = np.sqrt(var_h / var_J_original)
+    else:
+        j_scale = 1.0
+
+    # Scale J
+    J_balanced = {(i, j): val * j_scale for (i, j), val in J.items()}
+
+    # Verify Var(J_balanced) ≈ Var(h)
+    var_J_balanced, _ = compute_objective_variance({}, J_balanced, n_samples, seed)
+
+    return J_balanced, j_scale, var_h, var_J_original, var_J_balanced
+
+
+def normalize_objective_to_unit_variance(
+    h: Dict[int, float],
+    J_balanced: Dict[Tuple[int, int], float],
+    target_variance: float = 1.0,
+    n_samples: int = 10000,
+    seed: int = 42,
+) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], float, float]:
+    """
+    Normalize h and J so that Var(h + J) = target_variance.
+
+    Args:
+        h: dict {i: coeff} for linear terms
+        J_balanced: dict {(i,j): coeff} for quadratic terms (already balanced)
+        target_variance: desired variance (default: 1.0)
+        n_samples: number of random assignments
+        seed: random seed
+
+    Returns:
+        h_norm: dict with scaled linear coefficients
+        J_norm: dict with scaled quadratic coefficients
+        total_scale: float (the scaling factor applied)
+        var_total_original: float (Var(h + J_balanced) before normalization)
+    """
+    # Compute total variance
+    var_total_original, scale = compute_objective_variance(h, J_balanced, n_samples, seed)
+
+    # Compute normalization factor
+    if var_total_original > 0:
+        norm_scale = np.sqrt(var_total_original / target_variance)
+    else:
+        norm_scale = 1.0
+
+    # Scale both h and J
+    h_norm = {i: val / norm_scale for i, val in h.items()}
+    J_norm = {(i, j): val / norm_scale for (i, j), val in J_balanced.items()}
+
+    return h_norm, J_norm, norm_scale, var_total_original
+
+
+def prepare_normalized_qubo(
+    pairwise_data: Dict,
+    target_variance: float = 1.0,
+    n_samples: int = 10000,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Tuple[Dict[int, float], Dict[Tuple[int, int], float], Dict]:
+    """
+    Prepare h and J for QUBO by:
+    1. Balancing Var(h) and Var(J) (Lee et al. 2025).
+    2. Normalizing total objective to target_variance.
+
+    Args:
+        pairwise_data: Output from compute_pairwise_terms()
+        target_variance: Desired variance of the total objective (default: 1.0)
+        n_samples: Number of random assignments for variance estimation
+        seed: Random seed
+        verbose: Print progress
+
+    Returns:
+        h_norm: dict {i: coeff} for linear terms (normalized)
+        J_norm: dict {(i,j): coeff} for quadratic terms (balanced + normalized)
+        scales: dict with intermediate values for debugging
+    """
+    h = pairwise_data["linear"]
+    J = pairwise_data["quad"]
+
+    if verbose:
+        print("\n[prepare_normalized_qubo] Starting two-step normalization...")
+        print(f"  target_variance = {target_variance}")
+        print(f"  n_samples = {n_samples}")
+
+    # Step 1: Balance Var(h) and Var(J) (Lee et al. 2025)
+    J_balanced, j_scale, var_h, var_J_original, var_J_balanced = balance_quadratic_variance(
+        h, J, n_samples, seed
+    )
+
+    if verbose:
+        print(f"\n  Step 1: Quadratic variance balancing")
+        print(f"    Var(h)           : {var_h:.6f}")
+        print(f"    Var(J) original  : {var_J_original:.6f}")
+        print(f"    j_scale          : {j_scale:.4f}")
+        print(f"    Var(J) balanced  : {var_J_balanced:.6f}")
+        print(f"    Ratio (J/h)      : {var_J_balanced / var_h:.4f}")
+
+    # Step 2: Normalize total objective to target_variance
+    h_norm, J_norm, total_scale, var_total_original = normalize_objective_to_unit_variance(
+        h, J_balanced, target_variance, n_samples, seed
+    )
+
+    if verbose:
+        print(f"\n  Step 2: Total objective normalization")
+        print(f"    Var(h + J) original: {var_total_original:.6f}")
+        print(f"    total_scale         : {total_scale:.4f}")
+        print(f"    target_variance     : {target_variance:.6f}")
+
+    # Compute final variance for verification
+    var_final, _ = compute_objective_variance(h_norm, J_norm, n_samples, seed)
+    if verbose:
+        print(f"    Var(h_norm + J_norm): {var_final:.6f} (should be {target_variance:.6f})")
+
+    # Build scales dict
+    scales = {
+        "var_h_original": var_h,
+        "var_J_original": var_J_original,
+        "j_scale": j_scale,
+        "var_J_balanced": var_J_balanced,
+        "var_total_original": var_total_original,
+        "total_scale": total_scale,
+        "var_total_final": var_final,
+        "target_variance": target_variance,
+    }
+
+    if verbose:
+        print("\n  ✅ Normalization complete.")
+        print(f"    h range: {min(h_norm.values()):.4f} to {max(h_norm.values()):.4f}")
+        print(f"    J range: {min(J_norm.values()):.4f} to {max(J_norm.values()):.4f}")
+
+    return h_norm, J_norm, scales
+
+
+# ============================================================================
+# Gurobi MIQP Builder (UNCHANGED)
+# ============================================================================
 
 def build_miqp(
     pairwise_data: Dict,
@@ -302,7 +518,7 @@ def build_miqp(
 
     model.setParam("TimeLimit", time_limit)
     model.setParam("MIPGap", mip_gap)
-    model.setParam("NonConvex", 2)  # Important for quadratic objective
+    model.setParam("NonConvex", 2)
 
     # Add binary variables
     x_vars = {}
@@ -315,7 +531,6 @@ def build_miqp(
     lin_expr = gp.quicksum(linear[i] * x_vars[i] for i in free_indices)
     quad_expr = gp.QuadExpr()
     for (i, j), coeff in quad.items():
-        # i and j are guaranteed free and i < j
         quad_expr += coeff * x_vars[i] * x_vars[j]
 
     model.setObjective(lin_expr + quad_expr, GRB.MINIMIZE)
@@ -323,21 +538,13 @@ def build_miqp(
     # Budget constraint: sum(x_i) == K_new
     model.addConstr(gp.quicksum(x_vars[i] for i in free_indices) == K_new, name="budget")
 
-    # Connectivity constraints: x_i <= sum_{j in N_i} x_j
-    # For fixed stations M, they are always 1, so they contribute a constant to RHS.
+    # Connectivity constraints
     for i in free_indices:
         if i not in neighbors:
-            # Isolated point: no neighbors -> constraint is x_i <= 0 -> x_i = 0
-            # But this is a soft constraint in QUBO; in MIQP we enforce strictly.
-            # Since we have a budget constraint, we can just force x_i = 0.
-            # However, connectivity is supposed to be a guarantee, so we add:
-            # x_i <= 0  (which forces x_i = 0)
             model.addConstr(x_vars[i] == 0, name=f"conn_isolated_{i}")
             continue
 
-        # RHS sum over free neighbors
         rhs_free = gp.quicksum(x_vars[j] for j in neighbors[i] if j in free_indices)
-        # RHS constant from fixed neighbors
         rhs_fixed = sum(1 for j in neighbors[i] if j in M_indices)
 
         model.addConstr(
@@ -363,9 +570,9 @@ def build_miqp(
     }
 
 
-# -----------------------------------------------------------------------------
-# QUBO Builders (for OpenJij, SA, SQA, QAOA)
-# -----------------------------------------------------------------------------
+# ============================================================================
+# QUBO Builders (UNCHANGED)
+# ============================================================================
 
 def build_qubo_jijmodeling(
     pairwise_data: Dict,
@@ -380,21 +587,6 @@ def build_qubo_jijmodeling(
     This constructs the QUBO symbolically and then uses
     jijmodeling_transpiler.core.pubo.transpile_to_pubo to extract
     h, J, and constant.
-
-    Args:
-        pairwise_data: Output from compute_pairwise_terms.
-        K_new: Number of new stations to select.
-        lambda1: Budget penalty coefficient.
-        lambda2: Connectivity penalty coefficient.
-        verbose: Print progress.
-
-    Returns:
-        Dict with keys:
-            'h': dict {i: coeff} for free indices.
-            'J': dict {(i,j): coeff} for i<j.
-            'constant': float,
-            'problem': jm.Problem (if available),
-            'status': str,
     """
     try:
         import jijmodeling as jm
@@ -413,9 +605,7 @@ def build_qubo_jijmodeling(
     if N_free == 0:
         raise ValueError("No free variables. Cannot build QUBO.")
 
-    # Prepare arrays for JijModeling
-    # We need 1D arrays for linear, 2D for quad and neighbor mask
-    # Map free index -> position 0..N_free-1
+    # Map free index -> position
     pos = {idx: p for p, idx in enumerate(free_indices)}
 
     a_arr = np.zeros(N_free)
@@ -427,17 +617,16 @@ def build_qubo_jijmodeling(
         p_i = pos[i]
         p_j = pos[j]
         b_arr[p_i, p_j] = coeff
-        b_arr[p_j, p_i] = coeff  # ensure symmetry (though quad only has i<j)
+        b_arr[p_j, p_i] = coeff
 
     neigh_mask = np.zeros((N_free, N_free), dtype=int)
     for i, neigh_list in neighbors.items():
         p_i = pos[i]
         for j in neigh_list:
-            if j in pos:  # only free neighbors
+            if j in pos:
                 p_j = pos[j]
                 neigh_mask[p_i, p_j] = 1
 
-    # JijModeling placeholders
     a = jm.Placeholder("a", ndim=1, shape=(N_free,))
     b = jm.Placeholder("b", ndim=2, shape=(N_free, N_free))
     mask = jm.Placeholder("mask", ndim=2, shape=(N_free, N_free))
@@ -445,16 +634,11 @@ def build_qubo_jijmodeling(
     lam1 = jm.Placeholder("lambda1", ndim=0)
     lam2 = jm.Placeholder("lambda2", ndim=0)
 
-    # Variables
     x = jm.Variable("x", shape=(N_free,), binary=True)
 
-    # Build objective
     linear_term = jm.sum(i, a[i] * x[i])
     quad_term = jm.sum([i, j], b[i, j] * x[i] * x[j], i < j)
     budget_penalty = lam1 * (jm.sum(i, x[i]) - K) ** 2
-
-    # Connectivity penalty: sum_i x_i * (1 - sum_{j in N_i} x_j)
-    # Expand: sum_i x_i - sum_i sum_{j in N_i} x_i x_j
     conn_penalty = lam2 * (
         jm.sum(i, x[i]) - jm.sum([i, j], mask[i, j] * x[i] * x[j])
     )
@@ -467,7 +651,6 @@ def build_qubo_jijmodeling(
     if verbose:
         print("[QUBO_Jij] Problem defined. Compiling...")
 
-    # Compile
     compiled = compile_model(problem)
     data = {
         "a": a_arr,
@@ -483,14 +666,11 @@ def build_qubo_jijmodeling(
 
     pubo_model = transpile_to_pubo(compiled, data)
 
-    # Extract h, J, constant
     h = {}
     J = {}
     constant = 0.0
 
-    # PUBO model contains linear and quadratic terms
     for term, coeff in pubo_model.pubo.items():
-        # term is a tuple of indices (i, j, ...)
         if len(term) == 0:
             constant += coeff
         elif len(term) == 1:
@@ -502,14 +682,11 @@ def build_qubo_jijmodeling(
                 i, j = j, i
             J[(i, j)] = J.get((i, j), 0.0) + coeff
         else:
-            # Higher-order terms (should not happen for QUBO, but warn)
             warnings.warn(f"Higher-order term found: {term} -> {coeff}. Ignoring.")
-            continue
 
     if verbose:
         print(f"[QUBO_Jij] Extracted: {len(h)} linear, {len(J)} quadratic, constant={constant:.4f}")
 
-    # Map positions back to original indices
     h_orig = {}
     for p, coeff in h.items():
         i = free_indices[p]
@@ -541,23 +718,7 @@ def build_qubo_manual(
     """
     Manually construct QUBO (h, J, constant) without JijModeling.
 
-    This is a fallback that expands the QUBO formula (Eq. 13) explicitly.
-    It handles both free-free and free-fixed interactions.
-
-    Args:
-        pairwise_data: Output from compute_pairwise_terms.
-        K_new: Number of new stations to select.
-        lambda1: Budget penalty coefficient.
-        lambda2: Connectivity penalty coefficient.
-        verbose: Print progress.
-
-    Returns:
-        Dict with keys:
-            'h': dict {i: coeff} for free indices.
-            'J': dict {(i,j): coeff} for i<j.
-            'constant': float,
-            'status': str,
-            'method': 'manual',
+    This is a fallback that expands the QUBO formula explicitly.
     """
     linear = pairwise_data["linear"]
     quad = pairwise_data["quad"]
@@ -569,12 +730,10 @@ def build_qubo_manual(
     if N_free == 0:
         raise ValueError("No free variables. Cannot build QUBO.")
 
-    # Initialize
     h = {}
     J = {}
     constant = 0.0
 
-    # Helper to add to h or J
     def add_linear(i, coeff):
         h[i] = h.get(i, 0.0) + coeff
 
@@ -586,47 +745,31 @@ def build_qubo_manual(
             i, j = j, i
         J[(i, j)] = J.get((i, j), 0.0) + coeff
 
-    # ------------------------------------------------------------------------
-    # 1. Base terms: linear + quadratic (from original objective)
-    # ------------------------------------------------------------------------
+    # Base terms: linear + quadratic
     for i, coeff in linear.items():
         add_linear(i, coeff)
 
     for (i, j), coeff in quad.items():
         add_quad(i, j, coeff)
 
-    # ------------------------------------------------------------------------
-    # 2. Budget penalty: lambda1 * (sum x_i - K)^2
-    #    Expand: lambda1 * (sum x_i)^2 - 2*lambda1*K * sum x_i + lambda1*K^2
-    # ------------------------------------------------------------------------
-    # Budget penalty: lambda1 * (sum x_i - K)^2
-    # Expansion: lambda1 * (Σx_i + 2Σ_{i<j} x_i x_j - 2K Σx_i + K^2)
+    # Budget penalty
     for i in free_indices:
-        add_linear(i, lambda1 * (1.0 - 2.0 * K_new))   # FIXED
+        add_linear(i, lambda1 * (1.0 - 2.0 * K_new))
 
-    # Quadratic: 2*lambda1 for each pair
     for idx_i, i in enumerate(free_indices):
-        for j in free_indices[idx_i+1:]:
+        for j in free_indices[idx_i + 1:]:
             add_quad(i, j, 2.0 * lambda1)
 
-    # Constant: lambda1 * K^2
     constant += lambda1 * (K_new ** 2)
 
-    # ------------------------------------------------------------------------
-    # 3. Connectivity penalty: lambda2 * sum_i x_i * (1 - sum_{j in N_i} x_j)
-    #    Expand: lambda2 * sum_i x_i - lambda2 * sum_i sum_{j in N_i} x_i x_j
-    # ------------------------------------------------------------------------
-    # Linear: lambda2 for each free i
+    # Connectivity penalty
     for i in free_indices:
         add_linear(i, lambda2)
 
-    # Quadratic: -lambda2 for each encounter.
-    # Because the neighborhood graph is mutual, each free-free pair is encountered 
-    # twice (once at i, once at j), correctly accumulating to -2 * lambda2.
     for i in free_indices:
-       if i not in neighbors:
-           continue
-       for j in neighbors[i]:
+        if i not in neighbors:
+            continue
+        for j in neighbors[i]:
             if j in M_indices:
                 add_linear(i, -lambda2)
             elif j in free_indices and i != j:
@@ -635,7 +778,7 @@ def build_qubo_manual(
     if verbose:
         print(f"[QUBO_Manual] Built: {len(h)} linear, {len(J)} quadratic, constant={constant:.4f}")
 
-      # DEBUG: Print penalty structure
+    # DEBUG: Print penalty structure
     if verbose:
         # Compute penalty for selecting K_new vs K_new+1 stations
         # Take the first few free indices as an example
@@ -686,22 +829,6 @@ def build_qubo(
     Main QUBO builder entry point.
 
     Tries JijModeling first, then falls back to manual if requested or fails.
-
-    Args:
-        pairwise_data: Output from compute_pairwise_terms.
-        K_new: Number of new stations to select.
-        lambda1: Budget penalty coefficient.
-        lambda2: Connectivity penalty coefficient.
-        use_jijmodeling: If True, try JijModeling first. If False, use manual.
-        verbose: Print progress.
-
-    Returns:
-        Dict with keys:
-            'h': dict {i: coeff} for free indices.
-            'J': dict {(i,j): coeff} for i<j.
-            'constant': float,
-            'status': str,
-            'method': str ('jijmodeling' or 'manual'),
     """
     if use_jijmodeling:
         try:
@@ -713,67 +840,45 @@ def build_qubo(
         return build_qubo_manual(pairwise_data, K_new, lambda1, lambda2, verbose)
 
 
-# -----------------------------------------------------------------------------
-# Solution Extraction & Energy Evaluation
-# -----------------------------------------------------------------------------
+# ============================================================================
+# Solution Extraction & Energy Evaluation (UNCHANGED)
+# ============================================================================
 
 def extract_solution_gurobi(model_result: Dict) -> np.ndarray:
-    """
-    Extract binary solution vector from Gurobi model result.
-
-    Args:
-        model_result: Output from build_miqp.
-
-    Returns:
-        np.ndarray of length N_total with 1/0 values.
-    """
+    """Extract binary solution vector from Gurobi model result."""
     N_total = model_result["N_total"]
     x_vars = model_result["x_vars"]
     free_indices = model_result["free_indices"]
     M_indices = model_result["M_indices"]
 
     x_full = np.zeros(N_total, dtype=int)
-    # Fixed stations are always 1
     for m in M_indices:
         x_full[m] = 1
 
-    # Free variables from Gurobi
     for i, var in x_vars.items():
         x_full[i] = int(round(var.X))
 
     return x_full
 
 
-def extract_solution_openjij(sampleset, free_indices: List[int], M_indices: List[int], N_total: int) -> np.ndarray:
-    """
-    Extract binary solution vector from OpenJij sampleset.
-
-    Args:
-        sampleset: Output from oj.SASampler.sample_qubo or SQASampler.sample_qubo.
-        free_indices: List of free indices.
-        M_indices: List of fixed indices.
-        N_total: Total number of original indices.
-
-    Returns:
-        np.ndarray of length N_total with 1/0 values.
-    """
+def extract_solution_openjij(
+    sampleset,
+    free_indices: List[int],
+    M_indices: List[int],
+    N_total: int
+) -> np.ndarray:
+    """Extract binary solution vector from OpenJij sampleset."""
     x_full = np.zeros(N_total, dtype=int)
     for m in M_indices:
         x_full[m] = 1
 
-    # Get best sample (first row)
     if hasattr(sampleset, 'record'):
-        # OpenJij returns a SampleSet with .record
         best_sample = sampleset.record.solution[0]
     elif hasattr(sampleset, 'samples'):
         best_sample = sampleset.samples[0]
     else:
-        # Fallback: iterate
         best_sample = sampleset[0]
 
-    # The sample is indexed by the QUBO variable indices (0..N_free-1)
-    # We need to map back to original indices.
-    # The QUBO variables are in the same order as free_indices.
     for p, val in enumerate(best_sample):
         if val == 1:
             x_full[free_indices[p]] = 1
@@ -788,22 +893,7 @@ def compute_energy(
     lambda1: Optional[float] = None,
     lambda2: Optional[float] = None,
 ) -> float:
-    """
-    Compute the energy of a given solution vector.
-
-    If lambda1 and lambda2 are provided, computes the QUBO energy (with penalties).
-    If not, computes the MIQP energy (without penalties).
-
-    Args:
-        x: Binary vector of length N_total.
-        pairwise_data: Output from compute_pairwise_terms.
-        K_new: Number of new stations to select.
-        lambda1: Budget penalty (optional, for QUBO).
-        lambda2: Connectivity penalty (optional, for QUBO).
-
-    Returns:
-        Energy (float).
-    """
+    """Compute the energy of a given solution vector."""
     linear = pairwise_data["linear"]
     quad = pairwise_data["quad"]
     neighbors = pairwise_data["neighbors"]
@@ -812,15 +902,12 @@ def compute_energy(
 
     energy = 0.0
 
-    # Linear terms (only free variables have linear coefficients)
     for i, coeff in linear.items():
         energy += coeff * x[i]
 
-    # Quadratic terms (only free-free pairs)
     for (i, j), coeff in quad.items():
         energy += coeff * x[i] * x[j]
 
-    # Penalties (if provided)
     if lambda1 is not None:
         budget = sum(x[i] for i in free_indices)
         energy += lambda1 * (budget - K_new) ** 2
@@ -828,27 +915,23 @@ def compute_energy(
     if lambda2 is not None:
         for i in free_indices:
             if x[i] == 1:
-                # Count free neighbors selected
                 selected_free_neighbors = sum(1 for j in neighbors.get(i, []) if j in free_indices and x[j] == 1)
-                # Fixed neighbors are always selected (since they are 1)
                 fixed_neighbors = sum(1 for j in neighbors.get(i, []) if j in M_indices)
                 total_selected_neighbors = selected_free_neighbors + fixed_neighbors
-                # Penalty: x_i * (1 - sum_neighbors)
                 energy += lambda2 * (1 - total_selected_neighbors)
 
     return energy
 
 
-# -----------------------------------------------------------------------------
-# Utility: Save/Load Pairwise Data
-# -----------------------------------------------------------------------------
+# ============================================================================
+# Save/Load Pairwise Data (UNCHANGED)
+# ============================================================================
 
 def save_pairwise_data(pairwise_data: Dict, filepath: Union[str, Path]) -> None:
     """Save pairwise_data to disk (pickle + JSON metadata)."""
     path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Separate metadata (JSON-safe) from large arrays
     meta = {
         "N_total": pairwise_data["N_total"],
         "N_free": pairwise_data["N_free"],
@@ -867,7 +950,6 @@ def save_pairwise_data(pairwise_data: Dict, filepath: Union[str, Path]) -> None:
     with open(path.with_suffix(".meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    # Save full data as pickle
     with open(path.with_suffix(".pkl"), "wb") as f:
         pickle.dump(pairwise_data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -880,10 +962,6 @@ def load_pairwise_data(filepath: Union[str, Path]) -> Dict:
     with open(path.with_suffix(".pkl"), "rb") as f:
         return pickle.load(f)
 
-
-# -----------------------------------------------------------------------------
-# Quick Debug Helper
-# -----------------------------------------------------------------------------
 
 def print_pairwise_summary(pairwise_data: Dict) -> None:
     """Print a human-readable summary of pairwise_data."""
@@ -909,19 +987,28 @@ def print_pairwise_summary(pairwise_data: Dict) -> None:
     print("=" * 60)
 
 
-# -----------------------------------------------------------------------------
-# Module Exports (for cleaner imports)
-# -----------------------------------------------------------------------------
+# ============================================================================
+# Module Exports
+# ============================================================================
 
 __all__ = [
+    # Core
     "compute_pairwise_terms",
+    # New normalization functions
+    "compute_objective_variance",
+    "balance_quadratic_variance",
+    "normalize_objective_to_unit_variance",
+    "prepare_normalized_qubo",
+    # QUBO / MIQP
     "build_miqp",
     "build_qubo",
     "build_qubo_jijmodeling",
     "build_qubo_manual",
+    # Solution utilities
     "extract_solution_gurobi",
     "extract_solution_openjij",
     "compute_energy",
+    # I/O
     "save_pairwise_data",
     "load_pairwise_data",
     "print_pairwise_summary",
