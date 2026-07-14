@@ -278,8 +278,8 @@ def make_objective(
 
     def objective(trial):
         # Suggest hyperparameters
-        lam1 = trial.suggest_float('lam1', 1e-4, Q_sum, log=True)
-        lam2 = trial.suggest_float('lam2', 1e-4, Q_sum, log=True)
+        lam1 = trial.suggest_float('lam1', 1e-3, Q_sum, log=True)
+        lam2 = trial.suggest_float('lam2', 1e-3, Q_sum, log=True)
         num_sweeps = trial.suggest_int('num_sweeps', 5000, 30000, step=500)
 
         trial.set_user_attr('lam1', lam1)
