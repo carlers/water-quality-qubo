@@ -170,12 +170,14 @@ def farthest_point_sampling(
     start_idx: Optional[int] = None,
     seed: Optional[int] = None,
     domain_size: float = 50.0,
+    fixed_indices: Optional[List[int]] = None,
 ) -> Dict[int, List[int]]:
     """
     Generate nested subsets via farthest-point sampling (FPS).
 
-    Starting from `start_idx`, greedily add the point farthest (in Euclidean
-    distance) from the current selected set, until the largest requested size
+    If fixed_indices is provided, they are forced to be included in all subsets.
+    Starting from `start_idx` (or the geometric center), greedily add the point
+    farthest from the current selected set, until the largest requested size
     is reached. The resulting subsets are nested: size_1 ⊂ size_2 ⊂ ... ⊂ size_k.
 
     Args:
@@ -185,6 +187,7 @@ def farthest_point_sampling(
                    geometric center of the domain.
         seed: Random seed for tie-breaking. If None, uses global RANDOM_SEED.
         domain_size: Domain size for center calculation.
+        fixed_indices: List of indices that must be included in all subsets.
 
     Returns:
         Dict mapping size -> list of indices (nested).
@@ -198,44 +201,58 @@ def farthest_point_sampling(
 
     rng = np.random.RandomState(seed if seed is not None else RANDOM_SEED)
 
-    # Determine starting point
-    if start_idx is None:
+    # Initialize selected with fixed_indices (if any)
+    selected = list(fixed_indices) if fixed_indices is not None else []
+    # Remove duplicates and ensure all are valid indices
+    selected = [int(idx) for idx in set(selected) if 0 <= idx < n_total]
+
+    # Determine starting point if not already in selected
+    if start_idx is not None and start_idx not in selected:
+        selected.append(start_idx)
+    elif start_idx is None:
         center = np.array([domain_size / 2.0, domain_size / 2.0])
         distances_to_center = np.linalg.norm(coords - center, axis=1)
-        # Tie-breaking: pick the first occurrence with minimal distance
-        start_idx = int(np.argmin(distances_to_center))
+        # Pick the point closest to center, but only if not already in selected
+        candidates = [i for i in range(n_total) if i not in selected]
+        if candidates:
+            start_idx = candidates[np.argmin(distances_to_center[candidates])]
+            selected.append(start_idx)
+        else:
+            # All points are already fixed, but we can still proceed
+            pass
 
-    # Greedy FPS
-    selected = [start_idx]
-    # For speed, maintain a distance array to the nearest selected point
-    # Initialize distances from all points to the starting point
-    dist_to_selected = np.linalg.norm(coords - coords[start_idx], axis=1)
+    # If we already have more than the largest size, warn and truncate
+    if len(selected) > sizes[-1]:
+        warnings.warn(
+            f"Number of fixed indices ({len(selected)}) exceeds largest requested size ({sizes[-1]}). "
+            "Truncating to largest size."
+        )
+        selected = selected[:sizes[-1]]
+
+    # Distance array to nearest selected point
+    dist_to_selected = np.min(cdist(coords, coords[selected]), axis=1)
 
     subsets = {}
     target_idx = 0
 
     for size in sizes:
         while len(selected) < size:
-            # Pick the point with the maximum distance to the selected set
-            # Tie-breaking: choose randomly among ties (if any)
+            # Pick the point with maximum distance to the selected set
             max_dist = dist_to_selected.max()
             candidates = np.where(np.isclose(dist_to_selected, max_dist))[0]
-
             # Exclude already selected points
             candidates = [c for c in candidates if c not in selected]
 
             if not candidates:
-                # Should not happen if size <= n_total
+                # If no candidates left, break (shouldn't happen if size <= n_total)
                 warnings.warn(
                     f"No candidates left to reach size {size}; stopping at {len(selected)}."
                 )
                 break
 
-            # Pick the first candidate (tie-breaking by random permutation)
-            # This ensures reproducibility while handling ties gracefully
+            # Tie-breaking: pick randomly among candidates with equal max distance
             perm = rng.permutation(candidates)
             new_idx = int(perm[0])
-
             selected.append(new_idx)
 
             # Update distances to the new point
@@ -256,6 +273,7 @@ def create_nested_subsets(
     start_idx: Optional[int] = None,
     seed: Optional[int] = None,
     domain_size: float = 50.0,
+    fixed_indices: Optional[List[int]] = None,
 ) -> Dict[int, Dict[str, Union[np.ndarray, List[int]]]]:
     """
     Generate nested subsets with full data (coords, factors, utility, indices).
@@ -268,6 +286,7 @@ def create_nested_subsets(
         start_idx: Starting index for FPS. If None, uses point closest to center.
         seed: Random seed for FPS tie-breaking.
         domain_size: Domain size for center calculation.
+        fixed_indices: List of indices that must be included in all subsets.
 
     Returns:
         Dict mapping size -> {
@@ -277,7 +296,9 @@ def create_nested_subsets(
             'indices': List[int] (original master indices)
         }
     """
-    indices_dict = farthest_point_sampling(coords, sizes, start_idx, seed, domain_size)
+    indices_dict = farthest_point_sampling(
+        coords, sizes, start_idx, seed, domain_size, fixed_indices=fixed_indices
+    )
 
     subsets = {}
     for size, indices in indices_dict.items():
@@ -286,34 +307,11 @@ def create_nested_subsets(
             "coords": coords[indices_arr].copy(),
             "factors": factors[indices_arr].copy(),
             "U": utility[indices_arr].copy(),
-            "indices": indices_arr.tolist(),  # store as list for JSON compatibility
+            "indices": indices_arr.tolist(),
         }
 
     return subsets
 
-
-def select_existing_stations(
-    n_existing: int, n_total: int, seed: Optional[int] = None
-) -> List[int]:
-    """
-    Select random indices to serve as fixed existing stations M.
-
-    Args:
-        n_existing: Number of existing stations to select.
-        n_total: Total number of master candidates.
-        seed: Random seed. If None, uses global RANDOM_SEED.
-
-    Returns:
-        List of indices (length n_existing).
-    """
-    if n_existing > n_total:
-        raise ValueError(
-            f"n_existing ({n_existing}) cannot exceed n_total ({n_total})."
-        )
-
-    rng = np.random.RandomState(seed if seed is not None else RANDOM_SEED)
-    indices = rng.choice(n_total, size=n_existing, replace=False).tolist()
-    return indices
 
 def select_existing_stations_clustered(
     coords: np.ndarray,
@@ -496,6 +494,7 @@ def verify_subsets(
     coords: np.ndarray,
     factors: np.ndarray,
     utility: np.ndarray,
+    fixed_indices: Optional[List[int]] = None,
 ) -> bool:
     """
     Perform sanity checks on generated subsets.
@@ -505,6 +504,7 @@ def verify_subsets(
         - Each subset's data matches the master data.
         - Subsets are properly nested (size_1 ⊂ size_2 ⊂ ...).
         - All subset sizes are correct.
+        - If fixed_indices is provided, verify they are in all subsets.
 
     Returns:
         True if all checks pass, raises AssertionError otherwise.
@@ -546,6 +546,15 @@ def verify_subsets(
             f"Subset {s1} is not a subset of {s2}. "
             f"Missing indices: {idx1 - idx2}"
         )
+
+    # Verify fixed indices are present in all subsets
+    if fixed_indices is not None:
+        fixed_set = set(fixed_indices)
+        for size, data in subsets.items():
+            idx_set = set(data["indices"])
+            assert fixed_set.issubset(idx_set), (
+                f"Subset {size} is missing fixed indices: {fixed_set - idx_set}"
+            )
 
     print("✓ All verification checks passed.")
     return True
@@ -618,13 +627,13 @@ def generate_and_save_all(
     utility = compute_utility(factors, AHP_WEIGHTS)
     print(f"✓ Utility: shape {utility.shape}, range [{utility.min():.3f}, {utility.max():.3f}]")
 
-    # Step 4: Select existing stations M
+    # Step 4: Select existing stations M (clustered around highest utility)
     existing_indices = select_existing_stations_clustered(
         coords, utility, n_existing, max_existing_distance, seed=seed
     )
     print(f"✓ Existing stations (M): {existing_indices}")
 
-    # Step 5: Create nested subsets using FPS starting from center
+    # Step 5: Create nested subsets using FPS, forcing existing_indices to be included
     center = np.array([domain_size / 2.0, domain_size / 2.0])
     dist_to_center = np.linalg.norm(coords - center, axis=1)
     start_idx = int(np.argmin(dist_to_center))
@@ -637,11 +646,12 @@ def generate_and_save_all(
         start_idx=start_idx,
         seed=seed,
         domain_size=domain_size,
+        fixed_indices=existing_indices,  # <-- CRITICAL FIX
     )
     print(f"✓ Subsets created: {list(subsets.keys())}")
 
-    # Step 6: Verify nesting and data integrity
-    verify_subsets(subsets, coords, factors, utility)
+    # Step 6: Verify nesting, data integrity, and presence of existing indices
+    verify_subsets(subsets, coords, factors, utility, fixed_indices=existing_indices)
 
     # Step 7: Save everything
     save_master_data(
