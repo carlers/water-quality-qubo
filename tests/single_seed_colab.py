@@ -1,7 +1,7 @@
-#@title 🚀 MAIN PIPELINE v5 – Normalized QUBO with Winning Schedule & Objective
+#@title 🚀 MAIN PIPELINE v6 – Normalized QUBO with Winning Schedule & Objective
 """
 ================================================================================
-MAIN PIPELINE v5 – Normalized QUBO with Winning Schedule & Objective
+MAIN PIPELINE v6 – Normalized QUBO with Winning Schedule & Objective
 ================================================================================
 
 This script runs the full water quality monitoring pipeline using the
@@ -13,8 +13,9 @@ Pipeline steps:
     3. Validation of top K trials.
     4. Sharpening: Re-run top champions with high reads, track convergence.
     5. Select best deployment solution.
-    6. Generate final visualizations (deployment map, convergence profile).
-    7. Save all results to GDrive and local.
+    6. Generate final visualizations (deployment map, QUBO matrix, convergence profile).
+    7. Print rich summaries to terminal for easy overnight interpretation.
+    8. Save all results to GDrive and local.
 
 Inputs (set below):
     - SEED_DATA: random seed for data
@@ -22,11 +23,10 @@ Inputs (set below):
     - L_c: correlation length (km) – FIXED PHYSICAL PARAMETER
     - CONNECTIVITY_RANGE: communication range (km) – FIXED
     - WINNING_SCHEDULE: from schedule_comparison_v4 (e.g., 'new' or 'old')
-    - WINNING_OBJECTIVE: from optuna_tests_v4 (e.g., 'Pctl10' or 'Multi')
+    - WINNING_OBJECTIVE: from optuna_tests_v4 (e.g., 'Sq' or 'Pctl10')
     - TUNING_TRIALS, TUNING_READS, VAL_READS, etc.
 
 All results are saved to GDrive (if mounted) and locally.
-
 ================================================================================
 """
 
@@ -55,6 +55,9 @@ from src.plotting import (
     plot_convergence_profile,
     plot_final_deployment,
     plot_qubo_matrix_heatmap,
+    plot_optuna_learning_curve_enhanced,
+    plot_deployment_with_qubo,
+    plot_tuning_vs_validation_deployment,
     display_saved_plots,
 )
 from src.utils import (
@@ -64,6 +67,10 @@ from src.utils import (
     NumpyEncoder,
     extract_top3_champions,
     print_loaded_seed_summary,
+    print_tuning_summary,
+    print_validation_summary,
+    print_sharpening_summary,
+    print_global_summary,
     execute_phase,
     PHASE_TIMES,
     cleanup_tqdm,
@@ -86,8 +93,8 @@ BETA = 1.0
 DELTA = 1.0
 
 # --- Results from ablation ---
-WINNING_SCHEDULE = "new"           # 'new' or 'old' – from schedule_comparison_v4
-WINNING_OBJECTIVE = "Pctl10"       # from optuna_tests_v4
+WINNING_SCHEDULE = "old"           # 'new' or 'old' – from schedule_comparison_v4
+WINNING_OBJECTIVE = "Sq"           # from optuna_tests_v4
 
 # --- Flags ---
 FORCE_RETUNE = True                # If True, delete existing Optuna DB and re-tune
@@ -116,7 +123,7 @@ SHOW_PLOTS = True                  # Display plots in Colab
 
 # --- Storage ---
 # Local storage (relative to /content)
-LOCAL_SAVE_DIR = Path("results/main_pipeline_v5")
+LOCAL_SAVE_DIR = Path("results/main_pipeline_v6")
 LOCAL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # GDrive base path (if mounted)
@@ -132,7 +139,7 @@ except ImportError:
 
 # Drive subdirectory for this seed
 if GDRIVE_ENABLED:
-    SEED_DRIVE_DIR = Path(GDRIVE_BASE) / f"seed_{SEED_DATA}" / "main_v5"
+    SEED_DRIVE_DIR = Path(GDRIVE_BASE) / f"seed_{SEED_DATA}" / "main_v6"
     SEED_DRIVE_DIR.mkdir(parents=True, exist_ok=True)
 else:
     SEED_DRIVE_DIR = LOCAL_SAVE_DIR
@@ -142,7 +149,7 @@ else:
 # ============================================================================
 
 print("=" * 80)
-print("🚀 MAIN PIPELINE v5 – Normalized QUBO")
+print("🚀 MAIN PIPELINE v6 – Normalized QUBO")
 print("=" * 80)
 print(f"\n[Configuration]")
 print(f"  Seed: {SEED_DATA}")
@@ -223,6 +230,18 @@ with execute_phase("1. Optuna Tuning"):
 
     print(f"  ✅ Tuning complete. Trials: {len(study.trials)}")
 
+    # --- Print tuning summary ---
+    print_tuning_summary(study, "Main Pipeline")
+
+    # --- Generate enhanced learning curve ---
+    plot_dir = LOCAL_SAVE_DIR / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    plot_optuna_learning_curve_enhanced(
+        study,
+        plot_dir / "learning_curve_enhanced.png",
+        show_fig=SHOW_PLOTS,
+    )
+
     # Backup study to GDrive
     if GDRIVE_ENABLED:
         study_db = LOCAL_SAVE_DIR / "study" / f"main_pipeline_seed{SEED_DATA}.db"
@@ -258,6 +277,9 @@ with execute_phase("2. Validation"):
         )
         safe_save_pickle(val_path, validation_results)
         print(f"  ✅ Validation complete. Best SQR = {validation_results['best_sqr']:.4f}")
+
+    # --- Print validation summary ---
+    print_validation_summary(validation_results, "Main Pipeline")
 
     # Extract champion and top K unique champions
     champion = None
@@ -436,6 +458,9 @@ with execute_phase("3. Sharpening"):
             'convergence_key': None,
         }
 
+    # --- Print sharpening summary ---
+    print_sharpening_summary(best_sharpen, "Main Pipeline")
+
 # ============================================================================
 # PHASE 4: Final Visualization
 # ============================================================================
@@ -460,7 +485,6 @@ with execute_phase("4. Final Visualization"):
             sol = np.zeros(len(env['coords']), dtype=int)
             for m in env['M_indices']:
                 sol[m] = 1
-            # Use best_sharpen solution if available
             if best_sharpen.get('solution') is not None:
                 sol = best_sharpen['solution']
             top3_solutions.append(sol)
@@ -493,7 +517,7 @@ with execute_phase("4. Final Visualization"):
         top3_solutions=top3_solutions,
         top3_trials=top3_trials_info,
         M_indices=env['M_indices'],
-        DOMAIN_SIZE=50.0,  # Hardcoded for now (could be from config)
+        DOMAIN_SIZE=50.0,
         save_path=plot_dir / "validation_grid.png",
         dpi=PLOT_DPI,
         show_fig=SHOW_PLOTS,
@@ -513,12 +537,11 @@ with execute_phase("4. Final Visualization"):
     else:
         print("      Skipping convergence profile (no data).")
 
-    # 3. Final deployment map
-    print("    Generating final deployment map...")
+    # 3. Final deployment map (legacy, kept for compatibility)
+    print("    Generating final deployment map (legacy)...")
     if best_sharpen.get('solution') is not None:
         solution = best_sharpen['solution']
         selected_new = [i for i in range(len(solution)) if solution[i] == 1 and i not in env['M_indices']]
-        # Compute sharpening means (for info box)
         sharpening_means = {
             'best_sqr': np.mean([r['best_sqr'] for r in sharpening_results if r['best_sqr'] > 0]) if sharpening_results else 0.0,
             'feas_rate': np.mean([r['feas_rate'] for r in sharpening_results]) if sharpening_results else 0.0,
@@ -542,8 +565,86 @@ with execute_phase("4. Final Visualization"):
     else:
         print("      Skipping deployment map (no solution).")
 
-    # 4. QUBO matrix heatmap for best hyperparameters
-    print("    Generating QUBO matrix heatmap...")
+    # 4. NEW: Deployment + QUBO side-by-side for final champion
+    print("    Generating deployment + QUBO side-by-side...")
+    if best_sharpen.get('solution') is not None:
+        solution = best_sharpen['solution']
+        selected_new = [i for i in range(len(solution)) if solution[i] == 1 and i not in env['M_indices']]
+        lam1 = best_sharpen.get('lam1', np.nan)
+        lam2 = best_sharpen.get('lam2', np.nan)
+        if not np.isnan(lam1) and not np.isnan(lam2):
+            title = f"Sharpening Champion: Trial #{best_sharpen['trial']} | Run {best_sharpen['run']} | SQR={best_sharpen['best_sqr']:.4f}"
+            plot_deployment_with_qubo(
+                env=env,
+                lam1=lam1,
+                lam2=lam2,
+                solution=solution,
+                M_indices=env['M_indices'],
+                selected_new=selected_new,
+                U=env['U'],
+                coords=env['coords'],
+                DOMAIN_SIZE=50.0,
+                current_vector=CURRENT_VECTOR,
+                CONNECTIVITY_RANGE=CONNECTIVITY_RANGE,
+                title=title,
+                save_path=plot_dir / "deployment_with_qubo.png",
+                dpi=PLOT_DPI,
+                show_fig=SHOW_PLOTS,
+            )
+        else:
+            print("      Skipping deployment+QUBO (invalid lam1/lam2).")
+    else:
+        print("      Skipping deployment+QUBO (no solution).")
+
+    # 5. NEW: Tuning vs Validation deployment comparison (2x2)
+    print("    Generating tuning vs validation deployment comparison...")
+    # Get best tuning trial solution from study
+    best_tuning_trial = study.best_trial
+    tuning_solution = best_tuning_trial.user_attrs.get('best_solution')
+    if tuning_solution is not None:
+        tuning_solution = np.array(tuning_solution)
+    tuning_trial_info = {
+        'trial_number': best_tuning_trial.number,
+        'lam1': best_tuning_trial.params.get('lam1'),
+        'lam2': best_tuning_trial.params.get('lam2'),
+        'best_sqr': best_tuning_trial.user_attrs.get('best_sqr', np.nan),
+        'solution': tuning_solution,
+    }
+
+    # Get best validation trial
+    if validation_results.get('trials'):
+        best_val_trial = validation_results['trials'][0]
+        val_trial_info = {
+            'trial_number': best_val_trial.get('trial_number'),
+            'lam1': best_val_trial.get('lam1'),
+            'lam2': best_val_trial.get('lam2'),
+            'best_sqr': best_val_trial.get('best_sqr'),
+            'solution': best_val_trial.get('solution'),
+        }
+    else:
+        val_trial_info = None
+
+    if tuning_solution is not None and val_trial_info is not None and val_trial_info['solution'] is not None:
+        plot_tuning_vs_validation_deployment(
+            env=env,
+            tuning_trial=tuning_trial_info,
+            val_trial=val_trial_info,
+            coords=env['coords'],
+            U=env['U'],
+            M_indices=env['M_indices'],
+            DOMAIN_SIZE=50.0,
+            current_vector=CURRENT_VECTOR,
+            CONNECTIVITY_RANGE=CONNECTIVITY_RANGE,
+            experiment_name="Main Pipeline",
+            save_path=plot_dir / "tuning_vs_validation_deployment.png",
+            dpi=PLOT_DPI,
+            show_fig=SHOW_PLOTS,
+        )
+    else:
+        print("      Skipping tuning vs validation deployment (missing solutions).")
+
+    # 6. QUBO matrix heatmap for best sharpening hyperparameters (legacy)
+    print("    Generating QUBO matrix heatmap (legacy)...")
     if not np.isnan(best_sharpen.get('lam1', np.nan)) and not np.isnan(best_sharpen.get('lam2', np.nan)):
         plot_qubo_matrix_heatmap(
             env=env,
@@ -603,7 +704,7 @@ with execute_phase("5. Save Results"):
             'use_seed_none': USE_SEED_NONE,
         },
         'env_cache_hash': env['hash'],
-        'version': 'v5',
+        'version': 'v6',
     }
 
     # Save locally
@@ -630,17 +731,15 @@ with execute_phase("5. Save Results"):
 print("\n" + "=" * 80)
 print("📊 FINAL SUMMARY")
 print("=" * 80)
-print_loaded_seed_summary(results, SEED_DATA, "main_v5")
 
-print("\n" + "-" * 70)
-print("⏱️  PHASE RUNTIMES")
-print("-" * 70)
-for phase, t in PHASE_TIMES.items():
-    print(f"  {phase:20s}: {t/60:.2f} minutes")
-print(f"  {'Total':20s}: {total_time/60:.2f} minutes")
+# --- Print global summary ---
+print_global_summary(results, "Main Pipeline")
+
+# --- Also print the legacy loaded seed summary ---
+print_loaded_seed_summary(results, SEED_DATA, "main_v6")
 
 print("\n" + "=" * 80)
-print(f"✅ MAIN PIPELINE v5 COMPLETE!")
+print(f"✅ MAIN PIPELINE v6 COMPLETE!")
 print("=" * 80)
 print(f"📁 Results saved to: {LOCAL_SAVE_DIR.resolve()}")
 if GDRIVE_ENABLED:

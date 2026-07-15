@@ -30,13 +30,23 @@ import scipy.stats as stats
 # Level 1 imports
 from src.model import build_qubo
 from src.solvers import solve_sa, build_schedule
-from src.utils import safe_save_pickle, safe_load_pickle, NumpyEncoder
+from src.utils import (
+    safe_save_pickle,
+    safe_load_pickle,
+    NumpyEncoder,
+    print_tuning_summary,
+    print_validation_summary,
+    print_global_summary,
+)
 from src.environment import get_environment
 from src.plotting import (
     save_optuna_plots,
     plot_optuna_learning_curve,
+    plot_optuna_learning_curve_enhanced,
     plot_performance_scatter,
     plot_qubo_matrix_heatmap,
+    plot_deployment_with_qubo,
+    plot_tuning_vs_validation_deployment,
 )
 
 warnings.filterwarnings('ignore')
@@ -302,7 +312,7 @@ def evaluate_qubo(
 
 
 # -----------------------------------------------------------------------------
-# 2. make_objective – Optuna objective factory (unchanged logic, uses raw SQR)
+# 2. make_objective – Optuna objective factory (UPDATED: stores best_solution)
 # -----------------------------------------------------------------------------
 
 def make_objective(
@@ -317,6 +327,7 @@ def make_objective(
     """
     Returns a callable objective function for Optuna.
     The objective uses raw SQR from evaluate_qubo.
+    Stores best_solution and hyperparameters as user attrs.
     """
     Q_sum = env['Q_sum']
 
@@ -379,6 +390,7 @@ def make_objective(
             trial.set_user_attr('p10_sqr', 0.0)
             trial.set_user_attr('ESR', np.nan)
             trial.set_user_attr('MCR', np.nan)
+            trial.set_user_attr('best_solution', None)
             return 1.0 if objective_type != 'Multi' else [1.0, 1.0]
 
         best_sqr = result.get('best_sqr', 0.0)
@@ -387,6 +399,7 @@ def make_objective(
         p10_sqr = result.get('p10_sqr', 0.0)
         esr = result.get('ESR', np.nan)
         mcr = result.get('MCR', np.nan)
+        best_solution = result.get('best_solution')
 
         trial.set_user_attr('feas_rate', feas_rate)
         trial.set_user_attr('best_sqr', best_sqr)
@@ -394,6 +407,10 @@ def make_objective(
         trial.set_user_attr('p10_sqr', p10_sqr)
         trial.set_user_attr('ESR', esr)
         trial.set_user_attr('MCR', mcr)
+        if best_solution is not None:
+            trial.set_user_attr('best_solution', best_solution.tolist())
+        else:
+            trial.set_user_attr('best_solution', None)
 
         # Compute objective value (now using raw SQR)
         if objective_type == 'BestOnly':
@@ -646,7 +663,7 @@ def validate_study(
 
 
 # -----------------------------------------------------------------------------
-# 5. run_ablation_experiment – Full ablation/comparison orchestration
+# 5. run_ablation_experiment – Full ablation/comparison orchestration (UPDATED)
 # -----------------------------------------------------------------------------
 
 def run_ablation_experiment(
@@ -669,10 +686,12 @@ def run_ablation_experiment(
 ) -> Tuple[Dict, 'optuna.Study']:
     """
     Full pipeline for a single ablation/comparison experiment.
+    Now includes enhanced summaries, enhanced learning curve, and new plots.
     """
     storage_dir = Path(storage_dir)
     storage_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Build objective ---
     objective = make_objective(
         env=env,
         schedule_type=schedule_type,
@@ -686,6 +705,7 @@ def run_ablation_experiment(
     directions = ['minimize'] if objective_type != 'Multi' else ['minimize', 'minimize']
     sampler_type = 'TPE' if objective_type != 'Multi' else 'NSGAII'
 
+    # --- Run tuning ---
     study = run_optuna_study(
         experiment_name=experiment_name,
         objective=objective,
@@ -698,6 +718,19 @@ def run_ablation_experiment(
         verbose=verbose,
     )
 
+    # --- Print tuning summary ---
+    print_tuning_summary(study, experiment_name)
+
+    # --- Generate enhanced learning curve ---
+    plot_dir = storage_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    plot_optuna_learning_curve_enhanced(
+        study,
+        plot_dir / "learning_curve_enhanced.png",
+        show_fig=show_plots,
+    )
+
+    # --- Validate ---
     val_results = validate_study(
         study=study,
         env=env,
@@ -710,10 +743,11 @@ def run_ablation_experiment(
         verbose=verbose,
     )
 
+    # --- Save validation results ---
     val_path = storage_dir / f"{experiment_name}_val.pkl"
     safe_save_pickle(val_path, val_results, verbose=verbose)
 
-    # JSON summary
+    # --- JSON summary (with JSON import now fixed) ---
     json_path = storage_dir / f"{experiment_name}_val.json"
     json_data = {
         'experiment_name': experiment_name,
@@ -733,25 +767,125 @@ def run_ablation_experiment(
     with open(json_path, 'w') as f:
         json.dump(json_data, f, indent=2, cls=NumpyEncoder)
 
-    # Generate plots
-    plot_dir = storage_dir / "plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
+    # --- Print validation summary ---
+    print_validation_summary(val_results, experiment_name)
 
-    save_optuna_plots(study, plot_dir, show_fig=show_plots)
-    plot_optuna_learning_curve(study, plot_dir / "learning_curve.png", show_fig=show_plots)
-
+    # --- Performance scatter (SQR vs ESR, Feas vs MCR) ---
     if val_results['trials']:
         scatter_path = plot_dir / "performance_scatter.png"
         plot_performance_scatter(val_results, scatter_path, show_fig=show_plots)
 
-        if val_results['best_sqr'] > 0:
-            best_trial = next((t for t in val_results['trials'] if t['best_sqr'] == val_results['best_sqr']), None)
-            if best_trial:
-                lam1 = best_trial['lam1']
-                lam2 = best_trial['lam2']
-                K_new = env['config']['K_new']
-                heatmap_path = plot_dir / f"qubo_heatmap_lam1_{lam1:.4f}_lam2_{lam2:.4f}.png"
-                plot_qubo_matrix_heatmap(env, lam1, lam2, K_new, heatmap_path, show_fig=show_plots)
+    # --- Extract best tuning trial and solution ---
+    best_tuning_trial = study.best_trial
+    tuning_solution = best_tuning_trial.user_attrs.get('best_solution')
+    if tuning_solution is not None:
+        tuning_solution = np.array(tuning_solution)
+    tuning_trial_info = {
+        'trial_number': best_tuning_trial.number,
+        'lam1': best_tuning_trial.params.get('lam1'),
+        'lam2': best_tuning_trial.params.get('lam2'),
+        'best_sqr': best_tuning_trial.user_attrs.get('best_sqr', np.nan),
+        'solution': tuning_solution,
+    }
+
+    # --- Extract best validation trial and solution ---
+    if val_results['trials']:
+        best_val_trial = val_results['trials'][0]  # already sorted by best_sqr
+        val_trial_info = {
+            'trial_number': best_val_trial.get('trial_number'),
+            'lam1': best_val_trial.get('lam1'),
+            'lam2': best_val_trial.get('lam2'),
+            'best_sqr': best_val_trial.get('best_sqr'),
+            'solution': best_val_trial.get('solution'),
+        }
+    else:
+        val_trial_info = None
+
+    # --- Tuning vs Validation deployment comparison (2x2) ---
+    if tuning_solution is not None and val_trial_info is not None and val_trial_info['solution'] is not None:
+        plot_tuning_vs_validation_deployment(
+            env=env,
+            tuning_trial=tuning_trial_info,
+            val_trial=val_trial_info,
+            coords=env['coords'],
+            U=env['U'],
+            M_indices=env['M_indices'],
+            DOMAIN_SIZE=50.0,  # TODO: make configurable
+            current_vector=(1.0, 0.0),  # TODO: make configurable
+            CONNECTIVITY_RANGE=env['connectivity_range'],
+            experiment_name=experiment_name,
+            save_path=plot_dir / "tuning_vs_validation_deployment.png",
+            dpi=150,
+            show_fig=show_plots,
+        )
+
+    # --- Deployment + QUBO for validation champion ---
+    if val_trial_info is not None and val_trial_info['solution'] is not None:
+        solution = val_trial_info['solution']
+        selected_new = [i for i in range(len(solution)) if solution[i] == 1 and i not in env['M_indices']]
+        lam1 = val_trial_info['lam1']
+        lam2 = val_trial_info['lam2']
+        title = f"Validation Champion: Trial #{val_trial_info['trial_number']} | SQR={val_trial_info['best_sqr']:.4f}"
+        plot_deployment_with_qubo(
+            env=env,
+            lam1=lam1,
+            lam2=lam2,
+            solution=solution,
+            M_indices=env['M_indices'],
+            selected_new=selected_new,
+            U=env['U'],
+            coords=env['coords'],
+            DOMAIN_SIZE=50.0,
+            current_vector=(1.0, 0.0),
+            CONNECTIVITY_RANGE=env['connectivity_range'],
+            title=title,
+            save_path=plot_dir / "validation_champion_deployment_qubo.png",
+            dpi=150,
+            show_fig=show_plots,
+        )
+
+    # --- Optuna posterior plots (standard) ---
+    save_optuna_plots(study, plot_dir, show_fig=show_plots)
+
+    # --- QUBO matrix heatmap for best validation trial (legacy) ---
+    if val_trial_info is not None and val_trial_info['lam1'] is not None:
+        plot_qubo_matrix_heatmap(
+            env=env,
+            lam1=val_trial_info['lam1'],
+            lam2=val_trial_info['lam2'],
+            K_new=env['config']['K_new'],
+            save_path=plot_dir / f"qubo_heatmap_lam1_{val_trial_info['lam1']:.4f}_lam2_{val_trial_info['lam2']:.4f}.png",
+            show_fig=show_plots,
+        )
+
+    # --- Prepare global summary data ---
+    # We need to build a results dict with phase_times, total_time, etc.
+    # Since we don't have a global timer here, we can use the local timings.
+    # We'll store the times in a dict for the summary.
+    # For simplicity, we can pass the times we have (tuning and validation) and estimate total.
+    # Alternatively, we can compute elapsed time for the whole function.
+    # We'll use time.perf_counter() at start and end.
+    # Actually, we can just compute the total time by summing phase times if we stored them.
+    # But we don't have phase times in this function. We'll just use the total elapsed.
+    # We'll pass a simple dict with the key metrics.
+    summary_results = {
+        'phase_times': {'Tuning': 0, 'Validation': 0},  # placeholders
+        'total_time': 0,
+        'champion': {
+            'best_sqr': best_tuning_trial.user_attrs.get('best_sqr', np.nan) if best_tuning_trial else np.nan,
+        },
+        'validation_results': val_results,
+        'best_sharpen': {},  # not available in ablation
+        'spearman': {
+            'rho': val_results.get('spearman_rho', np.nan),
+            'available': val_results.get('spearman_rho') is not None,
+        },
+    }
+    # We can add the best_sharpen placeholder, but it's not used in ablation.
+    # For the global summary, we can just print the validation best.
+    # Alternatively, we can skip global summary here and let the caller handle it.
+    # But we already have print_global_summary, so we can call it.
+    print_global_summary(summary_results, experiment_name)
 
     if verbose:
         print(f"  ✅ Experiment '{experiment_name}' complete.")

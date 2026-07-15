@@ -13,9 +13,9 @@ This module provides:
     7. Loaded seed summary
     8. Dynamic summary N (get_summary_n)
     9. tqdm cleanup
+   10. Enhanced summary printers for tuning, validation, sharpening, and global results.
 
 All plotting functions have been moved to src/plotting.py.
-The obsolete calibrate_qubo_parameters function has been removed.
 """
 
 import json
@@ -305,7 +305,7 @@ def cleanup_tqdm():
 
 
 # ============================================================================
-# 8. PRINT LOADED SEED SUMMARY
+# 8. PRINT LOADED SEED SUMMARY (kept for compatibility)
 # ============================================================================
 
 def print_loaded_seed_summary(results, seed, mode):
@@ -392,6 +392,205 @@ def print_loaded_seed_summary(results, seed, mode):
 
 
 # ============================================================================
+# 9. NEW: ENHANCED SUMMARY PRINTERS (v7)
+# ============================================================================
+
+def print_tuning_summary(study, experiment_name):
+    """
+    Print a detailed summary of the best tuning trial from an Optuna study.
+    Displays hyperparameters, user attributes, and a preview of the selected stations.
+    """
+    if study is None or len(study.trials) == 0:
+        print(f"⚠️ No trials found for experiment '{experiment_name}'.")
+        return
+
+    best = study.best_trial
+    print("\n" + "=" * 80)
+    print(f"📊 TUNING SUMMARY: {experiment_name}")
+    print("=" * 80)
+    print(f"  Best Trial #: {best.number}")
+    print(f"  Best Objective Value: {best.value:.6f}")
+    print("\n  Hyperparameters:")
+    for key, val in best.params.items():
+        # Format floats nicely
+        if isinstance(val, float):
+            print(f"    {key:20s}: {val:.6f}")
+        else:
+            print(f"    {key:20s}: {val}")
+
+    # User attributes (excluding solutions to keep it clean)
+    print("\n  User Attributes (metrics):")
+    attrs = best.user_attrs
+    # Separate solution from metrics
+    solution = attrs.get('best_solution', None)
+    for key, val in attrs.items():
+        if key == 'best_solution':
+            continue
+        if isinstance(val, float):
+            print(f"    {key:20s}: {val:.6f}")
+        else:
+            print(f"    {key:20s}: {val}")
+
+    # Print selected stations preview
+    if solution is not None:
+        selected = [i for i, v in enumerate(solution) if v == 1]
+        if len(selected) <= 15:
+            idx_str = str(selected)
+        else:
+            idx_str = str(selected[:10]) + f" ... (total {len(selected)})"
+        print(f"    {'best_solution':20s}: {idx_str}")
+    else:
+        print(f"    {'best_solution':20s}: Not stored")
+    print("=" * 80)
+
+
+def print_validation_summary(val_results, experiment_name):
+    """
+    Print a detailed summary of the validation champion.
+    Expects val_results from validate_study().
+    """
+    if val_results is None or not val_results.get('trials'):
+        print(f"⚠️ No validation results for experiment '{experiment_name}'.")
+        return
+
+    # The first trial in 'trials' is the best (sorted by best_sqr descending)
+    best_trial = val_results['trials'][0]
+
+    print("\n" + "=" * 80)
+    print(f"📊 VALIDATION SUMMARY: {experiment_name}")
+    print("=" * 80)
+    print(f"  Best Validation SQR:   {best_trial.get('best_sqr', 'N/A'):.6f}")
+    print(f"  Feasibility Rate:       {best_trial.get('feas_rate', 'N/A'):.6f}")
+    print(f"  Trial #:                {best_trial.get('trial_number', 'N/A')}")
+    print(f"  λ₁:                     {best_trial.get('lam1', 'N/A'):.6f}")
+    print(f"  λ₂:                     {best_trial.get('lam2', 'N/A'):.6f}")
+    print(f"  num_sweeps:             {best_trial.get('num_sweeps', 'N/A')}")
+    if 'ESR' in best_trial:
+        print(f"  ESR:                    {best_trial['ESR']:.4f}")
+    if 'MCR' in best_trial:
+        print(f"  MCR:                    {best_trial['MCR']:.4f}")
+    # Selected stations
+    if best_trial.get('solution') is not None:
+        sol = best_trial['solution']
+        selected = [i for i, v in enumerate(sol) if v == 1]
+        if len(selected) <= 15:
+            idx_str = str(selected)
+        else:
+            idx_str = str(selected[:10]) + f" ... (total {len(selected)})"
+        print(f"  Selected stations:      {idx_str}")
+    else:
+        print("  Selected stations:      Not available")
+    print(f"  Spearman ρ:             {val_results.get('spearman_rho', 'N/A'):.4f}")
+    print(f"  Spearman p-value:       {val_results.get('spearman_p', 'N/A'):.4f}")
+    print(f"  Validated trials:       {val_results.get('n_validated', 0)}")
+    print("=" * 80)
+
+
+def print_sharpening_summary(best_sharpen, experiment_name):
+    """
+    Print a detailed summary of the best sharpening result.
+    """
+    if best_sharpen is None:
+        print(f"⚠️ No sharpening results for experiment '{experiment_name}'.")
+        return
+
+    print("\n" + "=" * 80)
+    print(f"📊 SHARPENING SUMMARY: {experiment_name}")
+    print("=" * 80)
+    print(f"  Best Sharpening SQR:    {best_sharpen.get('best_sqr', 'N/A'):.6f}")
+    print(f"  Feasibility Rate:       {best_sharpen.get('feas_rate', 'N/A'):.6f}")
+    print(f"  Trial #:                {best_sharpen.get('trial', 'N/A')}")
+    print(f"  Run #:                  {best_sharpen.get('run', 'N/A')}")
+    print(f"  λ₁:                     {best_sharpen.get('lam1', 'N/A'):.6f}")
+    print(f"  λ₂:                     {best_sharpen.get('lam2', 'N/A'):.6f}")
+    print(f"  num_sweeps:             {best_sharpen.get('num_sweeps', 'N/A')}")
+    if 'ESR' in best_sharpen:
+        print(f"  ESR:                    {best_sharpen['ESR']:.4f}")
+    if 'MCR' in best_sharpen:
+        print(f"  MCR:                    {best_sharpen['MCR']:.4f}")
+    # Selected stations
+    if best_sharpen.get('solution') is not None:
+        sol = best_sharpen['solution']
+        selected = [i for i, v in enumerate(sol) if v == 1]
+        if len(selected) <= 15:
+            idx_str = str(selected)
+        else:
+            idx_str = str(selected[:10]) + f" ... (total {len(selected)})"
+        print(f"  Selected stations:      {idx_str}")
+    else:
+        print("  Selected stations:      Not available")
+    print("=" * 80)
+
+
+def print_global_summary(results, experiment_name):
+    """
+    Print a final global summary table, including phase runtimes and key metrics.
+    Expects a results dictionary containing phase_times, total_time, champion, best_sharpen, validation_results, spearman.
+    """
+    print("\n" + "=" * 80)
+    print(f"🌍 GLOBAL SUMMARY: {experiment_name}")
+    print("=" * 80)
+
+    # Phase timings
+    phase_times = results.get('phase_times', {})
+    total_time = results.get('total_time', 0)
+    print("\n⏱️  PHASE RUNTIMES")
+    print("-" * 40)
+    if phase_times:
+        for phase, t in phase_times.items():
+            print(f"  {phase:20s}: {t/60:.2f} minutes")
+    else:
+        print("  (No phase timings recorded)")
+    print(f"  {'Total':20s}: {total_time/60:.2f} minutes")
+
+    # Key metrics
+    champion = results.get('champion', {})
+    best_sharpen = results.get('best_sharpen', {})
+    val_results = results.get('validation_results', {})
+    spearman = results.get('spearman', {})
+
+    print("\n📈 KEY METRICS")
+    print("-" * 40)
+    print(f"  Best Tuning SQR:       {champion.get('best_sqr', 'N/A'):.6f}")
+    print(f"  Best Validation SQR:   {val_results.get('best_sqr', 'N/A'):.6f}")
+    print(f"  Best Sharpening SQR:   {best_sharpen.get('best_sqr', 'N/A'):.6f}")
+    print(f"  Validation Feasibility: {val_results.get('feas_rate', 'N/A'):.4f}")
+    if spearman.get('available', False):
+        print(f"  Spearman ρ:             {spearman.get('rho', 'N/A'):.4f}")
+    else:
+        print(f"  Spearman ρ:             N/A")
+
+    # Final hyperparameters
+    print("\n🔧 FINAL HYPERPARAMETERS (Sharpening Champion)")
+    print("-" * 40)
+    print(f"  λ₁:                     {best_sharpen.get('lam1', 'N/A'):.6f}")
+    print(f"  λ₂:                     {best_sharpen.get('lam2', 'N/A'):.6f}")
+    print(f"  num_sweeps:             {best_sharpen.get('num_sweeps', 'N/A')}")
+    if 'beta_min_mult' in best_sharpen:
+        print(f"  β_min_mult:             {best_sharpen.get('beta_min_mult', 'N/A')}")
+        print(f"  β_max_mult:             {best_sharpen.get('beta_max_mult', 'N/A')}")
+    elif 'beta_min' in best_sharpen:
+        print(f"  β_min:                  {best_sharpen.get('beta_min', 'N/A')}")
+        print(f"  β_max:                  {best_sharpen.get('beta_max', 'N/A')}")
+    if 'cooling_power' in best_sharpen:
+        print(f"  cooling_power:          {best_sharpen.get('cooling_power', 'N/A')}")
+
+    # Final selected stations
+    if best_sharpen.get('solution') is not None:
+        sol = best_sharpen['solution']
+        selected = [i for i, v in enumerate(sol) if v == 1]
+        if len(selected) <= 15:
+            idx_str = str(selected)
+        else:
+            idx_str = str(selected[:10]) + f" ... (total {len(selected)})"
+        print(f"\n📍 FINAL SELECTED STATIONS: {idx_str}")
+    else:
+        print("\n📍 FINAL SELECTED STATIONS: Not available")
+
+    print("=" * 80)
+
+
+# ============================================================================
 # Module exports
 # ============================================================================
 
@@ -408,4 +607,8 @@ __all__ = [
     'get_summary_n',
     'cleanup_tqdm',
     'print_loaded_seed_summary',
+    'print_tuning_summary',
+    'print_validation_summary',
+    'print_sharpening_summary',
+    'print_global_summary',
 ]
