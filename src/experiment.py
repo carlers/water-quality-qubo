@@ -452,6 +452,8 @@ def make_objective(
 # 3. run_optuna_study – Create/load and run study (UPDATED: load_if_exists=True)
 # -----------------------------------------------------------------------------
 
+# In src/experiment.py
+
 def run_optuna_study(
     experiment_name: str,
     objective: Callable,
@@ -460,7 +462,8 @@ def run_optuna_study(
     directions: Optional[List[str]] = None,
     sampler_type: str = 'TPE',
     seed: int = 42,
-    load_if_exists: bool = True,  # <-- CHANGED DEFAULT to True for crash recovery
+    load_if_exists: bool = True,  # <-- already True
+    use_wandb_callback: bool = False,  # NEW
     verbose: bool = True,
 ) -> 'optuna.Study':
     """Create or load an Optuna study with RDBStorage."""
@@ -491,15 +494,46 @@ def run_optuna_study(
         storage=storage,
         sampler=sampler,
         directions=directions,
-        load_if_exists=load_if_exists,  # <-- now True
+        load_if_exists=load_if_exists,
     )
 
     existing_trials = len(study.trials)
     if existing_trials < n_trials:
         if verbose:
             print(f"  Optimizing {n_trials - existing_trials} more trials...")
+
+        # --- W&B Callback ---
+        callbacks = []
+        if use_wandb_callback:
+            try:
+                # Only if wandb is active
+                import wandb
+                if wandb.run is not None:
+                    from optuna.integration.wandb import WeightsAndBiasesCallback
+                    wandb_callback = WeightsAndBiasesCallback(
+                        metric_name="objective_value",
+                        as_job=False,  # logs trials as separate steps in the same run
+                    )
+                    callbacks.append(wandb_callback)
+                    if verbose:
+                        print("  📊 Optuna trials will be logged to W&B.")
+                else:
+                    if verbose:
+                        print("  ⚠️ W&B run not active; skipping callback.")
+            except ImportError as e:
+                if verbose:
+                    print(f"  ⚠️ Could not import W&B callback: {e}")
+            except Exception as e:
+                if verbose:
+                    print(f"  ⚠️ W&B callback setup failed: {e}")
+
         try:
-            study.optimize(objective, n_trials=n_trials - existing_trials, show_progress_bar=True)
+            study.optimize(
+                objective,
+                n_trials=n_trials - existing_trials,
+                show_progress_bar=True,
+                callbacks=callbacks,
+            )
         except Exception as e:
             print(f"  ⚠️ Optimization failed: {e}")
     else:

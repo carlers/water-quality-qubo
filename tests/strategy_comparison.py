@@ -243,6 +243,7 @@ def run_one_config(
 
     # Create study name
     study_name = f"strategy_seed{seed}_{objective}_T{n_trials}_R{tuning_reads}_K{val_top_k}_V{val_reads}_N{N}"
+    
     # Run tuning
     study = run_optuna_study(
         experiment_name=study_name,
@@ -253,6 +254,7 @@ def run_one_config(
         sampler_type='TPE',
         seed=TUNING_SEED,
         load_if_exists=True,  # crash recovery
+        use_wandb_callback=True,  # <-- NEW: log Optuna trials to W&B
         verbose=False,
     )
 
