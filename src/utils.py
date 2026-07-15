@@ -14,6 +14,9 @@ This module provides:
     8. Dynamic summary N (get_summary_n)
     9. tqdm cleanup
    10. Enhanced summary printers for tuning, validation, sharpening, and global results.
+   11. NEW: Single-run summary printer
+   12. NEW: Cross-strategy summary printer (dynamic ranked table)
+   13. NEW: Optuna trial log suppressor
 
 All plotting functions have been moved to src/plotting.py.
 """
@@ -23,6 +26,7 @@ import pickle
 import time
 import gc
 import contextlib
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
 
@@ -392,7 +396,7 @@ def print_loaded_seed_summary(results, seed, mode):
 
 
 # ============================================================================
-# 9. NEW: ENHANCED SUMMARY PRINTERS (v7) – FIXED FOR SAFE FORMATTING
+# 9. ENHANCED SUMMARY PRINTERS (v7)
 # ============================================================================
 
 def _safe_format(val, fmt=".4f"):
@@ -599,6 +603,143 @@ def print_global_summary(results, experiment_name):
 
 
 # ============================================================================
+# 10. NEW: SINGLE-RUN SUMMARY (for strategy comparison)
+# ============================================================================
+
+def print_single_run_summary(config: Dict, result: Dict, elapsed: float):
+    """
+    Print a concise yet rich summary for a single completed run.
+    
+    Args:
+        config: dict with keys like 'seed', 'objective', 'tuning_trials', 'tuning_reads',
+                'val_top_k', 'val_reads', 'N'
+        result: dict from run_one_config() containing 'best_sqr', 'feas_rate', 'spearman_rho', etc.
+        elapsed: runtime in seconds
+    """
+    print("\n" + "=" * 80)
+    print("📌 SINGLE RUN COMPLETE")
+    print("=" * 80)
+    print(f"  Seed:            {config['seed']}")
+    print(f"  Objective:       {config['objective']}")
+    print(f"  Tuning Trials:   {config['tuning_trials']}")
+    print(f"  Tuning Reads:    {config['tuning_reads']}")
+    print(f"  Validation TopK: {config['val_top_k']}")
+    print(f"  Validation Reads:{config['val_reads']}")
+    print(f"  N (candidates):  {config['N']}")
+    print("-" * 40)
+    print(f"  Best SQR:        {_safe_format(result.get('best_sqr', np.nan), '.6f')}")
+    print(f"  Feasibility:     {_safe_format(result.get('feas_rate', np.nan), '.4f')}")
+    if 'spearman_rho' in result and result['spearman_rho'] is not None:
+        print(f"  Spearman ρ:      {_safe_format(result['spearman_rho'], '.4f')}")
+    else:
+        print("  Spearman ρ:      N/A")
+    print(f"  Total Samples:   {result.get('total_samples', 'N/A')}")
+    print(f"  Runtime:         {elapsed:.2f} s ({elapsed/60:.2f} min)")
+    print("=" * 80)
+
+
+# ============================================================================
+# 11. NEW: CROSS-STRATEGY SUMMARY (dynamic ranked table)
+# ============================================================================
+
+def print_cross_strategy_summary(results_df: pd.DataFrame, title: str = "Cross-Strategy Summary"):
+    """
+    Print a dynamic ranked table of all completed configurations so far.
+    
+    Args:
+        results_df: DataFrame with columns: seed, objective, tuning_trials, tuning_reads,
+                    val_top_k, val_reads, N, best_sqr, feas_rate, spearman_rho, total_samples, time_seconds
+        title: optional title for the summary
+    """
+    if results_df.empty:
+        print("\n⚠️ No completed configurations yet.")
+        return
+
+    # Ensure we have a 'time_seconds' column; if not, compute from runtime
+    if 'time_seconds' not in results_df.columns and 'runtime' in results_df.columns:
+        results_df['time_seconds'] = results_df['runtime']
+    elif 'time_seconds' not in results_df.columns:
+        results_df['time_seconds'] = np.nan
+
+    # Create a configuration label
+    results_df['config'] = (
+        results_df['objective'] + " T" + results_df['tuning_trials'].astype(str) +
+        " R" + results_df['tuning_reads'].astype(str) +
+        " K" + results_df['val_top_k'].astype(str) +
+        " V" + results_df['val_reads'].astype(str)
+    )
+
+    # Group by config and aggregate across seeds (if multiple seeds present)
+    agg = results_df.groupby(['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N']).agg({
+        'best_sqr': ['mean', 'std', 'count'],
+        'feas_rate': ['mean', 'std'],
+        'spearman_rho': ['mean', 'std'],
+        'total_samples': ['mean'],
+        'time_seconds': ['mean', 'std']
+    }).reset_index()
+    agg.columns = ['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N',
+                   'best_sqr_mean', 'best_sqr_std', 'n_seeds',
+                   'feas_mean', 'feas_std',
+                   'rho_mean', 'rho_std',
+                   'samples_mean',
+                   'time_mean', 'time_std']
+
+    # Sort by best_sqr_mean descending
+    agg_sorted = agg.sort_values('best_sqr_mean', ascending=False)
+
+    # Display top rows (up to 20)
+    print("\n" + "=" * 80)
+    print(f"📊 {title} (completed configs)")
+    print("=" * 80)
+    print(f"Total completed runs: {len(results_df)}")
+    print(f"Unique configurations: {len(agg_sorted)}")
+    print("-" * 80)
+
+    # Select columns to show
+    display_cols = ['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads',
+                    'N', 'best_sqr_mean', 'best_sqr_std', 'feas_mean', 'rho_mean', 'samples_mean', 'time_mean']
+    # Format float columns
+    formatted = agg_sorted[display_cols].copy()
+    for col in ['best_sqr_mean', 'best_sqr_std', 'feas_mean', 'rho_mean', 'samples_mean', 'time_mean']:
+        formatted[col] = formatted[col].apply(lambda x: f"{x:.4f}" if not np.isnan(x) else "N/A")
+    # Format time as minutes
+    formatted['time_mean'] = formatted['time_mean'].apply(
+        lambda x: f"{x/60:.2f} min" if isinstance(x, (int, float)) and not np.isnan(x) else "N/A"
+    )
+
+    # Print top rows (show all if <= 20, else top 10 and note)
+    if len(formatted) <= 20:
+        print(formatted.to_string(index=False))
+    else:
+        print(formatted.head(10).to_string(index=False))
+        print(f"\n... and {len(formatted)-10} more configurations.")
+        # Also show the best and worst for context
+        print("\n🏆 Best overall:")
+        print(formatted.iloc[0].to_string())
+        print("\n📉 Worst overall:")
+        print(formatted.iloc[-1].to_string())
+
+    print("=" * 80)
+
+
+# ============================================================================
+# 12. NEW: SUPPRESS OPTUNA TRIAL LOGS
+# ============================================================================
+
+def suppress_optuna_trial_logs():
+    """
+    Suppress Optuna's per-trial logging output (e.g., "Trial 0 finished with value: ...")
+    but keep the progress bar visible.
+    """
+    # Set Optuna's logger to WARNING level to suppress INFO messages
+    optuna_logger = logging.getLogger('optuna')
+    optuna_logger.setLevel(logging.WARNING)
+    # Also suppress the root logger if it's propagating
+    # We can also adjust the logging level for the 'optuna' namespace
+    # The progress bar is handled separately by show_progress_bar=True in study.optimize()
+
+
+# ============================================================================
 # Module exports
 # ============================================================================
 
@@ -619,4 +760,7 @@ __all__ = [
     'print_validation_summary',
     'print_sharpening_summary',
     'print_global_summary',
+    'print_single_run_summary',        # NEW
+    'print_cross_strategy_summary',    # NEW
+    'suppress_optuna_trial_logs',      # NEW
 ]
