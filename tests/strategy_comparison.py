@@ -66,6 +66,7 @@ from src.plotting import (
     plot_cross_strategy_progress,
     plot_sqr_vs_runtime,
     regenerate_plots,
+    save_optuna_plots,  # NEW import for Optuna summary plots
 )
 
 warnings.filterwarnings('ignore')
@@ -193,7 +194,6 @@ def init_wandb(stage, run_name, config):
     if not WANDB_AVAILABLE:
         return None
     try:
-        # We'll use reinit=False to avoid creating new runs; the callback will reuse this run.
         wandb.init(
             project=PROJECT_NAME,
             config=config,
@@ -220,6 +220,7 @@ def run_one_config(
     val_reads: int,
     N: int,
     env: Dict,
+    config_counter: List[int],  # NEW: mutable counter for W&B step offset
 ) -> Dict:
     start_time = time.time()
 
@@ -231,6 +232,7 @@ def run_one_config(
         tuning_seed=TUNING_SEED,
         use_seed_none=USE_SEED_NONE,
         compute_esr_mcr=True,
+        config_counter=config_counter,  # pass the counter for trial logging
     )
 
     study_name = f"strategy_seed{seed}_{objective}_T{n_trials}_R{tuning_reads}_K{val_top_k}_V{val_reads}_N{N}"
@@ -244,11 +246,27 @@ def run_one_config(
         sampler_type='TPE',
         seed=TUNING_SEED,
         load_if_exists=True,
-        use_wandb_callback=True,  # Optuna trials logged to W&B
         verbose=False,
     )
 
     print_tuning_summary(study, f"Tuning: {study_name}", compact=True, width=200)
+
+    # ---- Log Optuna summary plots to W&B ----
+    if WANDB_AVAILABLE and wandb.run is not None:
+        try:
+            optuna_plot_dir = STUDIES_DIR / study_name / "optuna_plots"
+            optuna_plot_dir.mkdir(parents=True, exist_ok=True)
+            save_optuna_plots(study, optuna_plot_dir, show_fig=False)
+
+            # Use step offset: config_counter * 1000 + 100 to avoid conflict with callback steps (0..50)
+            step = config_counter[0] * 1000 + 100
+            for fname in ["optuna_param_importance.png", "optuna_parallel_coordinate.png",
+                          "optuna_slice.png", "optuna_learning_curve.png"]:
+                p = optuna_plot_dir / fname
+                if p.exists():
+                    wandb.log({f"optuna_{fname}": wandb.Image(str(p))}, step=step)
+        except Exception as e:
+            print(f"  ⚠️ Optuna plot logging failed: {e}")
 
     best_trial = study.best_trial
     tuning_best_sqr = best_trial.user_attrs.get('best_sqr', np.nan)
@@ -460,6 +478,7 @@ def run_stage(stage, configs, stage_name, desc, config_counter):
                     val_reads=val_reads,
                     N=N,
                     env=env,
+                    config_counter=config_counter,  # pass counter
                 )
                 results.append(result)
                 completed.add(key)
@@ -501,9 +520,8 @@ def run_stage(stage, configs, stage_name, desc, config_counter):
 
                 if WANDB_AVAILABLE and wandb.run is not None:
                     try:
-                        # Increment config counter and use step
                         config_counter[0] += 1
-                        step = config_counter[0] * 1000  # ensure step > callback's steps (0..50)
+                        step = config_counter[0] * 1000  # main config step
                         wandb.log({
                             "best_sqr": result['best_sqr'],
                             "effective_sqr": result['effective_sqr'],
@@ -530,9 +548,10 @@ def run_stage(stage, configs, stage_name, desc, config_counter):
                             "miqp_energy": result.get('miqp_energy', np.nan),
                             "stage": stage,
                         }, step=step)
-                        # Log images
+                        # Log deployment image
                         if deploy_path.exists():
                             wandb.log({"deployment_map": wandb.Image(str(deploy_path))}, step=step)
+                        # Log cross-strategy plots
                         for fname in ["heatmap_Sq_N100.png", "pareto_front_samples.png", "sqr_vs_feas.png", "sqr_vs_runtime.png"]:
                             p = PLOTS_DIR / fname
                             if p.exists():
