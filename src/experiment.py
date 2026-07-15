@@ -515,17 +515,13 @@ def run_optuna_study(
                         as_job=False,  # logs trials as separate steps in the same run
                     )
                     callbacks.append(wandb_callback)
-                    if verbose:
-                        print("  📊 Optuna trials will be logged to W&B.")
+                    print("  📊 Optuna trials will be logged to W&B.")
                 else:
-                    if verbose:
-                        print("  ⚠️ W&B run not active; skipping callback.")
+                    print("  ⚠️ W&B run not active; skipping callback.")
             except ImportError as e:
-                if verbose:
-                    print(f"  ⚠️ Could not import W&B callback: {e}")
+                print(f"  ⚠️ Could not import W&B callback: {e}")
             except Exception as e:
-                if verbose:
-                    print(f"  ⚠️ W&B callback setup failed: {e}")
+                print(f"  ⚠️ W&B callback setup failed: {e}")
 
         try:
             study.optimize(
