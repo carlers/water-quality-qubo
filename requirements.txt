@@ -20,3 +20,4 @@ qiskit-aer>=0.13.0
 # Utilities
 packaging
 tqdm
+wandb
