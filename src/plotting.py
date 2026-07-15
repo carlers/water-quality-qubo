@@ -16,8 +16,9 @@ This module provides:
    10. Deployment + QUBO matrix side-by-side (with text outside)
    11. Tuning vs Validation deployment comparison (2x2)
    12. Enhanced Optuna learning curve (best, median, rolling mean, scatter, NO worst)
-   13. NEW: Gurobi baseline plot
-   14. NEW: SQR vs Runtime scatter plot
+   13. Gurobi baseline plot
+   14. SQR vs Runtime scatter plot
+   15. Cross‑strategy progress plots (with legends outside)
 
 All functions accept a save_path and a show_fig flag (default True in Colab).
 """
@@ -114,7 +115,7 @@ def plot_validation_grid(
                     fontsize=10, verticalalignment='top', horizontalalignment='right',
                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-        # Info text box below plots
+        # Info text box below plots (already outside)
         info_lines = []
         info_lines.append("Gurobi (Exact) — SQR = 1.0000")
         for i, t in enumerate(top3_trials[:3]):
@@ -142,6 +143,7 @@ def plot_validation_grid(
                  bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.9),
                  linespacing=1.3)
 
+        # Figure-level legend (already outside)
         handles = [Patch(facecolor='red', edgecolor='black', label='New'),
                    Patch(facecolor='blue', edgecolor='black', label='Existing (M)'),
                    Patch(facecolor='lightgray', edgecolor='gray', label='Candidates')]
@@ -237,6 +239,7 @@ def plot_final_deployment(
 ) -> None:
     """
     Generate final deployment plot with utility landscape.
+    Legend placed outside to the right.
     """
     try:
         if best_solution is None:
@@ -251,7 +254,7 @@ def plot_final_deployment(
         all_selected = selected_m + selected_new
 
         fig, ax = plt.subplots(1, 1, figsize=(14, 10))
-        plt.subplots_adjust(right=0.72)
+        plt.subplots_adjust(right=0.72)  # make room for legend + text
 
         cf = ax.contourf(grid_x, grid_y, grid_z, levels=20, cmap='viridis', alpha=0.3)
         cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.8)
@@ -278,7 +281,7 @@ def plot_final_deployment(
                         fontsize=8, color=color, fontweight='bold',
                         bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7))
 
-        # Draw connectivity links
+        # Connectivity links
         D_max = CONNECTIVITY_RANGE
         for i, idx_i in enumerate(all_selected):
             for j, idx_j in enumerate(all_selected):
@@ -301,12 +304,13 @@ def plot_final_deployment(
         ax.set_xlim(-2, DOMAIN_SIZE + 2)
         ax.set_ylim(-2, DOMAIN_SIZE + 2)
 
+        # Legend placed outside to the right
         handles = [Patch(facecolor='red', edgecolor='black', label='New'),
                    Patch(facecolor='blue', edgecolor='black', label='Existing (M)'),
                    Patch(facecolor='lightgray', edgecolor='gray', label='Candidates')]
-        ax.legend(handles=handles, loc='upper left', bbox_to_anchor=(1.2, 1.0), fontsize=10)
+        ax.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
 
-        # Info text box
+        # Info text box (already outside)
         beta_min_mult = best_sharpen.get('beta_min_mult', None)
         beta_max_mult = best_sharpen.get('beta_max_mult', None)
         if beta_min_mult is None:
@@ -351,11 +355,7 @@ def save_optuna_plots(
     dpi: int = 150,
     show_fig: bool = False,
 ) -> None:
-    """
-    Generate and save Optuna posterior plots (importances, parallel, slice, learning curve).
-    Optionally display inline.
-    Handles multi-objective studies by specifying a target.
-    """
+    """Unchanged: no legends."""
     if not OPTUNA_AVAILABLE:
         print("  ⚠️ Optuna not available; skipping plots.")
         return
@@ -406,7 +406,7 @@ def save_optuna_plots(
     except Exception as e:
         print(f"  ⚠️ Failed to generate slice plot: {e}")
 
-    # Custom learning curve (will be replaced by enhanced version)
+    # Custom learning curve (no legend)
     try:
         best_values = [t.value for t in study.trials if t.value is not None]
         if best_values:
@@ -787,7 +787,6 @@ def plot_optuna_learning_curve_enhanced(
         cumulative_best = np.minimum.accumulate(values)
         cumulative_median = [np.median(values[:i+1]) for i in range(n_trials)]
 
-        # Rolling mean
         window = min(window, n_trials)
         rolling_mean = np.convolve(values, np.ones(window)/window, mode='valid')
 
@@ -800,7 +799,6 @@ def plot_optuna_learning_curve_enhanced(
         ax.plot(cumulative_best, 'b-', linewidth=2, label='Best so far')
         ax.plot(cumulative_median, 'g--', linewidth=1.5, label='Median so far')
 
-        # Rolling mean
         if len(rolling_mean) > 0:
             ax.plot(range(window-1, n_trials), rolling_mean, 'm-.', linewidth=1.5, label=f'Rolling Mean (w={window})')
 
@@ -808,10 +806,10 @@ def plot_optuna_learning_curve_enhanced(
         ax.set_ylabel('Objective Value (1 - Score)')
         study_name = getattr(study, 'study_name', 'Optuna Study')
         ax.set_title(f'Enhanced Learning Curve: {study_name}')
-        ax.legend()
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax.grid(True, alpha=0.3)
 
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 0.85, 1])
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         if show_fig:
             plt.show()
@@ -821,7 +819,7 @@ def plot_optuna_learning_curve_enhanced(
 
 
 # ============================================================================
-# 12. DEPLOYMENT + QUBO MATRIX SIDE-BY-SIDE (text outside)
+# 12. DEPLOYMENT + QUBO MATRIX SIDE-BY-SIDE
 # ============================================================================
 
 def plot_deployment_with_qubo(
@@ -843,7 +841,7 @@ def plot_deployment_with_qubo(
 ) -> None:
     """
     Side-by-side: Deployment map (left) + QUBO matrix heatmap (right).
-    The info text is placed outside the axes.
+    Legend placed outside to the right.
     """
     try:
         if solution is None:
@@ -887,8 +885,8 @@ def plot_deployment_with_qubo(
         ax1.set_aspect('equal')
         ax1.set_xlim(-2, DOMAIN_SIZE + 2)
         ax1.set_ylim(-2, DOMAIN_SIZE + 2)
-        ax1.legend()
         ax1.set_title(f'{title}\nDeployment Map', fontsize=12)
+        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
 
         # ---------- RIGHT: QUBO Matrix ----------
         ax2 = axes[1]
@@ -909,7 +907,6 @@ def plot_deployment_with_qubo(
                 Q[i, j] += val / 2.0
                 Q[j, i] += val / 2.0
 
-        # Reorder by spatial x-coordinate
         spatial_order = np.argsort(coords[:, 0])
         Q_reordered = Q[spatial_order, :][:, spatial_order]
 
@@ -919,7 +916,7 @@ def plot_deployment_with_qubo(
         ax2.set_title(f'{title}\nQUBO Matrix (λ₁={lam1:.4f}, λ₂={lam2:.4f})')
         plt.colorbar(cax, ax=ax2, label='Energy coefficient')
 
-        # Info text box placed outside the axes (using fig.text)
+        # Info text box outside
         info_text = (
             f"Seed: {env['config'].get('seed', 'N/A')} | "
             f"N: {N_total} | K_new: {K_new} | "
@@ -930,7 +927,7 @@ def plot_deployment_with_qubo(
 
         fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
 
-        plt.tight_layout(rect=[0, 0.06, 1, 0.95])
+        plt.tight_layout(rect=[0, 0.06, 0.85, 0.95])
         plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
         if show_fig:
             plt.show()
@@ -960,6 +957,7 @@ def plot_tuning_vs_validation_deployment(
 ) -> None:
     """
     2x2 grid comparing tuning deployment+QUBO (top row) vs validation deployment+QUBO (bottom row).
+    Legends placed outside.
     """
     try:
         # Extract data from tuning trial
@@ -997,7 +995,6 @@ def plot_tuning_vs_validation_deployment(
             spatial_order = np.argsort(coords[:, 0])
             return Q[spatial_order, :][:, spatial_order]
 
-        # Helper: deployment map on given axis
         def draw_deployment(ax, solution, title_sub):
             grid_x = np.linspace(0, DOMAIN_SIZE, 100)
             grid_y = np.linspace(0, DOMAIN_SIZE, 100)
@@ -1027,7 +1024,7 @@ def plot_tuning_vs_validation_deployment(
             ax.set_aspect('equal')
             ax.set_xlim(-2, DOMAIN_SIZE + 2)
             ax.set_ylim(-2, DOMAIN_SIZE + 2)
-            ax.legend()
+            ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
             ax.set_title(title_sub, fontsize=11)
 
         fig, axes = plt.subplots(2, 2, figsize=(16, 14))
@@ -1053,7 +1050,7 @@ def plot_tuning_vs_validation_deployment(
             axes[1, 1].text(0.5, 0.5, 'QUBO not available', ha='center', va='center', transform=axes[1, 1].transAxes)
 
         fig.suptitle(f'{experiment_name}: Tuning vs Validation Deployment', fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 0.9, 1])  # make room for legends
         plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
         if show_fig:
             plt.show()
@@ -1063,7 +1060,7 @@ def plot_tuning_vs_validation_deployment(
 
 
 # ============================================================================
-# 14. NEW: GUROBI BASELINE PLOT
+# 14. GUROBI BASELINE PLOT
 # ============================================================================
 
 def plot_gurobi_baseline(
@@ -1074,13 +1071,14 @@ def plot_gurobi_baseline(
 ) -> None:
     """
     Plot the Gurobi (or greedy fallback) baseline solution as a deployment map.
+    Legend placed outside.
     """
     try:
         solution = env.get('gurobi_solution')
         coords = env['coords']
         U = env['U']
         M_indices = env['M_indices']
-        DOMAIN_SIZE = 50.0  # assume fixed
+        DOMAIN_SIZE = 50.0
         CONNECTIVITY_RANGE = env.get('connectivity_range', 8.0)
 
         if solution is None:
@@ -1122,9 +1120,10 @@ def plot_gurobi_baseline(
         ax.set_aspect('equal')
         ax.set_xlim(-2, DOMAIN_SIZE + 2)
         ax.set_ylim(-2, DOMAIN_SIZE + 2)
-        ax.legend()
+        ax.set_title('Gurobi Exact Optimum (SQR=1.0000)')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
 
-        # Info text outside the axes
+        # Info text outside
         info_text = (
             f"Seed: {env['config'].get('seed', 'N/A')} | "
             f"N: {len(coords)} | K_new: {env['config']['K_new']} | "
@@ -1134,8 +1133,7 @@ def plot_gurobi_baseline(
         fig.text(0.5, 0.02, info_text, ha='center', va='bottom', fontsize=10,
                  bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9))
 
-        ax.set_title('Gurobi Exact Optimum (SQR=1.0000)')
-        plt.tight_layout(rect=[0, 0.06, 1, 1])
+        plt.tight_layout(rect=[0, 0.06, 0.85, 1])
         plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
         if show_fig:
             plt.show()
@@ -1145,7 +1143,7 @@ def plot_gurobi_baseline(
 
 
 # ============================================================================
-# 15. NEW: SQR vs RUNTIME SCATTER PLOT
+# 15. SQR vs RUNTIME SCATTER PLOT
 # ============================================================================
 
 def plot_sqr_vs_runtime(
@@ -1156,13 +1154,12 @@ def plot_sqr_vs_runtime(
 ) -> None:
     """
     Scatter plot of SQR vs Runtime, colour-coded by objective.
-    Also shows the Pareto frontier (configs that dominate in both metrics).
+    Legend placed outside.
     """
     if results_df.empty:
         print("  ⚠️ No data for SQR vs Runtime plot.")
         return
 
-    # Aggregate by config (excluding seed)
     agg = results_df.groupby(['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N']).agg({
         'best_sqr': ['mean', 'std', 'count'],
         'time_seconds': ['mean', 'std']
@@ -1171,7 +1168,6 @@ def plot_sqr_vs_runtime(
                    'sqr_mean', 'sqr_std', 'n_seeds',
                    'time_mean', 'time_std']
 
-    # Drop rows with NaN
     agg = agg[agg['sqr_mean'].notna() & agg['time_mean'].notna() & (agg['time_mean'] > 0)]
     if agg.empty:
         print("  ⚠️ No valid data for SQR vs Runtime plot.")
@@ -1179,13 +1175,11 @@ def plot_sqr_vs_runtime(
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    # Scatter points
     for obj in agg['objective'].unique():
         sub = agg[agg['objective'] == obj]
         ax.scatter(sub['time_mean'], sub['sqr_mean'], label=obj, s=80, alpha=0.7)
 
-    # Find Pareto frontier (maximize SQR, minimize time)
-    # Sort by time ascending, then keep those with increasing SQR
+    # Pareto frontier (approx)
     sorted_agg = agg.sort_values('time_mean')
     pareto = []
     best_sqr = -np.inf
@@ -1201,10 +1195,10 @@ def plot_sqr_vs_runtime(
     ax.set_xlabel('Mean Runtime (seconds)')
     ax.set_ylabel('Mean SQR')
     ax.set_title('SQR vs Runtime')
-    ax.legend()
     ax.grid(True, alpha=0.3)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
     plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
     if show_fig:
         plt.show()
@@ -1212,7 +1206,7 @@ def plot_sqr_vs_runtime(
 
 
 # ============================================================================
-# 16. UPDATED CROSS-STRATEGY PROGRESS (now includes SQR vs Runtime)
+# 16. CROSS-STRATEGY PROGRESS (updated with legend outside)
 # ============================================================================
 
 def plot_cross_strategy_progress(
@@ -1222,8 +1216,7 @@ def plot_cross_strategy_progress(
 ) -> None:
     """
     Generate updated cross-strategy progress plots from the accumulated DataFrame.
-    Plots: heatmap (SQR vs factors), Pareto (SQR vs samples), SQR vs feasibility,
-    Spearman correlation heatmap, and SQR vs Runtime.
+    All legends placed outside.
     """
     if results_df.empty:
         print("  ⚠️ No data to plot cross-strategy progress.")
@@ -1283,9 +1276,9 @@ def plot_cross_strategy_progress(
     plt.xlabel('Total Samples (Tuning + Validation)')
     plt.ylabel('Mean Validation SQR')
     plt.title('Pareto Front: SQR vs Samples')
-    plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.tight_layout()
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
     plt.savefig(save_dir / "pareto_front_samples.png", dpi=150)
     if show_fig:
         plt.show()
@@ -1300,9 +1293,9 @@ def plot_cross_strategy_progress(
     plt.xlabel('Mean Feasibility Rate')
     plt.ylabel('Mean Validation SQR')
     plt.title('SQR vs Feasibility')
-    plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.tight_layout()
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
     plt.savefig(save_dir / "sqr_vs_feas.png", dpi=150)
     if show_fig:
         plt.show()
@@ -1359,7 +1352,6 @@ def regenerate_plots(
 # ============================================================================
 
 __all__ = [
-    # Existing
     'plot_validation_grid',
     'plot_convergence_profile',
     'plot_final_deployment',
@@ -1373,7 +1365,6 @@ __all__ = [
     'plot_optuna_learning_curve_enhanced',
     'plot_deployment_with_qubo',
     'plot_tuning_vs_validation_deployment',
-    # New
     'plot_gurobi_baseline',
     'plot_sqr_vs_runtime',
     'plot_cross_strategy_progress',
