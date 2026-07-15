@@ -511,6 +511,8 @@ def run_optuna_study(
                 if wandb.run is not None:
                     from optuna.integration.wandb import WeightsAndBiasesCallback
                     wandb_callback = WeightsAndBiasesCallback(
+                        wandb_kwargs={'reinit': False, 'resume': 'allow'},  # reuse existing run
+                        as_multirun=False,  # log to the same run, not separate runs
                         metric_name="objective_value",
                     )
                     callbacks.append(wandb_callback)
