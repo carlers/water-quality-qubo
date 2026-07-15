@@ -321,7 +321,7 @@ def print_loaded_seed_summary(results, seed, mode):
     version = results.get('version', 'unknown')
 
     best_sqr = best_sharpen.get('best_sqr', 'N/A')
-    if isinstance(best_sqr, float):
+    if isinstance(best_sqr, (int, float)) and np.isfinite(best_sqr):
         print(f"  Best SQR:              {best_sqr:.4f}")
     else:
         print(f"  Best SQR:              {best_sqr}")
@@ -331,7 +331,7 @@ def print_loaded_seed_summary(results, seed, mode):
 
     lam1 = champion.get('lam1', 'N/A')
     lam2 = champion.get('lam2', 'N/A')
-    if isinstance(lam1, float) and isinstance(lam2, float):
+    if isinstance(lam1, (int, float)) and isinstance(lam2, (int, float)):
         print(f"  λ₁:                    {lam1:.4f},  λ₂: {lam2:.4f}")
     else:
         print(f"  λ₁:                    {lam1},  λ₂: {lam2}")
@@ -339,19 +339,19 @@ def print_loaded_seed_summary(results, seed, mode):
     beta_min_mult = champion.get('beta_min_mult', None)
     beta_max_mult = champion.get('beta_max_mult', None)
     if beta_min_mult is not None and beta_max_mult is not None:
-        if isinstance(beta_min_mult, float) and isinstance(beta_max_mult, float):
+        if isinstance(beta_min_mult, (int, float)) and isinstance(beta_max_mult, (int, float)):
             print(f"  β_min_mult:            {beta_min_mult:.4f},  β_max_mult: {beta_max_mult:.4f}")
         else:
             print(f"  β_min_mult:            {beta_min_mult},  β_max_mult: {beta_max_mult}")
         beta_min_abs = champion.get('beta_min_abs', None)
         beta_max_abs = champion.get('beta_max_abs', None)
         if beta_min_abs is not None and beta_max_abs is not None:
-            if isinstance(beta_min_abs, float) and isinstance(beta_max_abs, float):
+            if isinstance(beta_min_abs, (int, float)) and isinstance(beta_max_abs, (int, float)):
                 print(f"  β_min_abs:             {beta_min_abs:.4f},  β_max_abs: {beta_max_abs:.4f}")
     else:
         beta_min = champion.get('beta_min', 'N/A')
         beta_max = champion.get('beta_max', 'N/A')
-        if isinstance(beta_min, float) and isinstance(beta_max, float):
+        if isinstance(beta_min, (int, float)) and isinstance(beta_max, (int, float)):
             print(f"  β_min:                 {beta_min:.4f},  β_max: {beta_max:.4f}")
         else:
             print(f"  β_min:                 {beta_min},  β_max: {beta_max}")
@@ -372,7 +372,7 @@ def print_loaded_seed_summary(results, seed, mode):
         print(f"  Selected Stations:     {selected}")
 
     feas_rate = champion.get('feas_rate', 'N/A')
-    if isinstance(feas_rate, float):
+    if isinstance(feas_rate, (int, float)):
         print(f"  Feasibility:           {feas_rate*100:.1f}%")
     else:
         print(f"  Feasibility:           {feas_rate}")
@@ -392,8 +392,15 @@ def print_loaded_seed_summary(results, seed, mode):
 
 
 # ============================================================================
-# 9. NEW: ENHANCED SUMMARY PRINTERS (v7)
+# 9. NEW: ENHANCED SUMMARY PRINTERS (v7) – FIXED FOR SAFE FORMATTING
 # ============================================================================
+
+def _safe_format(val, fmt=".4f"):
+    """Safely format a value, returning 'N/A' if not numeric."""
+    if isinstance(val, (int, float)) and np.isfinite(val):
+        return f"{val:{fmt}}"
+    return "N/A"
+
 
 def print_tuning_summary(study, experiment_name):
     """
@@ -409,25 +416,23 @@ def print_tuning_summary(study, experiment_name):
     print(f"📊 TUNING SUMMARY: {experiment_name}")
     print("=" * 80)
     print(f"  Best Trial #: {best.number}")
-    print(f"  Best Objective Value: {best.value:.6f}")
+    print(f"  Best Objective Value: {_safe_format(best.value, '.6f')}")
     print("\n  Hyperparameters:")
     for key, val in best.params.items():
-        # Format floats nicely
         if isinstance(val, float):
-            print(f"    {key:20s}: {val:.6f}")
+            print(f"    {key:20s}: {_safe_format(val, '.6f')}")
         else:
             print(f"    {key:20s}: {val}")
 
     # User attributes (excluding solutions to keep it clean)
     print("\n  User Attributes (metrics):")
     attrs = best.user_attrs
-    # Separate solution from metrics
     solution = attrs.get('best_solution', None)
     for key, val in attrs.items():
         if key == 'best_solution':
             continue
         if isinstance(val, float):
-            print(f"    {key:20s}: {val:.6f}")
+            print(f"    {key:20s}: {_safe_format(val, '.6f')}")
         else:
             print(f"    {key:20s}: {val}")
 
@@ -459,16 +464,16 @@ def print_validation_summary(val_results, experiment_name):
     print("\n" + "=" * 80)
     print(f"📊 VALIDATION SUMMARY: {experiment_name}")
     print("=" * 80)
-    print(f"  Best Validation SQR:   {best_trial.get('best_sqr', 'N/A'):.6f}")
-    print(f"  Feasibility Rate:       {best_trial.get('feas_rate', 'N/A'):.6f}")
+    print(f"  Best Validation SQR:   {_safe_format(best_trial.get('best_sqr', 'N/A'), '.6f')}")
+    print(f"  Feasibility Rate:       {_safe_format(best_trial.get('feas_rate', 'N/A'), '.6f')}")
     print(f"  Trial #:                {best_trial.get('trial_number', 'N/A')}")
-    print(f"  λ₁:                     {best_trial.get('lam1', 'N/A'):.6f}")
-    print(f"  λ₂:                     {best_trial.get('lam2', 'N/A'):.6f}")
+    print(f"  λ₁:                     {_safe_format(best_trial.get('lam1', 'N/A'), '.6f')}")
+    print(f"  λ₂:                     {_safe_format(best_trial.get('lam2', 'N/A'), '.6f')}")
     print(f"  num_sweeps:             {best_trial.get('num_sweeps', 'N/A')}")
     if 'ESR' in best_trial:
-        print(f"  ESR:                    {best_trial['ESR']:.4f}")
+        print(f"  ESR:                    {_safe_format(best_trial['ESR'], '.4f')}")
     if 'MCR' in best_trial:
-        print(f"  MCR:                    {best_trial['MCR']:.4f}")
+        print(f"  MCR:                    {_safe_format(best_trial['MCR'], '.4f')}")
     # Selected stations
     if best_trial.get('solution') is not None:
         sol = best_trial['solution']
@@ -480,8 +485,8 @@ def print_validation_summary(val_results, experiment_name):
         print(f"  Selected stations:      {idx_str}")
     else:
         print("  Selected stations:      Not available")
-    print(f"  Spearman ρ:             {val_results.get('spearman_rho', 'N/A'):.4f}")
-    print(f"  Spearman p-value:       {val_results.get('spearman_p', 'N/A'):.4f}")
+    print(f"  Spearman ρ:             {_safe_format(val_results.get('spearman_rho', 'N/A'), '.4f')}")
+    print(f"  Spearman p-value:       {_safe_format(val_results.get('spearman_p', 'N/A'), '.4f')}")
     print(f"  Validated trials:       {val_results.get('n_validated', 0)}")
     print("=" * 80)
 
@@ -497,17 +502,17 @@ def print_sharpening_summary(best_sharpen, experiment_name):
     print("\n" + "=" * 80)
     print(f"📊 SHARPENING SUMMARY: {experiment_name}")
     print("=" * 80)
-    print(f"  Best Sharpening SQR:    {best_sharpen.get('best_sqr', 'N/A'):.6f}")
-    print(f"  Feasibility Rate:       {best_sharpen.get('feas_rate', 'N/A'):.6f}")
+    print(f"  Best Sharpening SQR:    {_safe_format(best_sharpen.get('best_sqr', 'N/A'), '.6f')}")
+    print(f"  Feasibility Rate:       {_safe_format(best_sharpen.get('feas_rate', 'N/A'), '.6f')}")
     print(f"  Trial #:                {best_sharpen.get('trial', 'N/A')}")
     print(f"  Run #:                  {best_sharpen.get('run', 'N/A')}")
-    print(f"  λ₁:                     {best_sharpen.get('lam1', 'N/A'):.6f}")
-    print(f"  λ₂:                     {best_sharpen.get('lam2', 'N/A'):.6f}")
+    print(f"  λ₁:                     {_safe_format(best_sharpen.get('lam1', 'N/A'), '.6f')}")
+    print(f"  λ₂:                     {_safe_format(best_sharpen.get('lam2', 'N/A'), '.6f')}")
     print(f"  num_sweeps:             {best_sharpen.get('num_sweeps', 'N/A')}")
     if 'ESR' in best_sharpen:
-        print(f"  ESR:                    {best_sharpen['ESR']:.4f}")
+        print(f"  ESR:                    {_safe_format(best_sharpen['ESR'], '.4f')}")
     if 'MCR' in best_sharpen:
-        print(f"  MCR:                    {best_sharpen['MCR']:.4f}")
+        print(f"  MCR:                    {_safe_format(best_sharpen['MCR'], '.4f')}")
     # Selected stations
     if best_sharpen.get('solution') is not None:
         sol = best_sharpen['solution']
@@ -538,10 +543,13 @@ def print_global_summary(results, experiment_name):
     print("-" * 40)
     if phase_times:
         for phase, t in phase_times.items():
-            print(f"  {phase:20s}: {t/60:.2f} minutes")
+            print(f"  {phase:20s}: {_safe_format(t/60, '.2f')} minutes")
     else:
         print("  (No phase timings recorded)")
-    print(f"  {'Total':20s}: {total_time/60:.2f} minutes")
+    if isinstance(total_time, (int, float)) and np.isfinite(total_time):
+        print(f"  {'Total':20s}: {_safe_format(total_time/60, '.2f')} minutes")
+    else:
+        print(f"  {'Total':20s}: N/A")
 
     # Key metrics
     champion = results.get('champion', {})
@@ -551,29 +559,29 @@ def print_global_summary(results, experiment_name):
 
     print("\n📈 KEY METRICS")
     print("-" * 40)
-    print(f"  Best Tuning SQR:       {champion.get('best_sqr', 'N/A'):.6f}")
-    print(f"  Best Validation SQR:   {val_results.get('best_sqr', 'N/A'):.6f}")
-    print(f"  Best Sharpening SQR:   {best_sharpen.get('best_sqr', 'N/A'):.6f}")
-    print(f"  Validation Feasibility: {val_results.get('feas_rate', 'N/A'):.4f}")
+    print(f"  Best Tuning SQR:       {_safe_format(champion.get('best_sqr', 'N/A'), '.6f')}")
+    print(f"  Best Validation SQR:   {_safe_format(val_results.get('best_sqr', 'N/A'), '.6f')}")
+    print(f"  Best Sharpening SQR:   {_safe_format(best_sharpen.get('best_sqr', 'N/A'), '.6f')}")
+    print(f"  Validation Feasibility: {_safe_format(val_results.get('feas_rate', 'N/A'), '.4f')}")
     if spearman.get('available', False):
-        print(f"  Spearman ρ:             {spearman.get('rho', 'N/A'):.4f}")
+        print(f"  Spearman ρ:             {_safe_format(spearman.get('rho', 'N/A'), '.4f')}")
     else:
         print(f"  Spearman ρ:             N/A")
 
     # Final hyperparameters
     print("\n🔧 FINAL HYPERPARAMETERS (Sharpening Champion)")
     print("-" * 40)
-    print(f"  λ₁:                     {best_sharpen.get('lam1', 'N/A'):.6f}")
-    print(f"  λ₂:                     {best_sharpen.get('lam2', 'N/A'):.6f}")
+    print(f"  λ₁:                     {_safe_format(best_sharpen.get('lam1', 'N/A'), '.6f')}")
+    print(f"  λ₂:                     {_safe_format(best_sharpen.get('lam2', 'N/A'), '.6f')}")
     print(f"  num_sweeps:             {best_sharpen.get('num_sweeps', 'N/A')}")
     if 'beta_min_mult' in best_sharpen:
-        print(f"  β_min_mult:             {best_sharpen.get('beta_min_mult', 'N/A')}")
-        print(f"  β_max_mult:             {best_sharpen.get('beta_max_mult', 'N/A')}")
+        print(f"  β_min_mult:             {_safe_format(best_sharpen.get('beta_min_mult', 'N/A'), '.4f')}")
+        print(f"  β_max_mult:             {_safe_format(best_sharpen.get('beta_max_mult', 'N/A'), '.4f')}")
     elif 'beta_min' in best_sharpen:
-        print(f"  β_min:                  {best_sharpen.get('beta_min', 'N/A')}")
-        print(f"  β_max:                  {best_sharpen.get('beta_max', 'N/A')}")
+        print(f"  β_min:                  {_safe_format(best_sharpen.get('beta_min', 'N/A'), '.4f')}")
+        print(f"  β_max:                  {_safe_format(best_sharpen.get('beta_max', 'N/A'), '.4f')}")
     if 'cooling_power' in best_sharpen:
-        print(f"  cooling_power:          {best_sharpen.get('cooling_power', 'N/A')}")
+        print(f"  cooling_power:          {_safe_format(best_sharpen.get('cooling_power', 'N/A'), '.4f')}")
 
     # Final selected stations
     if best_sharpen.get('solution') is not None:
