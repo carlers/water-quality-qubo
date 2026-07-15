@@ -12,6 +12,7 @@ Key features:
     - Uses run_ablation_experiment() for tuning + validation.
     - Uses plotting.py for visualizations.
     - FORCE_RERUN flag: deletes all existing results for a clean slate.
+    - TEST_MODE flag: reduces trials and reads for rapid prototyping.
 
 Objectives tested:
     - BestOnly    : maximize best_sqr
@@ -27,10 +28,10 @@ Objectives tested:
 Configuration:
     - SEED, K_new, L_c, CONNECTIVITY_RANGE are fixed physical parameters.
     - WINNING_SCHEDULE: set to the winner from schedule_comparison_v5.py.
-    - 150 trials per objective (balanced speed/statistics).
-    - Validation: top 15 trials with 256 reads.
+    - If TEST_MODE=True: 5 trials, 10 tuning reads, 15 validation reads, 3 top K.
+    - If TEST_MODE=False: 150 trials, 100 tuning reads, 256 validation reads, 15 top K.
 
-Results saved to: results/ablation_v6/
+Results saved to: results/ablation_{test/full}/
 ================================================================================
 """
 
@@ -61,6 +62,10 @@ warnings.filterwarnings('ignore')
 # USER CONFIGURATION
 # ============================================================================
 
+# --- Mode ---
+TEST_MODE = True  # If True: 5 trials, 10 reads, 15 val, 3 top K (rapid test)
+CURRENT_MODE = "test" if TEST_MODE else "full"
+
 # --- Physical parameters ---
 SEED = 42
 K_NEW = 5
@@ -72,7 +77,7 @@ BETA = 1.0
 DELTA = 1.0
 
 # --- Winning schedule from schedule_comparison_v5 ---
-WINNING_SCHEDULE = "new"         # 'new' or 'old' – update after running comparison
+WINNING_SCHEDULE = "old"         # 'new' or 'old' – update after running comparison
 
 # --- Experiment parameters ---
 OBJECTIVE_TYPES = [
@@ -86,10 +91,19 @@ OBJECTIVE_TYPES = [
     "Penalty-0.5",
     "Multi",
 ]
-N_TRIALS = 150                   # Per objective
-TUNING_READS = 100
-VAL_READS = 256
-VAL_TOP_K = 15
+
+if TEST_MODE:
+    print("\n⚠️  TEST_MODE ACTIVE – Using reduced parameters for rapid testing.")
+    N_TRIALS = 5                    # Per objective (total 45)
+    TUNING_READS = 10
+    VAL_READS = 15
+    VAL_TOP_K = 3
+else:
+    N_TRIALS = 150
+    TUNING_READS = 100
+    VAL_READS = 256
+    VAL_TOP_K = 15
+
 TUNING_SEED = 42
 VAL_SEED = 43
 USE_SEED_NONE = True
@@ -97,8 +111,8 @@ USE_SEED_NONE = True
 # --- Force rerun flag ---
 FORCE_RERUN = True               # If True, delete all existing ablation results
 
-# --- Output ---
-SAVE_DIR = Path("results/ablation_v6")
+# --- Output (mode-specific) ---
+SAVE_DIR = Path(f"results/ablation_{CURRENT_MODE}")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================================
@@ -106,9 +120,10 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================================
 
 print("=" * 80)
-print("🧪 OBJECTIVE ABLATION v6 – Refactored (Normalized QUBO)")
+print(f"🧪 OBJECTIVE ABLATION v6 – Refactored (Normalized QUBO) [{CURRENT_MODE.upper()} MODE]")
 print("=" * 80)
 print(f"\n[Configuration]")
+print(f"  Mode: {CURRENT_MODE.upper()}")
 print(f"  Seed: {SEED}")
 print(f"  K_new: {K_NEW}")
 print(f"  L_c: {L_C} km (FIXED)")
@@ -196,7 +211,7 @@ for objective_type in OBJECTIVE_TYPES:
 
     try:
         result, study = run_ablation_experiment(
-            experiment_name=f"ablation_{objective_type}",
+            experiment_name=f"ablation_{objective_type}_{CURRENT_MODE}",
             env=env,
             schedule_type=WINNING_SCHEDULE,
             objective_type=objective_type,
@@ -350,6 +365,8 @@ winner_name = winner if 'winner' in locals() else "Pctl10"  # default
 winner_dir = SAVE_DIR / winner_name / "plots"
 if winner_dir.exists():
     print(f"\n  Displaying plots from winning objective: {winner_name}")
+    # Only display plots that actually exist (ablation has fewer plot types)
+    # Use the default list from display_saved_plots, it will skip missing ones
     display_saved_plots(winner_dir)
 else:
     print(f"\n  ⚠️ No plots found for {winner_name}")
@@ -381,18 +398,26 @@ if winner_name in study_objects:
     # Also get best from Optuna study directly (tuning)
     study = study_objects[winner_name]
     if study:
-        best_trial_optuna = study.best_trial
-        print(f"\n  Best Optuna trial for {winner_name} (tuning):")
-        print(f"    λ₁ = {best_trial_optuna.params.get('lam1', 'N/A')}")
-        print(f"    λ₂ = {best_trial_optuna.params.get('lam2', 'N/A')}")
-        print(f"    num_sweeps = {best_trial_optuna.params.get('num_sweeps', 'N/A')}")
+        try:
+            # For multi-objective, best_trial is not directly available
+            if hasattr(study, 'best_trial') and study.best_trial is not None:
+                best_trial_optuna = study.best_trial
+                print(f"\n  Best Optuna trial for {winner_name} (tuning):")
+                print(f"    λ₁ = {best_trial_optuna.params.get('lam1', 'N/A')}")
+                print(f"    λ₂ = {best_trial_optuna.params.get('lam2', 'N/A')}")
+                print(f"    num_sweeps = {best_trial_optuna.params.get('num_sweeps', 'N/A')}")
+            else:
+                # For multi-objective, get the Pareto front
+                print(f"\n  Multi-objective study: best_trial not available. Pareto front has {len(study.best_trials)} trials.")
+        except AttributeError:
+            pass
 
 # ============================================================================
 # PHASE 6: Final summary
 # ============================================================================
 
 print("\n" + "=" * 80)
-print("✅ OBJECTIVE ABLATION v6 COMPLETE!")
+print(f"✅ OBJECTIVE ABLATION v6 COMPLETE! ({CURRENT_MODE.upper()} MODE)")
 print("=" * 80)
 print(f"\n📁 Results saved to: {SAVE_DIR.resolve()}")
 print("   - ablation_results.csv (ranked summary table)")
@@ -404,6 +429,7 @@ print("   - {objective}/ (detailed results + plots for each objective)")
 summary = {
     'experiment': 'objective_ablation_v6',
     'seed': SEED,
+    'mode': CURRENT_MODE,
     'winning_schedule': WINNING_SCHEDULE,
     'winner': winner_name if 'winner_name' in locals() else None,
     'results': df_sorted.to_dict('records'),

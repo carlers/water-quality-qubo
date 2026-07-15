@@ -12,14 +12,15 @@ Key features:
     - Uses run_ablation_experiment() for tuning + validation.
     - Uses plotting.py for all visualizations.
     - FORCE_RERUN flag: deletes existing study DBs and results for a clean slate.
+    - TEST_MODE flag: reduces trials and reads for rapid prototyping.
 
 Configuration:
     - SEED, K_new, L_c, CONNECTIVITY_RANGE are fixed physical parameters.
     - Schedules: 'old' and 'new'.
     - Objective: Pctl10 (fixed for fair comparison).
-    - 100 trials per schedule (quick comparison).
+    - If TEST_MODE=True: 10 trials, 10 tuning reads, 15 validation reads, 3 top K.
 
-Results saved to: results/schedule_compare_v5/
+Results saved to: results/schedule_compare_{test/full}/
 ================================================================================
 """
 
@@ -51,6 +52,10 @@ warnings.filterwarnings('ignore')
 # USER CONFIGURATION
 # ============================================================================
 
+# --- Mode ---
+TEST_MODE = True  # If True: 10 trials, 10 reads, 15 val, 3 top K (rapid test)
+CURRENT_MODE = "test" if TEST_MODE else "full"
+
 # --- Physical parameters ---
 SEED = 42
 K_NEW = 5
@@ -63,10 +68,19 @@ DELTA = 1.0
 
 # --- Experiment parameters ---
 SCHEDULES = ['old', 'new']       # Schedules to compare
-N_TRIALS = 100                   # Per schedule
-TUNING_READS = 100
-VAL_READS = 256
-VAL_TOP_K = 15
+
+if TEST_MODE:
+    print("\n⚠️  TEST_MODE ACTIVE – Using reduced parameters for rapid testing.")
+    N_TRIALS = 10
+    TUNING_READS = 10
+    VAL_READS = 15
+    VAL_TOP_K = 3
+else:
+    N_TRIALS = 100
+    TUNING_READS = 100
+    VAL_READS = 256
+    VAL_TOP_K = 15
+
 TUNING_SEED = 42
 VAL_SEED = 43
 USE_SEED_NONE = True
@@ -74,8 +88,8 @@ USE_SEED_NONE = True
 # --- Force rerun flag ---
 FORCE_RERUN = True               # If True, delete existing DBs and results
 
-# --- Output ---
-SAVE_DIR = Path("results/schedule_compare_v5")
+# --- Output (mode-specific) ---
+SAVE_DIR = Path(f"results/schedule_compare_{CURRENT_MODE}")
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================================
@@ -83,9 +97,10 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================================
 
 print("=" * 80)
-print("🧪 SCHEDULE COMPARISON v5 – Refactored (Normalized QUBO)")
+print(f"🧪 SCHEDULE COMPARISON v5 – Refactored (Normalized QUBO) [{CURRENT_MODE.upper()} MODE]")
 print("=" * 80)
 print(f"\n[Configuration]")
+print(f"  Mode: {CURRENT_MODE.upper()}")
 print(f"  Seed: {SEED}")
 print(f"  K_new: {K_NEW}")
 print(f"  L_c: {L_C} km (FIXED)")
@@ -175,7 +190,7 @@ for schedule_type in SCHEDULES:
         # Since we already deleted the whole schedule subdir, we can rely on
         # run_ablation_experiment's force_retune to skip loading old DBs.
         result, study = run_ablation_experiment(
-            experiment_name=f"schedule_{schedule_type}",
+            experiment_name=f"schedule_{schedule_type}_{CURRENT_MODE}",
             env=env,
             schedule_type=schedule_type,
             objective_type="Pctl10",              # fixed for fair comparison
@@ -311,6 +326,8 @@ winner_name = winner if 'winner' in locals() else 'new'  # default
 winner_dir = SAVE_DIR / winner_name / "plots"
 if winner_dir.exists():
     print(f"\n  Displaying plots from winning schedule: {winner_name}")
+    # Only display plots that actually exist (ablation has fewer plot types)
+    # Use the default list from display_saved_plots, it will skip missing ones
     display_saved_plots(winner_dir)
 else:
     print(f"\n  ⚠️ No plots found for {winner_name}")
@@ -320,7 +337,7 @@ else:
 # ============================================================================
 
 print("\n" + "=" * 80)
-print("✅ SCHEDULE COMPARISON v5 COMPLETE!")
+print(f"✅ SCHEDULE COMPARISON v5 COMPLETE! ({CURRENT_MODE.upper()} MODE)")
 print("=" * 80)
 print(f"\n📁 Results saved to: {SAVE_DIR.resolve()}")
 print("   - comparison_results.csv (summary table)")

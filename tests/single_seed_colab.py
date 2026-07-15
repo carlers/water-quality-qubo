@@ -1,7 +1,7 @@
-#@title 🚀 MAIN PIPELINE v6 – Normalized QUBO with Winning Schedule & Objective
+#@title 🚀 MAIN PIPELINE v7 – Normalized QUBO with Winning Schedule & Objective
 """
 ================================================================================
-MAIN PIPELINE v6 – Normalized QUBO with Winning Schedule & Objective
+MAIN PIPELINE v7 – Normalized QUBO with Winning Schedule & Objective
 ================================================================================
 
 This script runs the full water quality monitoring pipeline using the
@@ -17,16 +17,18 @@ Pipeline steps:
     7. Print rich summaries to terminal for easy overnight interpretation.
     8. Save all results to GDrive and local.
 
+TEST_MODE:
+    - If True, uses reduced parameters (10 trials, 10 reads, etc.) for rapid testing.
+    - Results are saved to results/main_pipeline_test/ to avoid overwriting full runs.
+
 Inputs (set below):
+    - TEST_MODE: Boolean – True for rapid testing, False for full production.
     - SEED_DATA: random seed for data
     - K_new: number of new stations to select
     - L_c: correlation length (km) – FIXED PHYSICAL PARAMETER
     - CONNECTIVITY_RANGE: communication range (km) – FIXED
     - WINNING_SCHEDULE: from schedule_comparison_v4 (e.g., 'new' or 'old')
     - WINNING_OBJECTIVE: from optuna_tests_v4 (e.g., 'Sq' or 'Pctl10')
-    - TUNING_TRIALS, TUNING_READS, VAL_READS, etc.
-
-All results are saved to GDrive (if mounted) and locally.
 ================================================================================
 """
 
@@ -82,6 +84,10 @@ warnings.filterwarnings('ignore')
 # 0. USER CONFIGURATION – SET THESE
 # ============================================================================
 
+# --- Mode ---
+TEST_MODE = True  # If True: 10 trials, 10 reads, 15 val, 20 sharpen (rapid test)
+CURRENT_MODE = "test" if TEST_MODE else "full"
+
 # --- Data ---
 SEED_DATA = 42
 K_new = 5
@@ -102,28 +108,34 @@ FORCE_REVALIDATE = True            # If True, re-run validation even if results 
 FORCE_RESHARPEN = True             # If True, re-run sharpening even if results exist
 USE_SEED_NONE = True               # OpenJij workaround (keep True)
 
-# --- Tuning ---
-TUNING_TRIALS = 200                # Number of Optuna trials
-TUNING_READS = 128                 # Reads per trial during tuning
+# --- Mode-specific parameters ---
+if TEST_MODE:
+    print("\n⚠️  TEST_MODE ACTIVE – Using reduced parameters for rapid testing.")
+    TUNING_TRIALS = 10
+    TUNING_READS = 10
+    VAL_READS = 15
+    VAL_TOP_K = 3
+    SHARPEN_TOP_K = 3
+    SHARPEN_READS = 20
+    SHARPEN_REPEATS = 1
+else:
+    TUNING_TRIALS = 200
+    TUNING_READS = 128
+    VAL_READS = 512
+    VAL_TOP_K = 20
+    SHARPEN_TOP_K = 3
+    SHARPEN_READS = 2048
+    SHARPEN_REPEATS = 3
+
 TUNING_SEED = 42
-
-# --- Validation ---
-VAL_READS = 512
-VAL_TOP_K = 20
 VAL_SEED = 43
-
-# --- Sharpening ---
-SHARPEN_TOP_K = 3                  # Number of unique champions to sharpen
-SHARPEN_READS = 2048
-SHARPEN_REPEATS = 3                # Runs per champion
 
 # --- Plots ---
 PLOT_DPI = 150
 SHOW_PLOTS = True                  # Display plots in Colab
 
-# --- Storage ---
-# Local storage (relative to /content)
-LOCAL_SAVE_DIR = Path("results/main_pipeline_v6")
+# --- Storage (mode-specific) ---
+LOCAL_SAVE_DIR = Path(f"results/main_pipeline_{CURRENT_MODE}")
 LOCAL_SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # GDrive base path (if mounted)
@@ -137,9 +149,9 @@ except ImportError:
     GDRIVE_ENABLED = False
     print("  ⚠️ Not running in Colab, GDrive disabled.")
 
-# Drive subdirectory for this seed
+# Drive subdirectory for this seed (mode-specific)
 if GDRIVE_ENABLED:
-    SEED_DRIVE_DIR = Path(GDRIVE_BASE) / f"seed_{SEED_DATA}" / "main_v6"
+    SEED_DRIVE_DIR = Path(GDRIVE_BASE) / f"seed_{SEED_DATA}" / f"main_pipeline_{CURRENT_MODE}"
     SEED_DRIVE_DIR.mkdir(parents=True, exist_ok=True)
 else:
     SEED_DRIVE_DIR = LOCAL_SAVE_DIR
@@ -149,9 +161,10 @@ else:
 # ============================================================================
 
 print("=" * 80)
-print("🚀 MAIN PIPELINE v6 – Normalized QUBO")
+print(f"🚀 MAIN PIPELINE v7 – Normalized QUBO ({CURRENT_MODE.upper()} MODE)")
 print("=" * 80)
 print(f"\n[Configuration]")
+print(f"  Mode: {CURRENT_MODE.upper()}")
 print(f"  Seed: {SEED_DATA}")
 print(f"  K_new: {K_new}")
 print(f"  L_c: {L_c} km (FIXED)")
@@ -217,7 +230,7 @@ with execute_phase("1. Optuna Tuning"):
 
     # Run study
     study = run_optuna_study(
-        experiment_name=f"main_pipeline_seed{SEED_DATA}",
+        experiment_name=f"main_pipeline_seed{SEED_DATA}_{CURRENT_MODE}",
         objective=objective,
         n_trials=TUNING_TRIALS,
         storage_dir=LOCAL_SAVE_DIR / "study",
@@ -242,9 +255,9 @@ with execute_phase("1. Optuna Tuning"):
         show_fig=SHOW_PLOTS,
     )
 
-    # Backup study to GDrive
-    if GDRIVE_ENABLED:
-        study_db = LOCAL_SAVE_DIR / "study" / f"main_pipeline_seed{SEED_DATA}.db"
+    # Backup study to GDrive (skip in test mode)
+    if GDRIVE_ENABLED and not TEST_MODE:
+        study_db = LOCAL_SAVE_DIR / "study" / f"main_pipeline_seed{SEED_DATA}_{CURRENT_MODE}.db"
         if study_db.exists():
             drive_study_dir = SEED_DRIVE_DIR / "study"
             drive_study_dir.mkdir(parents=True, exist_ok=True)
@@ -660,8 +673,8 @@ with execute_phase("4. Final Visualization"):
     # Display all plots inline
     display_saved_plots(plot_dir)
 
-    # Copy plots to GDrive
-    if GDRIVE_ENABLED:
+    # Copy plots to GDrive (skip in test mode)
+    if GDRIVE_ENABLED and not TEST_MODE:
         drive_plot_dir = SEED_DRIVE_DIR / "plots"
         drive_plot_dir.mkdir(parents=True, exist_ok=True)
         for png in plot_dir.glob("*.png"):
@@ -690,6 +703,7 @@ with execute_phase("5. Save Results"):
         'phase_times': PHASE_TIMES,
         'total_time': total_time,
         'seed': SEED_DATA,
+        'mode': CURRENT_MODE,
         'config': {
             'schedule': WINNING_SCHEDULE,
             'objective': WINNING_OBJECTIVE,
@@ -702,9 +716,10 @@ with execute_phase("5. Save Results"):
             'sharpen_reads': SHARPEN_READS,
             'sharpen_repeats': SHARPEN_REPEATS,
             'use_seed_none': USE_SEED_NONE,
+            'test_mode': TEST_MODE,
         },
         'env_cache_hash': env['hash'],
-        'version': 'v6',
+        'version': 'v7',
     }
 
     # Save locally
@@ -716,8 +731,8 @@ with execute_phase("5. Save Results"):
     # Also save as pickle (for full object storage)
     safe_save_pickle(LOCAL_SAVE_DIR / "results.pkl", results)
 
-    # Save to GDrive
-    if GDRIVE_ENABLED:
+    # Save to GDrive (skip in test mode)
+    if GDRIVE_ENABLED and not TEST_MODE:
         drive_results_path = SEED_DRIVE_DIR / "results.json"
         with open(drive_results_path, 'w') as f:
             json.dump(results, f, indent=2, cls=NumpyEncoder)
@@ -736,13 +751,13 @@ print("=" * 80)
 print_global_summary(results, "Main Pipeline")
 
 # --- Also print the legacy loaded seed summary ---
-print_loaded_seed_summary(results, SEED_DATA, "main_v6")
+print_loaded_seed_summary(results, SEED_DATA, "main_v7")
 
 print("\n" + "=" * 80)
-print(f"✅ MAIN PIPELINE v6 COMPLETE!")
+print(f"✅ MAIN PIPELINE v7 COMPLETE! ({CURRENT_MODE.upper()} MODE)")
 print("=" * 80)
 print(f"📁 Results saved to: {LOCAL_SAVE_DIR.resolve()}")
-if GDRIVE_ENABLED:
+if GDRIVE_ENABLED and not TEST_MODE:
     print(f"📁 GDrive backup: {SEED_DRIVE_DIR.resolve()}")
 print(f"🎯 Deployment SQR: {best_sharpen['best_sqr']:.4f} ({100*best_sharpen['best_sqr']:.1f}% of optimal)")
 if not np.isnan(best_sharpen.get('lam1', np.nan)):
