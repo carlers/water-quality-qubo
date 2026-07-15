@@ -14,9 +14,12 @@ This module provides:
     8. Dynamic summary N (get_summary_n)
     9. tqdm cleanup
    10. Enhanced summary printers for tuning, validation, sharpening, and global results.
-   11. NEW: Single-run summary printer
-   12. NEW: Cross-strategy summary printer (dynamic ranked table)
-   13. NEW: Optuna trial log suppressor
+   11. Single-run summary printer
+   12. Cross-strategy summary printer (dynamic ranked table)
+   13. Optuna trial log suppressor
+   14. NEW: Config header printer
+   15. NEW: Cross-strategy metrics (correlations, efficiency, CV, rankings)
+   16. NEW: Horizontal formatting for tuning/validation summaries
 
 All plotting functions have been moved to src/plotting.py.
 """
@@ -27,6 +30,7 @@ import time
 import gc
 import contextlib
 import logging
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
 
@@ -406,10 +410,49 @@ def _safe_format(val, fmt=".4f"):
     return "N/A"
 
 
-def print_tuning_summary(study, experiment_name):
+# -----------------------------------------------------------------------------
+# 9a. Horizontal formatting helpers
+# -----------------------------------------------------------------------------
+
+def _format_horizontal(items, width=200, sep="  "):
+    """
+    Format a list of (key, value) pairs into a single line with columns.
+    """
+    # Determine max key length
+    max_key_len = max(len(str(k)) for k, _ in items) if items else 0
+    # Try to fit as many as possible in one line
+    lines = []
+    current_line = []
+    current_len = 0
+    for key, val in items:
+        entry = f"{key}={val}"
+        entry_len = len(entry) + len(sep)
+        if current_len + entry_len > width and current_line:
+            lines.append(sep.join(current_line))
+            current_line = [entry]
+            current_len = entry_len
+        else:
+            current_line.append(entry)
+            current_len += entry_len
+    if current_line:
+        lines.append(sep.join(current_line))
+    return "\n".join(lines)
+
+
+def _format_dict_horizontal(d, width=200, sep="  "):
+    """Format a dictionary into horizontal lines."""
+    items = [(str(k), str(v)) for k, v in d.items()]
+    return _format_horizontal(items, width, sep)
+
+
+# -----------------------------------------------------------------------------
+# 9b. Updated summary printers with horizontal option
+# -----------------------------------------------------------------------------
+
+def print_tuning_summary(study, experiment_name, compact=True, width=200):
     """
     Print a detailed summary of the best tuning trial from an Optuna study.
-    Displays hyperparameters, user attributes, and a preview of the selected stations.
+    If compact=True, uses horizontal layout to save vertical space.
     """
     if study is None or len(study.trials) == 0:
         print(f"⚠️ No trials found for experiment '{experiment_name}'.")
@@ -421,42 +464,50 @@ def print_tuning_summary(study, experiment_name):
     print("=" * 80)
     print(f"  Best Trial #: {best.number}")
     print(f"  Best Objective Value: {_safe_format(best.value, '.6f')}")
-    print("\n  Hyperparameters:")
-    for key, val in best.params.items():
-        if isinstance(val, float):
-            print(f"    {key:20s}: {_safe_format(val, '.6f')}")
-        else:
-            print(f"    {key:20s}: {val}")
 
-    # User attributes (excluding solutions to keep it clean)
-    print("\n  User Attributes (metrics):")
-    attrs = best.user_attrs
-    solution = attrs.get('best_solution', None)
-    for key, val in attrs.items():
-        if key == 'best_solution':
-            continue
-        if isinstance(val, float):
-            print(f"    {key:20s}: {_safe_format(val, '.6f')}")
-        else:
-            print(f"    {key:20s}: {val}")
+    if not compact:
+        print("\n  Hyperparameters:")
+        for key, val in best.params.items():
+            if isinstance(val, float):
+                print(f"    {key:20s}: {_safe_format(val, '.6f')}")
+            else:
+                print(f"    {key:20s}: {val}")
 
-    # Print selected stations preview
-    if solution is not None:
-        selected = [i for i, v in enumerate(solution) if v == 1]
-        if len(selected) <= 15:
-            idx_str = str(selected)
-        else:
-            idx_str = str(selected[:10]) + f" ... (total {len(selected)})"
-        print(f"    {'best_solution':20s}: {idx_str}")
+        print("\n  User Attributes (metrics):")
+        attrs = best.user_attrs
+        solution = attrs.get('best_solution', None)
+        for key, val in attrs.items():
+            if key == 'best_solution':
+                continue
+            if isinstance(val, float):
+                print(f"    {key:20s}: {_safe_format(val, '.6f')}")
+            else:
+                print(f"    {key:20s}: {val}")
     else:
-        print(f"    {'best_solution':20s}: Not stored")
+        # Horizontal format
+        # Combine params and user attrs into a single dict
+        combined = {**best.params, **{k: v for k, v in best.user_attrs.items() if k != 'best_solution'}}
+        # Format as horizontal lines
+        items = [(k, _safe_format(v, '.6f') if isinstance(v, float) else v) for k, v in combined.items()]
+        print("\n  " + _format_horizontal(items, width=width))
+
+        # Show solution preview
+        solution = best.user_attrs.get('best_solution')
+        if solution is not None:
+            selected = [i for i, v in enumerate(solution) if v == 1]
+            if len(selected) <= 15:
+                idx_str = str(selected)
+            else:
+                idx_str = str(selected[:10]) + f" ... (total {len(selected)})"
+            print(f"  best_solution={idx_str}")
+
     print("=" * 80)
 
 
-def print_validation_summary(val_results, experiment_name):
+def print_validation_summary(val_results, experiment_name, compact=True, width=200):
     """
     Print a detailed summary of the validation champion.
-    Expects val_results from validate_study().
+    If compact=True, uses horizontal layout to save vertical space.
     """
     if val_results is None or not val_results.get('trials'):
         print(f"⚠️ No validation results for experiment '{experiment_name}'.")
@@ -468,30 +519,60 @@ def print_validation_summary(val_results, experiment_name):
     print("\n" + "=" * 80)
     print(f"📊 VALIDATION SUMMARY: {experiment_name}")
     print("=" * 80)
-    print(f"  Best Validation SQR:   {_safe_format(best_trial.get('best_sqr', 'N/A'), '.6f')}")
-    print(f"  Feasibility Rate:       {_safe_format(best_trial.get('feas_rate', 'N/A'), '.6f')}")
-    print(f"  Trial #:                {best_trial.get('trial_number', 'N/A')}")
-    print(f"  λ₁:                     {_safe_format(best_trial.get('lam1', 'N/A'), '.6f')}")
-    print(f"  λ₂:                     {_safe_format(best_trial.get('lam2', 'N/A'), '.6f')}")
-    print(f"  num_sweeps:             {best_trial.get('num_sweeps', 'N/A')}")
-    if 'ESR' in best_trial:
-        print(f"  ESR:                    {_safe_format(best_trial['ESR'], '.4f')}")
-    if 'MCR' in best_trial:
-        print(f"  MCR:                    {_safe_format(best_trial['MCR'], '.4f')}")
-    # Selected stations
-    if best_trial.get('solution') is not None:
-        sol = best_trial['solution']
-        selected = [i for i, v in enumerate(sol) if v == 1]
-        if len(selected) <= 15:
-            idx_str = str(selected)
+
+    if not compact:
+        print(f"  Best Validation SQR:   {_safe_format(best_trial.get('best_sqr', 'N/A'), '.6f')}")
+        print(f"  Feasibility Rate:       {_safe_format(best_trial.get('feas_rate', 'N/A'), '.6f')}")
+        print(f"  Trial #:                {best_trial.get('trial_number', 'N/A')}")
+        print(f"  λ₁:                     {_safe_format(best_trial.get('lam1', 'N/A'), '.6f')}")
+        print(f"  λ₂:                     {_safe_format(best_trial.get('lam2', 'N/A'), '.6f')}")
+        print(f"  num_sweeps:             {best_trial.get('num_sweeps', 'N/A')}")
+        if 'ESR' in best_trial:
+            print(f"  ESR:                    {_safe_format(best_trial['ESR'], '.4f')}")
+        if 'MCR' in best_trial:
+            print(f"  MCR:                    {_safe_format(best_trial['MCR'], '.4f')}")
+        if best_trial.get('solution') is not None:
+            sol = best_trial['solution']
+            selected = [i for i, v in enumerate(sol) if v == 1]
+            if len(selected) <= 15:
+                idx_str = str(selected)
+            else:
+                idx_str = str(selected[:10]) + f" ... (total {len(selected)})"
+            print(f"  Selected stations:      {idx_str}")
         else:
-            idx_str = str(selected[:10]) + f" ... (total {len(selected)})"
-        print(f"  Selected stations:      {idx_str}")
+            print("  Selected stations:      Not available")
+        print(f"  Spearman ρ:             {_safe_format(val_results.get('spearman_rho', 'N/A'), '.4f')}")
+        print(f"  Spearman p-value:       {_safe_format(val_results.get('spearman_p', 'N/A'), '.4f')}")
+        print(f"  Validated trials:       {val_results.get('n_validated', 0)}")
     else:
-        print("  Selected stations:      Not available")
-    print(f"  Spearman ρ:             {_safe_format(val_results.get('spearman_rho', 'N/A'), '.4f')}")
-    print(f"  Spearman p-value:       {_safe_format(val_results.get('spearman_p', 'N/A'), '.4f')}")
-    print(f"  Validated trials:       {val_results.get('n_validated', 0)}")
+        # Horizontal format
+        items = [
+            ("best_sqr", _safe_format(best_trial.get('best_sqr'), '.6f')),
+            ("feas", _safe_format(best_trial.get('feas_rate'), '.4f')),
+            ("trial", best_trial.get('trial_number', 'N/A')),
+            ("lam1", _safe_format(best_trial.get('lam1'), '.6f')),
+            ("lam2", _safe_format(best_trial.get('lam2'), '.6f')),
+            ("sweeps", best_trial.get('num_sweeps', 'N/A')),
+        ]
+        if 'ESR' in best_trial:
+            items.append(("ESR", _safe_format(best_trial['ESR'], '.4f')))
+        if 'MCR' in best_trial:
+            items.append(("MCR", _safe_format(best_trial['MCR'], '.4f')))
+        # Show selected stations preview
+        if best_trial.get('solution') is not None:
+            sol = best_trial['solution']
+            selected = [i for i, v in enumerate(sol) if v == 1]
+            if len(selected) <= 15:
+                idx_str = str(selected)
+            else:
+                idx_str = str(selected[:10]) + f" ... ({len(selected)} total)"
+            items.append(("selected", idx_str))
+        items.append(("rho", _safe_format(val_results.get('spearman_rho'), '.4f')))
+        items.append(("p", _safe_format(val_results.get('spearman_p'), '.4f')))
+        items.append(("n_val", val_results.get('n_validated', 0)))
+
+        print("\n  " + _format_horizontal(items, width=width))
+
     print("=" * 80)
 
 
@@ -603,18 +684,13 @@ def print_global_summary(results, experiment_name):
 
 
 # ============================================================================
-# 10. NEW: SINGLE-RUN SUMMARY (for strategy comparison)
+# 10. SINGLE-RUN SUMMARY (for strategy comparison)
 # ============================================================================
 
 def print_single_run_summary(config: Dict, result: Dict, elapsed: float):
     """
     Print a concise yet rich summary for a single completed run.
-    
-    Args:
-        config: dict with keys like 'seed', 'objective', 'tuning_trials', 'tuning_reads',
-                'val_top_k', 'val_reads', 'N'
-        result: dict from run_one_config() containing 'best_sqr', 'feas_rate', 'spearman_rho', etc.
-        elapsed: runtime in seconds
+    Now uses effective SQR = max(tuning_sqr, val_sqr) and also MIQP energy.
     """
     print("\n" + "=" * 80)
     print("📌 SINGLE RUN COMPLETE")
@@ -627,29 +703,35 @@ def print_single_run_summary(config: Dict, result: Dict, elapsed: float):
     print(f"  Validation Reads:{config['val_reads']}")
     print(f"  N (candidates):  {config['N']}")
     print("-" * 40)
-    print(f"  Best SQR:        {_safe_format(result.get('best_sqr', np.nan), '.6f')}")
+
+    # Effective SQR (max of tuning and validation)
+    tuning_sqr = result.get('tuning_best_sqr', np.nan)
+    val_sqr = result.get('best_sqr', np.nan)
+    effective_sqr = max(tuning_sqr, val_sqr) if not (np.isnan(tuning_sqr) or np.isnan(val_sqr)) else (tuning_sqr if not np.isnan(tuning_sqr) else val_sqr)
+    sqr_source = "tuning" if effective_sqr == tuning_sqr and not np.isnan(tuning_sqr) else "validation"
+
+    print(f"  Best SQR:        {_safe_format(effective_sqr, '.6f')} (from {sqr_source})")
+    print(f"  Tuning SQR:      {_safe_format(tuning_sqr, '.6f')}")
+    print(f"  Validation SQR:  {_safe_format(val_sqr, '.6f')}")
     print(f"  Feasibility:     {_safe_format(result.get('feas_rate', np.nan), '.4f')}")
-    if 'spearman_rho' in result and result['spearman_rho'] is not None:
+    if 'spearman_rho' in result and result['spearman_rho'] is not None and not np.isnan(result['spearman_rho']):
         print(f"  Spearman ρ:      {_safe_format(result['spearman_rho'], '.4f')}")
     else:
         print("  Spearman ρ:      N/A")
+    print(f"  MIQP Energy:     {_safe_format(result.get('miqp_energy', np.nan), '.6f')}")
     print(f"  Total Samples:   {result.get('total_samples', 'N/A')}")
     print(f"  Runtime:         {elapsed:.2f} s ({elapsed/60:.2f} min)")
     print("=" * 80)
 
 
 # ============================================================================
-# 11. NEW: CROSS-STRATEGY SUMMARY (dynamic ranked table)
+# 11. CROSS-STRATEGY SUMMARY (dynamic ranked table) - with nan handling
 # ============================================================================
 
-def print_cross_strategy_summary(results_df: pd.DataFrame, title: str = "Cross-Strategy Summary"):
+def print_cross_strategy_summary(results_df: pd.DataFrame, title: str = "Cross-Strategy Summary", top_n: int = 10):
     """
     Print a dynamic ranked table of all completed configurations so far.
-    
-    Args:
-        results_df: DataFrame with columns: seed, objective, tuning_trials, tuning_reads,
-                    val_top_k, val_reads, N, best_sqr, feas_rate, spearman_rho, total_samples, time_seconds
-        title: optional title for the summary
+    Uses nan-safe aggregation.
     """
     if results_df.empty:
         print("\n⚠️ No completed configurations yet.")
@@ -669,7 +751,7 @@ def print_cross_strategy_summary(results_df: pd.DataFrame, title: str = "Cross-S
         " V" + results_df['val_reads'].astype(str)
     )
 
-    # Group by config and aggregate across seeds (if multiple seeds present)
+    # Group by config (excluding seed) and aggregate using nan-safe functions
     agg = results_df.groupby(['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N']).agg({
         'best_sqr': ['mean', 'std', 'count'],
         'feas_rate': ['mean', 'std'],
@@ -677,6 +759,8 @@ def print_cross_strategy_summary(results_df: pd.DataFrame, title: str = "Cross-S
         'total_samples': ['mean'],
         'time_seconds': ['mean', 'std']
     }).reset_index()
+
+    # Flatten columns
     agg.columns = ['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N',
                    'best_sqr_mean', 'best_sqr_std', 'n_seeds',
                    'feas_mean', 'feas_std',
@@ -684,10 +768,14 @@ def print_cross_strategy_summary(results_df: pd.DataFrame, title: str = "Cross-S
                    'samples_mean',
                    'time_mean', 'time_std']
 
+    # Replace NaN std with 0 for single seed
+    agg['best_sqr_std'] = agg['best_sqr_std'].fillna(0)
+    agg['time_std'] = agg['time_std'].fillna(0)
+
     # Sort by best_sqr_mean descending
     agg_sorted = agg.sort_values('best_sqr_mean', ascending=False)
 
-    # Display top rows (up to 20)
+    # Display top_n rows
     print("\n" + "=" * 80)
     print(f"📊 {title} (completed configs)")
     print("=" * 80)
@@ -699,7 +787,7 @@ def print_cross_strategy_summary(results_df: pd.DataFrame, title: str = "Cross-S
     display_cols = ['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads',
                     'N', 'best_sqr_mean', 'best_sqr_std', 'feas_mean', 'rho_mean', 'samples_mean', 'time_mean']
     # Format float columns
-    formatted = agg_sorted[display_cols].copy()
+    formatted = agg_sorted[display_cols].head(top_n).copy()
     for col in ['best_sqr_mean', 'best_sqr_std', 'feas_mean', 'rho_mean', 'samples_mean', 'time_mean']:
         formatted[col] = formatted[col].apply(lambda x: f"{x:.4f}" if not np.isnan(x) else "N/A")
     # Format time as minutes
@@ -707,23 +795,14 @@ def print_cross_strategy_summary(results_df: pd.DataFrame, title: str = "Cross-S
         lambda x: f"{x/60:.2f} min" if isinstance(x, (int, float)) and not np.isnan(x) else "N/A"
     )
 
-    # Print top rows (show all if <= 20, else top 10 and note)
-    if len(formatted) <= 20:
-        print(formatted.to_string(index=False))
-    else:
-        print(formatted.head(10).to_string(index=False))
-        print(f"\n... and {len(formatted)-10} more configurations.")
-        # Also show the best and worst for context
-        print("\n🏆 Best overall:")
-        print(formatted.iloc[0].to_string())
-        print("\n📉 Worst overall:")
-        print(formatted.iloc[-1].to_string())
-
+    print(formatted.to_string(index=False))
+    if len(agg_sorted) > top_n:
+        print(f"\n... and {len(agg_sorted)-top_n} more configurations (see CSV).")
     print("=" * 80)
 
 
 # ============================================================================
-# 12. NEW: SUPPRESS OPTUNA TRIAL LOGS
+# 12. SUPPRESS OPTUNA TRIAL LOGS
 # ============================================================================
 
 def suppress_optuna_trial_logs():
@@ -731,12 +810,122 @@ def suppress_optuna_trial_logs():
     Suppress Optuna's per-trial logging output (e.g., "Trial 0 finished with value: ...")
     but keep the progress bar visible.
     """
-    # Set Optuna's logger to WARNING level to suppress INFO messages
     optuna_logger = logging.getLogger('optuna')
     optuna_logger.setLevel(logging.WARNING)
-    # Also suppress the root logger if it's propagating
-    # We can also adjust the logging level for the 'optuna' namespace
-    # The progress bar is handled separately by show_progress_bar=True in study.optimize()
+
+
+# ============================================================================
+# 13. NEW: CONFIG HEADER PRINTER
+# ============================================================================
+
+def print_config_header(config: Dict):
+    """
+    Print a one-line header before running a configuration.
+    """
+    print("\n" + "─" * 80)
+    print(f"▶ Config: Seed={config['seed']}, Obj={config['objective']}, "
+          f"T={config['tuning_trials']}, R={config['tuning_reads']}, "
+          f"K={config['val_top_k']}, V={config['val_reads']}, N={config['N']}")
+    print("─" * 80)
+
+
+# ============================================================================
+# 14. NEW: CROSS-STRATEGY METRICS (correlations, efficiency, CV, rankings)
+# ============================================================================
+
+def print_cross_strategy_metrics(results_df: pd.DataFrame, title: str = "Cross-Strategy Metrics"):
+    """
+    Compute and print:
+    - Spearman correlation: SQR vs Runtime, SQR vs Samples
+    - Efficiency: SQR / Runtime, SQR / Samples
+    - Coefficient of Variation (CV) for each config
+    - Rankings by Efficiency, SQR, and CV
+    """
+    if results_df.empty:
+        print("\n⚠️ No data for cross-strategy metrics.")
+        return
+
+    # Ensure we have runtime and samples
+    if 'time_seconds' not in results_df.columns and 'runtime' in results_df.columns:
+        results_df['time_seconds'] = results_df['runtime']
+    if 'time_seconds' not in results_df.columns:
+        results_df['time_seconds'] = np.nan
+
+    # Group by config (excluding seed) and aggregate with nan-safe functions
+    agg = results_df.groupby(['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N']).agg({
+        'best_sqr': ['mean', 'std', 'count'],
+        'feas_rate': ['mean', 'std'],
+        'spearman_rho': ['mean', 'std'],
+        'total_samples': ['mean'],
+        'time_seconds': ['mean', 'std']
+    }).reset_index()
+    agg.columns = ['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N',
+                   'sqr_mean', 'sqr_std', 'n_seeds',
+                   'feas_mean', 'feas_std',
+                   'rho_mean', 'rho_std',
+                   'samples_mean',
+                   'time_mean', 'time_std']
+
+    # Drop rows where sqr_mean is NaN
+    agg = agg[agg['sqr_mean'].notna()]
+    if agg.empty:
+        print("⚠️ No valid configurations with SQR.")
+        return
+
+    # --- 1. Compute Spearman correlations (across configurations, using mean SQR) ---
+    valid_time = agg[agg['time_mean'].notna() & (agg['time_mean'] > 0)]
+    valid_samples = agg[agg['samples_mean'].notna() & (agg['samples_mean'] > 0)]
+
+    rho_sqr_time = np.nan
+    p_sqr_time = np.nan
+    if len(valid_time) >= 3:
+        rho_sqr_time, p_sqr_time = stats.spearmanr(valid_time['sqr_mean'], valid_time['time_mean'], nan_policy='omit')
+
+    rho_sqr_samples = np.nan
+    p_sqr_samples = np.nan
+    if len(valid_samples) >= 3:
+        rho_sqr_samples, p_sqr_samples = stats.spearmanr(valid_samples['sqr_mean'], valid_samples['samples_mean'], nan_policy='omit')
+
+    # --- 2. Efficiency (SQR per runtime and per sample) ---
+    agg['efficiency_time'] = agg['sqr_mean'] / agg['time_mean']
+    agg['efficiency_samples'] = agg['sqr_mean'] / agg['samples_mean']
+
+    # --- 3. Coefficient of Variation (CV) ---
+    agg['cv'] = agg['sqr_std'] / agg['sqr_mean']
+
+    # --- 4. Rankings ---
+    rank_by_sqr = agg.sort_values('sqr_mean', ascending=False).reset_index(drop=True)
+    rank_by_eff_time = agg.sort_values('efficiency_time', ascending=False).reset_index(drop=True)
+    rank_by_cv = agg.sort_values('cv', ascending=True).reset_index(drop=True)  # lower CV is better
+
+    # --- Print ---
+    print("\n" + "=" * 80)
+    print(f"📈 {title}")
+    print("=" * 80)
+
+    print("\n🔗 Correlations (across configurations):")
+    if not np.isnan(rho_sqr_time):
+        print(f"  Spearman ρ(SQR, Runtime): {rho_sqr_time:.4f}  (p={p_sqr_time:.4f})")
+    else:
+        print("  Spearman ρ(SQR, Runtime): N/A (insufficient data)")
+    if not np.isnan(rho_sqr_samples):
+        print(f"  Spearman ρ(SQR, Samples): {rho_sqr_samples:.4f}  (p={p_sqr_samples:.4f})")
+    else:
+        print("  Spearman ρ(SQR, Samples): N/A (insufficient data)")
+
+    print("\n🏆 Rank by Efficiency (SQR / Runtime):")
+    print(rank_by_eff_time[['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N',
+                            'sqr_mean', 'time_mean', 'efficiency_time']].head(5).to_string(index=False, float_format="%.4f"))
+
+    print("\n🏆 Rank by Best SQR:")
+    print(rank_by_sqr[['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N',
+                       'sqr_mean', 'sqr_std', 'feas_mean']].head(5).to_string(index=False, float_format="%.4f"))
+
+    print("\n🏆 Rank by Robustness (lowest CV):")
+    print(rank_by_cv[['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N',
+                      'sqr_mean', 'sqr_std', 'cv']].head(5).to_string(index=False, float_format="%.4f"))
+
+    print("=" * 80)
 
 
 # ============================================================================
@@ -760,7 +949,9 @@ __all__ = [
     'print_validation_summary',
     'print_sharpening_summary',
     'print_global_summary',
-    'print_single_run_summary',        # NEW
-    'print_cross_strategy_summary',    # NEW
-    'suppress_optuna_trial_logs',      # NEW
+    'print_single_run_summary',
+    'print_cross_strategy_summary',
+    'suppress_optuna_trial_logs',
+    'print_config_header',
+    'print_cross_strategy_metrics',
 ]

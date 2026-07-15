@@ -13,7 +13,7 @@ This module creates a master set of candidate sites with:
 All outputs are saved to the `data/` directory as .npy, .pkl, and .json files.
 
 Usage (command line):
-    python data/synthetic_data.py --seed 123 --n_master 150 --subset_sizes 10,20,30,50,100
+    python data/synthetic_data.py --seed 123 --n_master 200 --subset_sizes 10,20,30,50,100,150,200
     python data/synthetic_data.py --seed random  # Random seed (uses current time)
 """
 
@@ -38,8 +38,8 @@ RANDOM_SEED: int = 42
 # Domain: square of size DOMAIN_SIZE x DOMAIN_SIZE (kilometers)
 DOMAIN_SIZE: float = 50.0
 
-# Number of master candidate sites
-N_MASTER: int = 100
+# Number of master candidate sites (INCREASED to 200 to support scaling)
+N_MASTER: int = 200
 
 # AHP baseline weights (from Table I in the paper)
 # Order: [Pollution Load, Ecological Sensitivity, Hydrodynamic Variability,
@@ -55,8 +55,8 @@ CURRENT_VECTOR: Tuple[float, float] = (1.0, 0.0)
 # Number of existing stations (for incremental scenario)
 N_EXISTING: int = 3
 
-# Sizes of nested subsets to generate
-SUBSET_SIZES: List[int] = [10, 20, 30, 50, 100]
+# Sizes of nested subsets to generate (EXTENDED to include 150 and 200)
+SUBSET_SIZES: List[int] = [10, 20, 30, 50, 100, 150, 200]
 
 # Output directory (relative to project root)
 OUTPUT_DIR: str = "data"
@@ -384,6 +384,7 @@ def select_existing_stations_clustered(
     
     return selected
 
+
 def save_master_data(
     coords: np.ndarray,
     factors: np.ndarray,
@@ -560,7 +561,7 @@ def generate_and_save_all(
     n_master: Optional[int] = None,
     domain_size: Optional[float] = None,
     n_existing: Optional[int] = None,
-    max_existing_distance: Optional[float] = 10.0,  # <-- NEW PARAMETER
+    max_existing_distance: Optional[float] = 10.0,
     subset_sizes: Optional[List[int]] = None,
 ) -> Dict:
     """
@@ -572,6 +573,7 @@ def generate_and_save_all(
         n_master: Number of master candidates. If None, uses N_MASTER.
         domain_size: Domain size in km. If None, uses DOMAIN_SIZE.
         n_existing: Number of existing stations. If None, uses N_EXISTING.
+        max_existing_distance: Max cluster distance for existing stations.
         subset_sizes: List of subset sizes. If None, uses SUBSET_SIZES.
 
     Returns:
@@ -617,11 +619,12 @@ def generate_and_save_all(
     print(f"✓ Utility: shape {utility.shape}, range [{utility.min():.3f}, {utility.max():.3f}]")
 
     # Step 4: Select existing stations M
-    existing_indices = select_existing_stations_clustered(coords, utility, n_existing, max_existing_distance, seed=seed)
+    existing_indices = select_existing_stations_clustered(
+        coords, utility, n_existing, max_existing_distance, seed=seed
+    )
     print(f"✓ Existing stations (M): {existing_indices}")
 
     # Step 5: Create nested subsets using FPS starting from center
-    # Use the point closest to domain center as the first point
     center = np.array([domain_size / 2.0, domain_size / 2.0])
     dist_to_center = np.linalg.norm(coords - center, axis=1)
     start_idx = int(np.argmin(dist_to_center))
@@ -652,7 +655,7 @@ def generate_and_save_all(
             "start_idx": start_idx,
             "description": "Synthetic dataset for water quality monitoring QUBO.",
             "created_with_seed": seed,
-            "max_existing_distance": max_existing_distance,  # <-- LOG IT
+            "max_existing_distance": max_existing_distance,
         },
     )
 
@@ -714,7 +717,7 @@ def parse_args():
         help="Number of existing stations M."
     )
     parser.add_argument(
-        "--max_existing_distance",  # <-- NEW ARGUMENT
+        "--max_existing_distance",
         type=float, 
         default=10.0,
         help="Maximum cluster distance (km) for existing stations. Default: 10.0"
@@ -723,7 +726,7 @@ def parse_args():
         "--subset_sizes", 
         type=str, 
         default=None,
-        help='Comma-separated subset sizes, e.g., "10,20,30,50,100"'
+        help='Comma-separated subset sizes, e.g., "10,20,30,50,100,150,200"'
     )
     parser.add_argument(
         "--output_dir", 
@@ -761,6 +764,6 @@ if __name__ == "__main__":
         n_master=args.n_master,
         domain_size=args.domain_size,
         n_existing=args.n_existing,
-        max_existing_distance=args.max_existing_distance,  # <-- PASS IT
+        max_existing_distance=args.max_existing_distance,
         subset_sizes=subset_sizes,
     )

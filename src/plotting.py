@@ -13,12 +13,11 @@ This module provides:
     7. Performance scatter (SQR vs ESR/MCR, feasibility vs MCR)
     8. QUBO matrix heatmap (for champion hyperparameters)
     9. Experiment comparison table (bar chart comparing multiple experiments)
-   10. Deployment + QUBO matrix side-by-side
+   10. Deployment + QUBO matrix side-by-side (with text outside)
    11. Tuning vs Validation deployment comparison (2x2)
-   12. Enhanced Optuna learning curve (best, median, worst, mean, scatter)
-   13. NEW: Single config result plot (lightweight deployment + QUBO for a run)
-   14. NEW: Cross-strategy progress plots (heatmap, Pareto, SQR-vs-feas, Spearman)
-   15. NEW: Regenerate plots from saved DataFrame (for crash recovery)
+   12. Enhanced Optuna learning curve (best, median, rolling mean, scatter, NO worst)
+   13. NEW: Gurobi baseline plot
+   14. NEW: SQR vs Runtime scatter plot
 
 All functions accept a save_path and a show_fig flag (default True in Colab).
 """
@@ -52,7 +51,7 @@ try:
 except ImportError:
     OPTUNA_AVAILABLE = False
 
-# Local import for building QUBO matrices (needed for new plots)
+# Local import for building QUBO matrices
 from src.model import build_qubo
 
 
@@ -367,9 +366,8 @@ def save_optuna_plots(
     def _save_plot(plot_func: Callable, filename: str, **kwargs) -> None:
         try:
             fig = plot_func(study, **kwargs)
-            # fig may be a Figure or an Axes or array of Axes
             if hasattr(fig, 'savefig'):
-                pass  # it's a Figure
+                pass
             elif hasattr(fig, 'figure'):
                 fig = fig.figure
             elif isinstance(fig, np.ndarray) and len(fig) > 0 and hasattr(fig[0], 'figure'):
@@ -383,16 +381,13 @@ def save_optuna_plots(
         except Exception as e:
             print(f"  ⚠️ Failed to generate {filename}: {e}")
 
-    # Parameter importances (works for single-objective only; for multi, it will raise)
     try:
         _save_plot(plot_param_importances, "optuna_param_importance.png")
     except Exception as e:
-        print(f"  ⚠️ Could not generate parameter importance (multi-objective?): {e}")
+        print(f"  ⚠️ Could not generate parameter importance: {e}")
 
-    # Parallel coordinate: for multi-objective, specify target
     try:
         if len(study.directions) > 1:
-            # Multi-objective: use first objective value as target
             def target_func(t):
                 return t.values[0] if t.values is not None else None
             _save_plot(plot_parallel_coordinate, "optuna_parallel_coordinate.png", target=target_func)
@@ -401,7 +396,6 @@ def save_optuna_plots(
     except Exception as e:
         print(f"  ⚠️ Failed to generate parallel coordinate plot: {e}")
 
-    # Slice plot: same handling
     try:
         if len(study.directions) > 1:
             def target_func(t):
@@ -412,7 +406,7 @@ def save_optuna_plots(
     except Exception as e:
         print(f"  ⚠️ Failed to generate slice plot: {e}")
 
-    # Learning curve (custom)
+    # Custom learning curve (will be replaced by enhanced version)
     try:
         best_values = [t.value for t in study.trials if t.value is not None]
         if best_values:
@@ -770,7 +764,7 @@ def plot_optuna_learning_curve(
 
 
 # ============================================================================
-# 11. ENHANCED OPTUNA LEARNING CURVE
+# 11. ENHANCED OPTUNA LEARNING CURVE (NO worst, with scatter)
 # ============================================================================
 
 def plot_optuna_learning_curve_enhanced(
@@ -780,7 +774,8 @@ def plot_optuna_learning_curve_enhanced(
     show_fig: bool = True,
 ) -> None:
     """
-    Enhanced learning curve: cumulative best, median, worst, rolling mean, and scatter.
+    Enhanced learning curve: cumulative best, median, rolling mean, and scatter.
+    No worst line (since it's often 1.0).
     """
     try:
         values = [t.value for t in study.trials if t.value is not None]
@@ -790,7 +785,6 @@ def plot_optuna_learning_curve_enhanced(
 
         n_trials = len(values)
         cumulative_best = np.minimum.accumulate(values)
-        cumulative_worst = np.maximum.accumulate(values)
         cumulative_median = [np.median(values[:i+1]) for i in range(n_trials)]
 
         # Rolling mean
@@ -802,12 +796,11 @@ def plot_optuna_learning_curve_enhanced(
         # Scatter of all trials
         ax.scatter(range(n_trials), values, alpha=0.3, s=10, color='gray', label='All Trials')
 
-        # Best, Median, Worst
+        # Best and Median (no worst)
         ax.plot(cumulative_best, 'b-', linewidth=2, label='Best so far')
         ax.plot(cumulative_median, 'g--', linewidth=1.5, label='Median so far')
-        ax.plot(cumulative_worst, 'r--', linewidth=1.5, label='Worst so far')
 
-        # Rolling mean (only where valid)
+        # Rolling mean
         if len(rolling_mean) > 0:
             ax.plot(range(window-1, n_trials), rolling_mean, 'm-.', linewidth=1.5, label=f'Rolling Mean (w={window})')
 
@@ -828,7 +821,7 @@ def plot_optuna_learning_curve_enhanced(
 
 
 # ============================================================================
-# 12. DEPLOYMENT + QUBO MATRIX SIDE-BY-SIDE
+# 12. DEPLOYMENT + QUBO MATRIX SIDE-BY-SIDE (text outside)
 # ============================================================================
 
 def plot_deployment_with_qubo(
@@ -850,7 +843,7 @@ def plot_deployment_with_qubo(
 ) -> None:
     """
     Side-by-side: Deployment map (left) + QUBO matrix heatmap (right).
-    The title includes the experiment context (e.g., "Validation Champion: Trial #42").
+    The info text is placed outside the axes.
     """
     try:
         if solution is None:
@@ -858,6 +851,7 @@ def plot_deployment_with_qubo(
             return
 
         fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        fig.subplots_adjust(bottom=0.15, top=0.85)
 
         # ---------- LEFT: Deployment Map ----------
         ax1 = axes[0]
@@ -925,10 +919,18 @@ def plot_deployment_with_qubo(
         ax2.set_title(f'{title}\nQUBO Matrix (λ₁={lam1:.4f}, λ₂={lam2:.4f})')
         plt.colorbar(cax, ax=ax2, label='Energy coefficient')
 
-        # Overall title
-        fig.suptitle(title, fontsize=14, fontweight='bold')
+        # Info text box placed outside the axes (using fig.text)
+        info_text = (
+            f"Seed: {env['config'].get('seed', 'N/A')} | "
+            f"N: {N_total} | K_new: {K_new} | "
+            f"Selected: {len(selected_new)} new, {len(selected_m)} existing"
+        )
+        fig.text(0.5, 0.03, info_text, ha='center', va='bottom', fontsize=10,
+                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9))
 
-        plt.tight_layout()
+        fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
+
+        plt.tight_layout(rect=[0, 0.06, 1, 0.95])
         plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
         if show_fig:
             plt.show()
@@ -1061,69 +1063,50 @@ def plot_tuning_vs_validation_deployment(
 
 
 # ============================================================================
-# 14. NEW: SINGLE CONFIG RESULT PLOT (lightweight)
+# 14. NEW: GUROBI BASELINE PLOT
 # ============================================================================
 
-def plot_single_config_result(
+def plot_gurobi_baseline(
     env: Dict,
-    config: Dict,
-    result: Dict,
-    save_dir: Union[str, Path],
+    save_path: Union[str, Path],
+    dpi: int = 150,
     show_fig: bool = True,
 ) -> None:
     """
-    Generate a lightweight plot for a single completed run.
-    Shows a deployment map (using the best solution) and a small info box.
-    If the solution is not available, skip.
-    
-    Args:
-        env: environment dict (needed for coords, U, M_indices, etc.)
-        config: dict with keys like 'seed', 'objective', 'N', etc.
-        result: dict from run_one_config() containing 'best_solution', 'best_sqr', etc.
-        save_dir: directory to save the plot
-        show_fig: whether to display inline
+    Plot the Gurobi (or greedy fallback) baseline solution as a deployment map.
     """
     try:
-        # Extract solution
-        solution = result.get('best_solution')
-        if solution is None:
-            print("  ⚠️ No solution found; skipping single-run plot.")
-            return
-        
-        # Extract data
+        solution = env.get('gurobi_solution')
         coords = env['coords']
         U = env['U']
         M_indices = env['M_indices']
-        DOMAIN_SIZE = 50.0  # hardcoded for now; could be in config
+        DOMAIN_SIZE = 50.0  # assume fixed
         CONNECTIVITY_RANGE = env.get('connectivity_range', 8.0)
-        current_vector = (1.0, 0.0)  # might be stored in env
 
-        # Determine selected stations
-        selected_new = [i for i in range(len(solution)) if solution[i] == 1 and i not in M_indices]
+        if solution is None:
+            print("  ⚠️ No Gurobi solution available.")
+            return
+
         selected_m = [i for i in range(len(solution)) if solution[i] == 1 and i in M_indices]
+        selected_new = [i for i in range(len(solution)) if solution[i] == 1 and i not in M_indices]
         all_selected = selected_m + selected_new
 
-        # Create figure
         fig, ax = plt.subplots(figsize=(10, 8))
-        
-        # Utility landscape
         grid_x = np.linspace(0, DOMAIN_SIZE, 100)
         grid_y = np.linspace(0, DOMAIN_SIZE, 100)
         grid_z = griddata(coords, U, (grid_x[None, :], grid_y[:, None]), method='cubic')
+
         ax.contourf(grid_x, grid_y, grid_z, levels=20, cmap='viridis', alpha=0.3)
-        
-        # Candidates
         ax.scatter(coords[:, 0], coords[:, 1], c='lightgray', s=30, alpha=0.5,
                    edgecolor='gray', linewidth=0.2)
-        
-        # Selected stations
+
         if selected_m:
             ax.scatter(coords[selected_m, 0], coords[selected_m, 1],
-                       c='blue', s=100, marker='s', edgecolor='black', label='Existing (M)')
+                       c='blue', s=120, marker='s', edgecolor='black', label='Existing (M)')
         if selected_new:
             ax.scatter(coords[selected_new, 0], coords[selected_new, 1],
-                       c='red', s=120, marker='o', edgecolor='black', label='New')
-        
+                       c='red', s=150, marker='o', edgecolor='black', label='New')
+
         # Connectivity links
         for i, idx_i in enumerate(all_selected):
             for j, idx_j in enumerate(all_selected):
@@ -1133,53 +1116,103 @@ def plot_single_config_result(
                         ax.plot([coords[idx_i, 0], coords[idx_j, 0]],
                                 [coords[idx_i, 1], coords[idx_j, 1]],
                                 color='gray', alpha=0.4, linewidth=1.5, linestyle='--')
-        
-        # Current direction
-        ax.quiver(0, 0, current_vector[0], current_vector[1],
-                  angles='xy', scale_units='xy', scale=10,
-                  color='blue', width=0.02, label='Current', zorder=6)
-        
-        ax.set_xlabel("X (km)")
-        ax.set_ylabel("Y (km)")
+
+        ax.set_xlabel('X (km)')
+        ax.set_ylabel('Y (km)')
         ax.set_aspect('equal')
         ax.set_xlim(-2, DOMAIN_SIZE + 2)
         ax.set_ylim(-2, DOMAIN_SIZE + 2)
         ax.legend()
-        
-        # Info box
+
+        # Info text outside the axes
         info_text = (
-            f"Seed: {config['seed']}\n"
-            f"Objective: {config['objective']}\n"
-            f"N: {config['N']}\n"
-            f"Tuning Trials: {config['tuning_trials']}\n"
-            f"Tuning Reads: {config['tuning_reads']}\n"
-            f"Val TopK: {config['val_top_k']}\n"
-            f"Val Reads: {config['val_reads']}\n"
-            f"SQR: {result.get('best_sqr', 0.0):.4f}\n"
-            f"Feas: {result.get('feas_rate', 0.0):.2f}\n"
-            f"Samples: {result.get('total_samples', 0)}\n"
-            f"New stations: {len(selected_new)}"
+            f"Seed: {env['config'].get('seed', 'N/A')} | "
+            f"N: {len(coords)} | K_new: {env['config']['K_new']} | "
+            f"Gurobi MIQP: {env['gurobi_miqp']:.6f} (SQR=1.0000) | "
+            f"Selected: {len(selected_new)} new, {len(selected_m)} existing"
         )
-        ax.text(0.02, 0.98, info_text, transform=ax.transAxes,
-                fontsize=9, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-        
-        ax.set_title(f"Run: Seed {config['seed']} - {config['objective']} (N={config['N']})")
-        
-        # Save
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        save_path = save_dir / f"single_run_seed{config['seed']}_obj{config['objective']}_N{config['N']}.png"
-        plt.savefig(save_path, dpi=100, bbox_inches='tight')
+        fig.text(0.5, 0.02, info_text, ha='center', va='bottom', fontsize=10,
+                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9))
+
+        ax.set_title('Gurobi Exact Optimum (SQR=1.0000)')
+        plt.tight_layout(rect=[0, 0.06, 1, 1])
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
         if show_fig:
             plt.show()
         plt.close(fig)
     except Exception as e:
-        print(f"  ⚠️ Failed to generate single-run plot: {e}")
+        print(f"  ⚠️ Failed to generate Gurobi baseline plot: {e}")
 
 
 # ============================================================================
-# 15. NEW: CROSS-STRATEGY PROGRESS PLOTS
+# 15. NEW: SQR vs RUNTIME SCATTER PLOT
+# ============================================================================
+
+def plot_sqr_vs_runtime(
+    results_df: pd.DataFrame,
+    save_path: Union[str, Path],
+    dpi: int = 150,
+    show_fig: bool = True,
+) -> None:
+    """
+    Scatter plot of SQR vs Runtime, colour-coded by objective.
+    Also shows the Pareto frontier (configs that dominate in both metrics).
+    """
+    if results_df.empty:
+        print("  ⚠️ No data for SQR vs Runtime plot.")
+        return
+
+    # Aggregate by config (excluding seed)
+    agg = results_df.groupby(['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N']).agg({
+        'best_sqr': ['mean', 'std', 'count'],
+        'time_seconds': ['mean', 'std']
+    }).reset_index()
+    agg.columns = ['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N',
+                   'sqr_mean', 'sqr_std', 'n_seeds',
+                   'time_mean', 'time_std']
+
+    # Drop rows with NaN
+    agg = agg[agg['sqr_mean'].notna() & agg['time_mean'].notna() & (agg['time_mean'] > 0)]
+    if agg.empty:
+        print("  ⚠️ No valid data for SQR vs Runtime plot.")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Scatter points
+    for obj in agg['objective'].unique():
+        sub = agg[agg['objective'] == obj]
+        ax.scatter(sub['time_mean'], sub['sqr_mean'], label=obj, s=80, alpha=0.7)
+
+    # Find Pareto frontier (maximize SQR, minimize time)
+    # Sort by time ascending, then keep those with increasing SQR
+    sorted_agg = agg.sort_values('time_mean')
+    pareto = []
+    best_sqr = -np.inf
+    for _, row in sorted_agg.iterrows():
+        if row['sqr_mean'] > best_sqr:
+            pareto.append(row)
+            best_sqr = row['sqr_mean']
+
+    if pareto:
+        pareto_df = pd.DataFrame(pareto)
+        ax.plot(pareto_df['time_mean'], pareto_df['sqr_mean'], 'k--', linewidth=2, label='Pareto Frontier')
+
+    ax.set_xlabel('Mean Runtime (seconds)')
+    ax.set_ylabel('Mean SQR')
+    ax.set_title('SQR vs Runtime')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+
+
+# ============================================================================
+# 16. UPDATED CROSS-STRATEGY PROGRESS (now includes SQR vs Runtime)
 # ============================================================================
 
 def plot_cross_strategy_progress(
@@ -1190,13 +1223,7 @@ def plot_cross_strategy_progress(
     """
     Generate updated cross-strategy progress plots from the accumulated DataFrame.
     Plots: heatmap (SQR vs factors), Pareto (SQR vs samples), SQR vs feasibility,
-    and Spearman correlation heatmap.
-    
-    Args:
-        results_df: DataFrame with columns: seed, objective, tuning_trials, tuning_reads,
-                    val_top_k, val_reads, N, best_sqr, feas_rate, spearman_rho, total_samples
-        save_dir: directory to save the plots (will overwrite existing)
-        show_fig: whether to display inline
+    Spearman correlation heatmap, and SQR vs Runtime.
     """
     if results_df.empty:
         print("  ⚠️ No data to plot cross-strategy progress.")
@@ -1205,36 +1232,31 @@ def plot_cross_strategy_progress(
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # We'll group by config (excluding seed) to get mean metrics
+    # Aggregate
     agg = results_df.groupby(['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N']).agg({
         'best_sqr': ['mean', 'std', 'count'],
         'feas_rate': ['mean'],
         'spearman_rho': ['mean'],
-        'total_samples': ['mean']
+        'total_samples': ['mean'],
+        'time_seconds': ['mean', 'std']
     }).reset_index()
     agg.columns = ['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N',
                    'best_sqr_mean', 'best_sqr_std', 'n_seeds',
-                   'feas_mean', 'rho_mean', 'samples_mean']
+                   'feas_mean', 'rho_mean', 'samples_mean',
+                   'time_mean', 'time_std']
 
-    # Create a config label
-    agg['config_label'] = (
-        agg['objective'] + " T" + agg['tuning_trials'].astype(str) +
-        " R" + agg['tuning_reads'].astype(str) +
-        " K" + agg['val_top_k'].astype(str) +
-        " V" + agg['val_reads'].astype(str)
-    )
+    # Drop rows with NaN SQR
+    agg = agg[agg['best_sqr_mean'].notna()]
 
-    # --- Plot 1: Heatmap of SQR vs Val TopK and Val Reads, faceted by Objective ---
-    # For simplicity, we'll pick the best tuning trials/reads for each objective (mean across seeds)
-    # We'll create pivot tables: rows = (tuning_trials, tuning_reads), cols = (val_top_k, val_reads)
-    # But that can get large. Instead, we'll facet by objective and N (assuming N is fixed in Stage 1).
-    # Since N is fixed to 100 in Stage 1, we'll filter for N=100.
+    if agg.empty:
+        print("  ⚠️ No valid aggregated data.")
+        return
+
+    # ---- Heatmap (for N=100) ----
     stage1_df = agg[agg['N'] == 100]
     if not stage1_df.empty:
         for obj in stage1_df['objective'].unique():
             sub = stage1_df[stage1_df['objective'] == obj]
-            # Create pivot: rows = (tuning_trials, tuning_reads), cols = (val_top_k, val_reads)
-            # Flatten into a single string for rows and columns
             sub['row_label'] = sub['tuning_trials'].astype(str) + "T," + sub['tuning_reads'].astype(str) + "R"
             sub['col_label'] = "K" + sub['val_top_k'].astype(str) + ",V" + sub['val_reads'].astype(str)
             pivot = sub.pivot(index='row_label', columns='col_label', values='best_sqr_mean')
@@ -1252,7 +1274,7 @@ def plot_cross_strategy_progress(
                 plt.show()
             plt.close()
 
-    # --- Plot 2: Pareto Front (SQR vs Total Samples) ---
+    # ---- Pareto Front: SQR vs Samples ----
     plt.figure(figsize=(10, 6))
     for obj in agg['objective'].unique():
         sub = agg[agg['objective'] == obj]
@@ -1260,16 +1282,16 @@ def plot_cross_strategy_progress(
                     label=obj, s=60, alpha=0.7)
     plt.xlabel('Total Samples (Tuning + Validation)')
     plt.ylabel('Mean Validation SQR')
-    plt.title('Pareto Front: SQR vs Total Samples')
+    plt.title('Pareto Front: SQR vs Samples')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(save_dir / "pareto_front.png", dpi=150)
+    plt.savefig(save_dir / "pareto_front_samples.png", dpi=150)
     if show_fig:
         plt.show()
     plt.close()
 
-    # --- Plot 3: SQR vs Feasibility ---
+    # ---- SQR vs Feasibility ----
     plt.figure(figsize=(10, 6))
     for obj in agg['objective'].unique():
         sub = agg[agg['objective'] == obj]
@@ -1286,14 +1308,14 @@ def plot_cross_strategy_progress(
         plt.show()
     plt.close()
 
-    # --- Plot 4: Spearman ρ heatmap (similar to SQR heatmap) ---
+    # ---- Spearman ρ Heatmap ----
     if not stage1_df.empty:
         for obj in stage1_df['objective'].unique():
             sub = stage1_df[stage1_df['objective'] == obj]
             sub['row_label'] = sub['tuning_trials'].astype(str) + "T," + sub['tuning_reads'].astype(str) + "R"
             sub['col_label'] = "K" + sub['val_top_k'].astype(str) + ",V" + sub['val_reads'].astype(str)
             pivot = sub.pivot(index='row_label', columns='col_label', values='rho_mean')
-            if pivot.empty:
+            if pivot.empty or pivot.isnull().all().all():
                 continue
             plt.figure(figsize=(10, 6))
             sns.heatmap(pivot, annot=True, fmt='.3f', cmap='coolwarm',
@@ -1307,9 +1329,12 @@ def plot_cross_strategy_progress(
                 plt.show()
             plt.close()
 
+    # ---- SQR vs Runtime (new) ----
+    plot_sqr_vs_runtime(results_df, save_dir / "sqr_vs_runtime.png", show_fig=show_fig)
+
 
 # ============================================================================
-# 16. NEW: REGENERATE PLOTS FROM SAVED DATA
+# 17. REGENERATE PLOTS (calls all of the above)
 # ============================================================================
 
 def regenerate_plots(
@@ -1319,7 +1344,7 @@ def regenerate_plots(
 ) -> None:
     """
     Regenerate all cross-strategy progress plots from a saved DataFrame.
-    This is called on startup to restore plots after a crash or resume.
+    Called on startup to restore plots after a crash or resume.
     """
     if results_df.empty:
         print("  ⚠️ No data to regenerate plots.")
@@ -1349,7 +1374,8 @@ __all__ = [
     'plot_deployment_with_qubo',
     'plot_tuning_vs_validation_deployment',
     # New
-    'plot_single_config_result',
+    'plot_gurobi_baseline',
+    'plot_sqr_vs_runtime',
     'plot_cross_strategy_progress',
     'regenerate_plots',
 ]

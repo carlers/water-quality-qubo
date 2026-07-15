@@ -14,6 +14,7 @@ All functions import only from Level 1 (model, solvers, utils, environment, plot
 
 CRITICAL: SQR is now computed using the RAW MIQP energy (pairwise_raw), not the
 normalized energy. This ensures a fair comparison to the Gurobi baseline.
+UPDATED: nan-safe aggregations, load_if_exists=True, division-by-zero guard.
 """
 
 import time
@@ -98,7 +99,7 @@ def _compute_raw_energy(
 
 
 # -----------------------------------------------------------------------------
-# 1. evaluate_qubo – Core evaluation function (UPDATED: raw SQR)
+# 1. evaluate_qubo – Core evaluation function (UPDATED: division-by-zero guard)
 # -----------------------------------------------------------------------------
 
 def evaluate_qubo(
@@ -241,7 +242,11 @@ def evaluate_qubo(
         # Use the best solution (if feasible) and compute raw energy
         if best_solution is not None and feas_rate:
             raw_miqp = _compute_raw_energy(best_solution, pairwise_raw)
-            best_sqr = raw_miqp / gurobi_miqp if gurobi_miqp else 0.0
+            # --- division-by-zero guard ---
+            if gurobi_miqp == 0:
+                best_sqr = 0.0
+            else:
+                best_sqr = raw_miqp / gurobi_miqp
             return {
                 'best_miqp': raw_miqp,
                 'best_sqr': best_sqr,
@@ -285,9 +290,13 @@ def evaluate_qubo(
     feas_rate = len(feasible_raw_miqps) / len(all_samples) if all_samples else 0.0
 
     if feasible_raw_miqps and np.isfinite(best_raw_miqp) and best_raw_miqp != float('inf'):
-        best_sqr = best_raw_miqp / gurobi_miqp if gurobi_miqp else 0.0
-        avg_sqr = np.mean([e / gurobi_miqp for e in feasible_raw_miqps]) if feasible_raw_miqps else 0.0
-        p10_sqr = np.percentile([e / gurobi_miqp for e in feasible_raw_miqps], 10) if feasible_raw_miqps else 0.0
+        # --- division-by-zero guard ---
+        if gurobi_miqp == 0:
+            best_sqr = 0.0
+        else:
+            best_sqr = best_raw_miqp / gurobi_miqp
+        avg_sqr = np.mean([e / gurobi_miqp for e in feasible_raw_miqps]) if gurobi_miqp != 0 else 0.0
+        p10_sqr = np.percentile([e / gurobi_miqp for e in feasible_raw_miqps], 10) if gurobi_miqp != 0 else 0.0
         best_solution = best_sol if best_sol is not None else best_solution
     else:
         best_raw_miqp = float('inf')
@@ -440,7 +449,7 @@ def make_objective(
 
 
 # -----------------------------------------------------------------------------
-# 3. run_optuna_study – Create/load and run study (unchanged)
+# 3. run_optuna_study – Create/load and run study (UPDATED: load_if_exists=True)
 # -----------------------------------------------------------------------------
 
 def run_optuna_study(
@@ -451,7 +460,7 @@ def run_optuna_study(
     directions: Optional[List[str]] = None,
     sampler_type: str = 'TPE',
     seed: int = 42,
-    load_if_exists: bool = False,
+    load_if_exists: bool = True,  # <-- CHANGED DEFAULT to True for crash recovery
     verbose: bool = True,
 ) -> 'optuna.Study':
     """Create or load an Optuna study with RDBStorage."""
@@ -482,7 +491,7 @@ def run_optuna_study(
         storage=storage,
         sampler=sampler,
         directions=directions,
-        load_if_exists=load_if_exists,
+        load_if_exists=load_if_exists,  # <-- now True
     )
 
     existing_trials = len(study.trials)
@@ -501,7 +510,7 @@ def run_optuna_study(
 
 
 # -----------------------------------------------------------------------------
-# 4. validate_study – Validate top trials (unchanged, uses raw SQR from evaluate_qubo)
+# 4. validate_study – Validate top trials (UPDATED: nan-safe aggregation)
 # -----------------------------------------------------------------------------
 
 def validate_study(
@@ -518,6 +527,7 @@ def validate_study(
     """
     Extract top_k trials and re-evaluate with more reads.
     Returns validation results with raw SQR.
+    Uses np.nanmax and np.nanmean for safe aggregation.
     """
     directions = study.directions
     if len(directions) == 1:
@@ -624,25 +634,27 @@ def validate_study(
         tuning_scores.append(tuning_score)
         validation_sqrs.append(best_sqr)
 
-    # Summary stats
+    # --- Summary stats with nan-safe aggregation ---
+    # Filter out NaN values
     valid_best_sqrs = [r['best_sqr'] for r in val_results if np.isfinite(r['best_sqr']) and r['best_sqr'] > 0]
     if valid_best_sqrs:
-        best_sqr = max(valid_best_sqrs)
+        best_sqr = np.nanmax(valid_best_sqrs)  # <-- nan-safe max
         # Find corresponding trial
         best_trial = next((r for r in val_results if r['best_sqr'] == best_sqr), None)
         feas_rate = best_trial['feas_rate'] if best_trial else np.nan
         top5_sqrs = sorted(valid_best_sqrs, reverse=True)[:5]
-        avg_top5 = np.mean(top5_sqrs) if top5_sqrs else np.nan
+        avg_top5 = np.nanmean(top5_sqrs) if top5_sqrs else np.nan
     else:
         best_sqr = np.nan
         avg_top5 = np.nan
         feas_rate = np.nan
 
+    # Spearman correlation: filter pairs where both are finite
     paired = [(ts, vs) for ts, vs in zip(tuning_scores, validation_sqrs)
               if np.isfinite(vs) and vs > 0 and np.isfinite(ts)]
     if len(paired) >= 3:
         ts_vals, vs_vals = zip(*paired)
-        rho, pval = stats.spearmanr(ts_vals, vs_vals)
+        rho, pval = stats.spearmanr(ts_vals, vs_vals, nan_policy='omit')
     else:
         rho, pval = np.nan, np.nan
 
@@ -663,7 +675,7 @@ def validate_study(
 
 
 # -----------------------------------------------------------------------------
-# 5. run_ablation_experiment – Full ablation/comparison orchestration (UPDATED)
+# 5. run_ablation_experiment – Full ablation/comparison orchestration
 # -----------------------------------------------------------------------------
 
 def run_ablation_experiment(
@@ -714,7 +726,7 @@ def run_ablation_experiment(
         directions=directions,
         sampler_type=sampler_type,
         seed=tuning_seed,
-        load_if_exists=not force_retune,
+        load_if_exists=not force_retune,  # <-- if force_retune, don't load existing
         verbose=verbose,
     )
 
@@ -810,8 +822,8 @@ def run_ablation_experiment(
             coords=env['coords'],
             U=env['U'],
             M_indices=env['M_indices'],
-            DOMAIN_SIZE=50.0,  # TODO: make configurable
-            current_vector=(1.0, 0.0),  # TODO: make configurable
+            DOMAIN_SIZE=50.0,
+            current_vector=(1.0, 0.0),
             CONNECTIVITY_RANGE=env['connectivity_range'],
             experiment_name=experiment_name,
             save_path=plot_dir / "tuning_vs_validation_deployment.png",
@@ -859,32 +871,19 @@ def run_ablation_experiment(
         )
 
     # --- Prepare global summary data ---
-    # We need to build a results dict with phase_times, total_time, etc.
-    # Since we don't have a global timer here, we can use the local timings.
-    # We'll store the times in a dict for the summary.
-    # For simplicity, we can pass the times we have (tuning and validation) and estimate total.
-    # Alternatively, we can compute elapsed time for the whole function.
-    # We'll use time.perf_counter() at start and end.
-    # Actually, we can just compute the total time by summing phase times if we stored them.
-    # But we don't have phase times in this function. We'll just use the total elapsed.
-    # We'll pass a simple dict with the key metrics.
     summary_results = {
-        'phase_times': {'Tuning': 0, 'Validation': 0},  # placeholders
+        'phase_times': {'Tuning': 0, 'Validation': 0},
         'total_time': 0,
         'champion': {
             'best_sqr': best_tuning_trial.user_attrs.get('best_sqr', np.nan) if best_tuning_trial else np.nan,
         },
         'validation_results': val_results,
-        'best_sharpen': {},  # not available in ablation
+        'best_sharpen': {},
         'spearman': {
             'rho': val_results.get('spearman_rho', np.nan),
             'available': val_results.get('spearman_rho') is not None,
         },
     }
-    # We can add the best_sharpen placeholder, but it's not used in ablation.
-    # For the global summary, we can just print the validation best.
-    # Alternatively, we can skip global summary here and let the caller handle it.
-    # But we already have print_global_summary, so we can call it.
     print_global_summary(summary_results, experiment_name)
 
     if verbose:

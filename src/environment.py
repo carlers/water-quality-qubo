@@ -11,15 +11,17 @@ The environment includes:
     - Gurobi baseline (MIQP value and solution).
     - Fixed physical parameters (L_c, connectivity_range).
 
+NEW: Supports N (number of candidate sites) via nested subsets from synthetic_data.
+
 Caching:
     A deterministic hash is generated from all parameters that affect
-    the QUBO (seed, K_new, L_c, L_w, beta, delta, connectivity_range).
+    the QUBO (seed, K_new, L_c, L_w, beta, delta, connectivity_range, N).
     If the cache exists locally (or on GDrive), it is loaded.
     Otherwise, it is built and saved.
 
 Usage:
     from src.environment import get_environment
-    env = get_environment(seed=42, K_new=5, L_c=5.0, connectivity_range=8.0)
+    env = get_environment(seed=42, K_new=5, L_c=5.0, connectivity_range=8.0, N=100)
     # env is a dict with all needed data.
 """
 
@@ -87,6 +89,7 @@ def get_environment(
     force_recompute: bool = False,
     verbose: bool = True,
     gdrive_base: Optional[str] = None,
+    N: Optional[int] = None,  # NEW: number of candidate sites to use (subset)
 ) -> Dict:
     """
     Build or load the cached normalized QUBO environment.
@@ -103,6 +106,7 @@ def get_environment(
         force_recompute: If True, ignore cache and rebuild.
         verbose: Print progress.
         gdrive_base: If provided, also look for cache in GDrive and save there.
+        N: If provided, load the subset of this size from the master data (must be in subsets).
 
     Returns:
         dict with keys:
@@ -130,6 +134,7 @@ def get_environment(
         'delta': delta,
         'connectivity_range': connectivity_range,
         'current_vector': current_vector,
+        'N': N,  # include N for caching
     }
     # Sort keys for reproducibility
     config_str = json.dumps(config, sort_keys=True)
@@ -160,25 +165,50 @@ def get_environment(
                 else:
                     if verbose:
                         print(f"  ⚠️ Cache config mismatch. Rebuilding.")
-                    break
 
     if verbose:
         print(f"  ⏳ Building environment (hash={cache_hash})...")
 
     # ------------------------------------------------------------------------
-    # 1. Generate / load synthetic data
+    # 1. Generate / load synthetic data (master set)
     # ------------------------------------------------------------------------
+    # Ensure master data exists for this seed
     if not local_data_dir.exists():
         generate_and_save_all(seed=seed, output_dir=str(local_data_dir))
-    coords, factors, U, subsets, meta = load_master_data(str(local_data_dir))
+    coords_master, factors_master, U_master, subsets, meta = load_master_data(str(local_data_dir))
     M_indices = meta['existing_indices']
-    N_total = len(coords)
-
-    if verbose:
-        print(f"  ✓ Loaded data: N_total={N_total}, |M|={len(M_indices)}")
 
     # ------------------------------------------------------------------------
-    # 2. Compute connectivity_range if not provided
+    # 2. If N is specified, load the corresponding subset
+    # ------------------------------------------------------------------------
+    if N is not None:
+        if N not in subsets:
+            raise ValueError(f"N={N} not found in subsets. Available: {list(subsets.keys())}")
+        subset_data = subsets[N]
+        coords = subset_data['coords']
+        U = subset_data['U']
+        # M_indices: keep only those that are in the subset
+        # Map original indices to subset indices
+        orig_indices = subset_data['indices']
+        idx_map = {orig: new for new, orig in enumerate(orig_indices)}
+        # Filter M_indices: keep only those present in the subset
+        M_indices_subset = [idx_map[m] for m in M_indices if m in idx_map]
+        # Also need to map factors? Not needed for QUBO construction because we only need coords, U.
+        # But we may want to keep the original indices for reference.
+        # We'll store M_indices as the new subset indices.
+        M_indices = M_indices_subset
+        if verbose:
+            print(f"  ✓ Loaded subset N={N} ( |M|={len(M_indices)} )")
+    else:
+        coords = coords_master
+        U = U_master
+        if verbose:
+            print(f"  ✓ Loaded full master set (N_total={len(coords)}, |M|={len(M_indices)})")
+
+    N_total = len(coords)
+
+    # ------------------------------------------------------------------------
+    # 3. Compute connectivity_range if not provided
     # ------------------------------------------------------------------------
     if connectivity_range is None:
         dist_matrix = cdist(coords, coords)
@@ -192,7 +222,7 @@ def get_environment(
     config['connectivity_range'] = connectivity_range
 
     # ------------------------------------------------------------------------
-    # 3. Build raw pairwise terms with fixed physical parameters
+    # 4. Build raw pairwise terms with fixed physical parameters
     # ------------------------------------------------------------------------
     if verbose:
         print(f"  Building pairwise terms (L_c={L_c} km, L_w={L_w} km, D_max={connectivity_range:.2f} km)...")
@@ -211,7 +241,7 @@ def get_environment(
     )
 
     # ------------------------------------------------------------------------
-    # 4. Normalize the QUBO (two-step)
+    # 5. Normalize the QUBO (two-step)
     # ------------------------------------------------------------------------
     if verbose:
         print("  Normalizing QUBO...")
@@ -242,7 +272,7 @@ def get_environment(
         print(f"    J range: {min(J_norm.values()) if J_norm else 0:.4f} to {max(J_norm.values()) if J_norm else 0:.4f}")
 
     # ------------------------------------------------------------------------
-    # 5. Compute Gurobi baseline (or greedy fallback)
+    # 6. Compute Gurobi baseline (or greedy fallback)
     # ------------------------------------------------------------------------
     gurobi_miqp = None
     gurobi_solution = None
@@ -287,13 +317,13 @@ def get_environment(
             print(f"    ✓ Greedy fallback: MIQP = {gurobi_miqp:.8f}")
 
     # ------------------------------------------------------------------------
-    # 6. Package environment
+    # 7. Package environment
     # ------------------------------------------------------------------------
     env = {
         'coords': coords,
         'U': U,
         'M_indices': M_indices,
-        'pairwise_raw': pairwise_raw, 
+        'pairwise_raw': pairwise_raw,
         'pairwise_norm': pairwise_norm,
         'Q_obj': Q_obj,
         'gurobi_miqp': gurobi_miqp,
@@ -307,7 +337,7 @@ def get_environment(
     }
 
     # ------------------------------------------------------------------------
-    # 7. Save cache
+    # 8. Save cache
     # ------------------------------------------------------------------------
     local_cache_path.parent.mkdir(parents=True, exist_ok=True)
     with open(local_cache_path, 'wb') as f:
