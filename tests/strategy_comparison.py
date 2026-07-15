@@ -76,44 +76,43 @@ warnings.filterwarnings('ignore')
 
 # --- Mode ---
 CURRENT_MODE = 'test'  # 'test' or 'full'
-FORCE_RECOMPUTE_ENV = False  # Set True if you want to rebuild environments from scratch
+FORCE_RECOMPUTE_ENV = False
 
-# --- Fixed physical parameters (kept constant across all runs) ---
+# --- Fixed physical parameters ---
 K_NEW = 5
 L_C = 5.0
 CONNECTIVITY_RANGE = 8.0
 L_W = 1.0
 BETA = 1.0
 DELTA = 1.0
-SCHEDULE_TYPE = "old"  # confirmed winner
+SCHEDULE_TYPE = "old"
 USE_SEED_NONE = True
 TUNING_SEED = 42
 VAL_SEED = 43
 
-# --- Stage 1: Full grid on N=100 ---
+# --- Stage 1 ---
 if CURRENT_MODE == 'test':
     OBJECTIVES = ["Sq"]
     TUNING_TRIALS_LIST = [50]
     TUNING_READS_LIST = [50]
-    VAL_TOP_K_LIST = [1, 3]          # 1 = minimal (re-eval best trial), 3, 10
+    VAL_TOP_K_LIST = [1, 3]
     VAL_READS_LIST = [128, 256]
     SEEDS = [42]
-    N_LIST = [100]                    # Stage 1 only N=100
+    N_LIST = [100]
 elif CURRENT_MODE == 'full':
     OBJECTIVES = ["Sq", "Pctl10", "Penalty-0.1"]
     TUNING_TRIALS_LIST = [100, 200]
     TUNING_READS_LIST = [50, 100]
-    VAL_TOP_K_LIST = [1, 3, 10]       # no 20
+    VAL_TOP_K_LIST = [1, 3, 10]
     VAL_READS_LIST = [128, 256, 512]
     SEEDS = [42, 43, 44]
     N_LIST = [100]
 else:
     raise ValueError(f"Unknown CURRENT_MODE: {CURRENT_MODE}")
 
-# --- Stage 2: Scaling & validation-read sensitivity ---
+# --- Stage 2 ---
 RUN_STAGE2 = True
 if RUN_STAGE2:
-    # Sweep only N and val_reads; exclude N=100 (already done in Stage 1)
     SCALING_N_LIST = [150] if CURRENT_MODE == 'test' else [150, 200]
     SCALING_VAL_READS_LIST = [512] if CURRENT_MODE == 'test' else [256, 512, 1024]
 else:
@@ -130,7 +129,7 @@ PLOTS_DIR.mkdir(exist_ok=True)
 FINAL_PLOTS_DIR = SAVE_DIR / "final_plots"
 FINAL_PLOTS_DIR.mkdir(exist_ok=True)
 
-# --- GDrive (if in Colab) ---
+# --- GDrive ---
 try:
     from google.colab import drive
     drive.mount('/content/drive', force_remount=False)
@@ -142,7 +141,7 @@ except ImportError:
     GDRIVE_ENABLED = False
     GDRIVE_SAVE_DIR = None
 
-# --- W&B Configuration ---
+# --- W&B ---
 PROJECT_NAME = "wqm-placement-optimization"
 if WANDB_AVAILABLE:
     # Will be initialized after config
@@ -153,7 +152,6 @@ if WANDB_AVAILABLE:
 # ============================================================================
 
 def load_progress(stage=1):
-    """Load saved results and completed set for a given stage."""
     if stage == 1:
         results_file = SAVE_DIR / "stage1_results.pkl"
         completed_file = SAVE_DIR / "stage1_completed.pkl"
@@ -165,7 +163,6 @@ def load_progress(stage=1):
     return results, completed
 
 def save_progress(results, completed, stage=1):
-    """Save results and completed set for a given stage."""
     if stage == 1:
         results_file = SAVE_DIR / "stage1_results.pkl"
         completed_file = SAVE_DIR / "stage1_completed.pkl"
@@ -182,7 +179,6 @@ def save_progress(results, completed, stage=1):
         df = pd.DataFrame(results)
         df.to_csv(csv_file, index=False)
 
-    # Mirror to GDrive if enabled
     if GDRIVE_ENABLED:
         safe_save_pickle(GDRIVE_SAVE_DIR / results_file.name, results, verbose=False)
         safe_save_pickle(GDRIVE_SAVE_DIR / completed_file.name, completed, verbose=False)
@@ -194,17 +190,17 @@ def save_progress(results, completed, stage=1):
 # ============================================================================
 
 def init_wandb(stage, run_name, config):
-    """Initialize W&B run if available."""
     if not WANDB_AVAILABLE:
         return None
     try:
+        # We'll use reinit=False to avoid creating new runs; the callback will reuse this run.
         wandb.init(
             project=PROJECT_NAME,
             config=config,
             tags=[CURRENT_MODE, "strategy_comparison", f"stage{stage}"],
             group=f"stage{stage}",
             name=run_name,
-            reinit=True,
+            reinit=False,  # prevent creating new runs
         )
         return wandb
     except Exception as e:
@@ -225,12 +221,8 @@ def run_one_config(
     N: int,
     env: Dict,
 ) -> Dict:
-    """
-    Run a single configuration (tuning + optional validation) and return results.
-    """
     start_time = time.time()
 
-    # Build objective
     obj_func = make_objective(
         env=env,
         schedule_type=SCHEDULE_TYPE,
@@ -241,10 +233,8 @@ def run_one_config(
         compute_esr_mcr=True,
     )
 
-    # Create study name
     study_name = f"strategy_seed{seed}_{objective}_T{n_trials}_R{tuning_reads}_K{val_top_k}_V{val_reads}_N{N}"
-    
-    # Run tuning
+
     study = run_optuna_study(
         experiment_name=study_name,
         objective=obj_func,
@@ -253,22 +243,18 @@ def run_one_config(
         directions=['minimize'],
         sampler_type='TPE',
         seed=TUNING_SEED,
-        load_if_exists=True,  # crash recovery
-        use_wandb_callback=True,  # <-- NEW: log Optuna trials to W&B
+        load_if_exists=True,
+        use_wandb_callback=True,  # Optuna trials logged to W&B
         verbose=False,
     )
 
-    # Print tuning summary (horizontal compact)
     print_tuning_summary(study, f"Tuning: {study_name}", compact=True, width=200)
 
-    # Extract best tuning trial info
     best_trial = study.best_trial
     tuning_best_sqr = best_trial.user_attrs.get('best_sqr', np.nan)
     tuning_feas_rate = best_trial.user_attrs.get('feas_rate', np.nan)
 
-    # --- Validation ---
     if val_top_k >= 1:
-        # Run validation on top K trials
         val_results = validate_study(
             study=study,
             env=env,
@@ -278,29 +264,25 @@ def run_one_config(
             top_k=val_top_k,
             use_seed_none=USE_SEED_NONE,
             compute_esr_mcr=True,
-            verbose=True,  # This will print its own summary
+            verbose=True,
         )
         best_sqr = val_results.get('best_sqr', np.nan)
         feas_rate = val_results.get('feas_rate', np.nan)
         spearman_rho = val_results.get('spearman_rho', np.nan)
         if val_results.get('trials'):
             best_solution = val_results['trials'][0].get('solution')
-            # Extract hyperparameters from the best validation trial
             lam1 = val_results['trials'][0].get('lam1', np.nan)
             lam2 = val_results['trials'][0].get('lam2', np.nan)
             num_sweeps = val_results['trials'][0].get('num_sweeps', np.nan)
         else:
             best_solution = None
             lam1, lam2, num_sweeps = np.nan, np.nan, np.nan
-        # Print the validation summary (horizontal)
         print_validation_summary(val_results, f"Validation: {study_name}", compact=True, width=200)
     else:
-        # Minimal: re-evaluate the best trial with val_reads (this is essentially val_top_k=1)
-        # We'll just call evaluate_qubo on the best trial's params
+        # Minimal validation: re-evaluate best trial
         lam1 = best_trial.params.get('lam1', 0.01)
         lam2 = best_trial.params.get('lam2', 0.01)
         num_sweeps = best_trial.params.get('num_sweeps', 10000)
-        # Need schedule params
         if SCHEDULE_TYPE == 'old':
             beta_min = best_trial.params.get('beta_min', 0.01)
             beta_max = best_trial.params.get('beta_max', 40.0)
@@ -338,7 +320,6 @@ def run_one_config(
         feas_rate = result.get('feas_rate', np.nan)
         spearman_rho = np.nan
         best_solution = result.get('best_solution')
-        # Print a mini summary for this "top-1 validation"
         print("\n" + "=" * 80)
         print("📊 TOP-1 VALIDATION (minimal)")
         print("=" * 80)
@@ -347,16 +328,11 @@ def run_one_config(
         print(f"  Feasibility: {_safe_format(feas_rate, '.4f')}")
         print("=" * 80)
 
-    # Total samples consumed
     total_samples = n_trials * tuning_reads + val_top_k * val_reads
-
     elapsed = time.time() - start_time
 
-    # Effective SQR = max(tuning, validation)
     effective_sqr = max(tuning_best_sqr, best_sqr) if not (np.isnan(tuning_best_sqr) or np.isnan(best_sqr)) else (tuning_best_sqr if not np.isnan(tuning_best_sqr) else best_sqr)
 
-    # Extract SA schedule parameters from the best trial (if available)
-    # They are stored in the user attrs or params
     if SCHEDULE_TYPE == 'old':
         beta_min = best_trial.params.get('beta_min', np.nan)
         beta_max = best_trial.params.get('beta_max', np.nan)
@@ -396,22 +372,16 @@ def run_one_config(
     }
     return result_dict
 
-# Helper for formatting
 def _safe_format(val, fmt=".4f"):
     if isinstance(val, (int, float)) and np.isfinite(val):
         return f"{val:{fmt}}"
     return "N/A"
 
 # ============================================================================
-# 5. MAIN LOOP: Run Stage 1 and Stage 2
+# 5. MAIN LOOP: run_stage
 # ============================================================================
 
-def run_stage(stage, configs, stage_name, desc):
-    """
-    Run a list of configs (each a tuple of parameters) for a given stage.
-    Returns aggregated results DataFrame.
-    """
-    # Load progress
+def run_stage(stage, configs, stage_name, desc, config_counter):
     results, completed = load_progress(stage)
     total_configs = len(configs)
 
@@ -420,32 +390,19 @@ def run_stage(stage, configs, stage_name, desc):
         df_existing = pd.DataFrame(results)
         print_cross_strategy_summary(df_existing, title=f"{stage_name} Progress So Far")
         regenerate_plots(df_existing, PLOTS_DIR, show_fig=True)
-        # Also print metrics
         print_cross_strategy_metrics(df_existing, title=f"{stage_name} Metrics")
 
-    # ---- Initialize progress bars ----
-    # Global bar
     global_bar = tqdm(total=total_configs, desc=f"{stage_name} Overall", position=0, leave=True)
-    # Per-seed bars
     seed_bars = {}
     for seed in SEEDS:
         seed_bars[seed] = tqdm(total=len([c for c in configs if c[0] == seed]),
                                desc=f"Seed {seed}", position=SEEDS.index(seed)+1, leave=False)
 
-    # For W&B, we'll log per config, not per seed
-
-    # ---- Outer loop: seeds ----
     for seed in SEEDS:
-        # Filter configs for this seed
         seed_configs = [c for c in configs if c[0] == seed]
         if not seed_configs:
             continue
 
-        # Load environment once per seed (cached)
-        # N is the first element of the config that is variable; but we assume N is fixed for Stage 1.
-        # For Stage 2, N varies. We'll load env per N as well.
-        # We'll load env for the first config's N (if stage 2, we'll load per N later)
-        # To simplify, we'll load per (seed, N) and cache.
         env_cache = {}
         for config_item in seed_configs:
             (seed_c, objective, n_trials, tuning_reads, val_top_k, val_reads, N) = config_item
@@ -469,25 +426,20 @@ def run_stage(stage, configs, stage_name, desc):
             else:
                 env = env_cache[key]
 
-            # At seed start for the first N, print Gurobi baseline
-            # We'll do it once per seed (when the first config runs)
             if config_item == seed_configs[0]:
                 print("\n" + "=" * 80)
                 print(f"🌱 SEED {seed} START (N={N})")
                 print("=" * 80)
                 print(f"Gurobi MIQP baseline: {env['gurobi_miqp']:.6f} (SQR=1.0000)")
-                # Generate and display Gurobi deployment plot
                 gurobi_path = PLOTS_DIR / f"gurobi_baseline_seed{seed}_N{N}.png"
                 plot_gurobi_baseline(env, gurobi_path, show_fig=True)
 
-            # Check if already completed
             key = (seed_c, objective, n_trials, tuning_reads, val_top_k, val_reads, N)
             if key in completed:
                 seed_bars[seed].update(1)
                 global_bar.update(1)
                 continue
 
-            # ---- Run the config ----
             print_config_header({
                 'seed': seed_c,
                 'objective': objective,
@@ -513,20 +465,15 @@ def run_stage(stage, configs, stage_name, desc):
                 completed.add(key)
                 save_progress(results, completed, stage)
 
-                # ---- Print single-run summary ----
                 print_single_run_summary(result, result, result['runtime'])
 
-                # ---- Update cross-strategy summaries and plots ----
                 df_all = pd.DataFrame(results)
                 print_cross_strategy_summary(df_all, title=f"{stage_name} Progress (All Configs So Far)")
                 print_cross_strategy_metrics(df_all, title=f"{stage_name} Metrics")
 
-                # Update cross-strategy progress plots
                 plot_cross_strategy_progress(df_all, PLOTS_DIR, show_fig=True)
                 plot_sqr_vs_runtime(df_all, PLOTS_DIR / "sqr_vs_runtime.png", show_fig=True)
 
-                # ---- Generate per-config deployment+QUBO plot ----
-                # We need lam1, lam2 from the result
                 lam1 = result.get('lam1', np.nan)
                 lam2 = result.get('lam2', np.nan)
                 solution = result.get('best_solution')
@@ -552,16 +499,11 @@ def run_stage(stage, configs, stage_name, desc):
                         show_fig=True,
                     )
 
-                # ---- Log learning curve ----
-                # We need to get the study from the run_one_config? It's not returned.
-                # We can re-fetch the study from the DB or we can already have the study object.
-                # To simplify, we'll skip logging learning curve for now, or we can re-create it.
-                # For the MVP, we'll just log the plots we already have.
-
-                # ---- Log to W&B ----
                 if WANDB_AVAILABLE and wandb.run is not None:
                     try:
-                        # Log metrics
+                        # Increment config counter and use step
+                        config_counter[0] += 1
+                        step = config_counter[0] * 1000  # ensure step > callback's steps (0..50)
                         wandb.log({
                             "best_sqr": result['best_sqr'],
                             "effective_sqr": result['effective_sqr'],
@@ -587,21 +529,19 @@ def run_stage(stage, configs, stage_name, desc):
                             "N": N,
                             "miqp_energy": result.get('miqp_energy', np.nan),
                             "stage": stage,
-                        })
-                        # Log images if they exist
+                        }, step=step)
+                        # Log images
                         if deploy_path.exists():
-                            wandb.log({"deployment_map": wandb.Image(str(deploy_path))})
-                        # Log cross-strategy plots
+                            wandb.log({"deployment_map": wandb.Image(str(deploy_path))}, step=step)
                         for fname in ["heatmap_Sq_N100.png", "pareto_front_samples.png", "sqr_vs_feas.png", "sqr_vs_runtime.png"]:
                             p = PLOTS_DIR / fname
                             if p.exists():
-                                wandb.log({f"cross_{fname}": wandb.Image(str(p))})
+                                wandb.log({f"cross_{fname}": wandb.Image(str(p))}, step=step)
                     except Exception as e:
                         print(f"  ⚠️ W&B logging failed: {e}")
 
             except Exception as e:
                 print(f"  ❌ Config {key} failed: {e}")
-                # Store error placeholder
                 error_result = {
                     'seed': seed_c,
                     'objective': objective,
@@ -639,8 +579,6 @@ def run_stage(stage, configs, stage_name, desc):
         seed_bars[seed].close()
 
     global_bar.close()
-
-    # Return aggregated DataFrame
     df = pd.DataFrame(results)
     return df
 
@@ -666,10 +604,8 @@ def main():
         print("  Stage 2: Disabled")
     print("=" * 80)
 
-    # Suppress Optuna per-trial logs
     suppress_optuna_trial_logs()
 
-    # ---- Initialize W&B ----
     wandb_run = None
     if WANDB_AVAILABLE:
         try:
@@ -694,14 +630,11 @@ def main():
         except Exception as e:
             print(f"  ⚠️ W&B init failed: {e}")
 
-    # ========================================================================
-    # STAGE 1: Full grid on N=100
-    # ========================================================================
+    # ---- Stage 1 ----
     print("\n" + "=" * 80)
     print("📌 STAGE 1: Grid Search on N=100")
     print("=" * 80)
 
-    # Generate configs
     stage1_configs = list(itertools.product(
         SEEDS,
         OBJECTIVES,
@@ -709,17 +642,15 @@ def main():
         TUNING_READS_LIST,
         VAL_TOP_K_LIST,
         VAL_READS_LIST,
-        N_LIST  # N is fixed to 100
+        N_LIST
     ))
 
-    df_stage1 = run_stage(1, stage1_configs, "Stage 1", "Stage 1")
+    config_counter = [0]  # mutable counter for W&B steps
+    df_stage1 = run_stage(1, stage1_configs, "Stage 1", "Stage 1", config_counter)
 
-    # ---- Stage 1 final aggregation and winner ----
     if not df_stage1.empty:
-        # Filter out errors
         df_valid = df_stage1[df_stage1['best_sqr'].notna() & df_stage1['best_sqr'] > 0]
         if not df_valid.empty:
-            # Group by config (excluding seed) to get mean SQR, runtime, etc.
             winner_agg = df_valid.groupby(['objective', 'tuning_trials', 'tuning_reads', 'val_top_k', 'val_reads', 'N']).agg({
                 'best_sqr': ['mean', 'std', 'count'],
                 'effective_sqr': ['mean', 'std'],
@@ -735,15 +666,11 @@ def main():
                                   'samples_mean',
                                   'time_mean', 'time_std']
 
-            # Compute efficiency
             winner_agg['efficiency_time'] = winner_agg['eff_sqr_mean'] / winner_agg['time_mean']
             winner_agg['efficiency_samples'] = winner_agg['eff_sqr_mean'] / winner_agg['samples_mean']
 
-            # Find winners
             winner_eff = winner_agg.loc[winner_agg['efficiency_time'].idxmax()]
             winner_sqr = winner_agg.loc[winner_agg['sqr_mean'].idxmax()]
-            # For CV, we need std; but we might not have enough seeds for std.
-            # We'll just use the SQR winner.
 
             print("\n" + "=" * 80)
             print("🏆 STAGE 1 WINNERS")
@@ -756,7 +683,6 @@ def main():
             print(f"  {winner_sqr['objective']} T{winner_sqr['tuning_trials']} R{winner_sqr['tuning_reads']} K{winner_sqr['val_top_k']} V{winner_sqr['val_reads']} N{winner_sqr['N']}")
             print(f"  SQR: {winner_sqr['sqr_mean']:.4f}, Runtime: {winner_sqr['time_mean']:.2f}s")
 
-            # Save winner (default: efficiency winner)
             winner_dict = {
                 'objective': winner_eff['objective'],
                 'tuning_trials': int(winner_eff['tuning_trials']),
@@ -770,24 +696,21 @@ def main():
             }
             with open(SAVE_DIR / "stage1_winner.json", "w") as f:
                 json.dump(winner_dict, f, indent=2, cls=NumpyEncoder)
-
+        else:
+            winner_dict = None
     else:
         winner_dict = None
 
-    # ========================================================================
-    # STAGE 2: Scaling and validation-read sensitivity
-    # ========================================================================
+    # ---- Stage 2 ----
     if RUN_STAGE2 and winner_dict is not None:
         print("\n" + "=" * 80)
         print("📌 STAGE 2: Scaling to larger N and VAL_READS sensitivity")
         print("=" * 80)
 
-        # Fix winner params
         fixed_obj = winner_dict['objective']
         fixed_trials = winner_dict['tuning_trials']
         fixed_reads = winner_dict['tuning_reads']
         fixed_topk = winner_dict['val_top_k']
-        # Use all seeds and sweep N and val_reads
         stage2_configs = list(itertools.product(
             SEEDS,
             [fixed_obj],
@@ -797,13 +720,10 @@ def main():
             SCALING_VAL_READS_LIST,
             SCALING_N_LIST
         ))
-        # Remove any duplicates (e.g., if N=100 somehow still there)
         stage2_configs = list(set(stage2_configs))
 
-        # Run Stage 2
-        df_stage2 = run_stage(2, stage2_configs, "Stage 2", "Stage 2")
+        df_stage2 = run_stage(2, stage2_configs, "Stage 2", "Stage 2", config_counter)
 
-        # Aggregate Stage 2 results
         if not df_stage2.empty:
             df_valid2 = df_stage2[df_stage2['best_sqr'].notna() & df_stage2['best_sqr'] > 0]
             if not df_valid2.empty:
@@ -816,10 +736,8 @@ def main():
                                       'feas_mean', 'time_mean']
                 print("\n📊 STAGE 2 SUMMARY")
                 print(stage2_agg.to_string(index=False, float_format="%.4f"))
-                # Save
                 stage2_agg.to_csv(SAVE_DIR / "stage2_summary.csv", index=False)
 
-                # Scaling plot
                 plt.figure(figsize=(10, 6))
                 for vr in stage2_agg['val_reads'].unique():
                     sub = stage2_agg[stage2_agg['val_reads'] == vr]
@@ -827,16 +745,14 @@ def main():
                 plt.xlabel('Number of Candidate Sites (N)')
                 plt.ylabel('Mean Validation SQR')
                 plt.title('Scaling Performance with N')
-                plt.legend()
+                plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
                 plt.grid(True, alpha=0.3)
-                plt.tight_layout()
+                plt.tight_layout(rect=[0, 0, 0.85, 1])
                 plt.savefig(FINAL_PLOTS_DIR / "scaling_plot.png", dpi=150)
                 plt.show()
                 plt.close()
 
-    # ========================================================================
-    # FINAL CLEANUP
-    # ========================================================================
+    # ---- Final cleanup ----
     print("\n" + "=" * 80)
     print("✅ STRATEGY COMPARISON COMPLETE")
     print("=" * 80)
