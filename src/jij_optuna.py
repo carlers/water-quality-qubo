@@ -88,7 +88,7 @@ def tune_sa(
         return result["energy"]  # raw MIQP energy (minimise)
 
     study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
 
     best = study.best_trial
     if verbose:
@@ -149,7 +149,7 @@ def tune_sqa(
         return result["energy"]
 
     study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=True)
 
     best = study.best_trial
     if verbose:
