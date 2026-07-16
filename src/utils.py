@@ -928,6 +928,156 @@ def print_cross_strategy_metrics(results_df: pd.DataFrame, title: str = "Cross-S
     print("=" * 80)
 
 
+# =============================================================================
+# ADDITIONS TO src/utils.py (JijModeling Pipeline)
+# ============================================================================
+
+# -----------------------------------------------------------------------------
+# JijModeling tuning summary
+# -----------------------------------------------------------------------------
+def print_jij_tuning_summary(
+    best_params: Dict,
+    best_value: float,
+    solver_name: str = "SA",
+    title: str = "Tuning Summary",
+) -> None:
+    """
+    Print a concise summary of Optuna tuning results.
+    """
+    print("\n" + "=" * 80)
+    print(f"📊 {title} – {solver_name} Tuning")
+    print("=" * 80)
+    print(f"  Best objective (energy): {_safe_format(best_value, '.6f')}")
+    print("  Best hyperparameters:")
+    for key, val in best_params.items():
+        if isinstance(val, float):
+            print(f"    {key:20s}: {_safe_format(val, '.6f')}")
+        else:
+            print(f"    {key:20s}: {val}")
+    print("=" * 80)
+
+
+# -----------------------------------------------------------------------------
+# JijModeling benchmark summary
+# -----------------------------------------------------------------------------
+def print_jij_benchmark_summary(
+    df: pd.DataFrame,
+    title: str = "Benchmark Summary",
+) -> None:
+    """
+    Print a formatted summary table for benchmark results.
+    Expects columns: solver, N, sqr, runtime, feasible, energy, status.
+    """
+    if df.empty:
+        print("⚠️ No data to summarise.")
+        return
+
+    # Group by solver and N
+    agg = df.groupby(["solver", "N"]).agg({
+        "sqr": ["mean", "std"],
+        "runtime": ["mean", "std"],
+        "feasible": "mean",
+        "energy": ["mean", "std"],
+    }).reset_index()
+    agg.columns = [
+        "solver", "N",
+        "sqr_mean", "sqr_std",
+        "runtime_mean", "runtime_std",
+        "feasibility",
+        "energy_mean", "energy_std"
+    ]
+
+    print("\n" + "=" * 80)
+    print(f"📊 {title}")
+    print("=" * 80)
+    print(f"Total runs: {len(df)}")
+    print(f"Unique configs: {len(agg)}")
+    print("-" * 80)
+
+    # Select columns to display
+    display_cols = ["solver", "N", "sqr_mean", "sqr_std", "runtime_mean", "runtime_std", "feasibility"]
+    formatted = agg[display_cols].copy()
+    formatted["sqr_mean"] = formatted["sqr_mean"].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "N/A")
+    formatted["sqr_std"] = formatted["sqr_std"].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "N/A")
+    formatted["runtime_mean"] = formatted["runtime_mean"].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "N/A")
+    formatted["runtime_std"] = formatted["runtime_std"].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "N/A")
+    formatted["feasibility"] = formatted["feasibility"].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "N/A")
+
+    print(formatted.to_string(index=False))
+    print("=" * 80)
+
+
+# -----------------------------------------------------------------------------
+# JijModeling single run summary
+# -----------------------------------------------------------------------------
+def print_jij_single_run(
+    config: Dict,
+    result: Dict,
+    elapsed: float,
+) -> None:
+    """
+    Print a concise summary for a single solver run.
+    config: dict with keys like 'solver', 'N', 'K', 'seed', 'lambda_budget', 'lambda_conn', ...
+    result: dict with keys 'energy', 'feasible', 'status'
+    """
+    solver = config.get("solver", "Unknown")
+    N = config.get("N", "?")
+    K = config.get("K", "?")
+    seed = config.get("seed", "?")
+    energy = result.get("energy", np.nan)
+    feasible = result.get("feasible", False)
+    status = result.get("status", "")
+
+    print(f"\n  {solver:6s} | N={N:3d} K={K:2d} seed={seed:2d} | "
+          f"energy={_safe_format(energy, '.6f')} | feasible={feasible} | "
+          f"runtime={elapsed:.2f}s | status={status}")
+
+
+# -----------------------------------------------------------------------------
+# JijModeling result saving/loading (crash recovery)
+# -----------------------------------------------------------------------------
+def save_jij_results(
+    results: List[Dict],
+    completed: set,
+    stage: Union[int, str],
+    save_dir: Union[str, Path],
+) -> None:
+    """
+    Save results and completed set for a given stage.
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    results_file = save_dir / f"jij_stage{stage}_results.pkl"
+    completed_file = save_dir / f"jij_stage{stage}_completed.pkl"
+    csv_file = save_dir / f"jij_stage{stage}_results.csv"
+
+    safe_save_pickle(results_file, results, verbose=False)
+    safe_save_pickle(completed_file, completed, verbose=False)
+
+    if results:
+        df = pd.DataFrame(results)
+        df.to_csv(csv_file, index=False)
+
+
+def load_jij_results(
+    stage: Union[int, str],
+    save_dir: Union[str, Path],
+) -> tuple[List[Dict], set]:
+    """
+    Load results and completed set for a given stage.
+    Returns (results_list, completed_set).
+    """
+    save_dir = Path(save_dir)
+    results_file = save_dir / f"jij_stage{stage}_results.pkl"
+    completed_file = save_dir / f"jij_stage{stage}_completed.pkl"
+
+    results = safe_load_pickle(results_file, [])
+    completed = safe_load_pickle(completed_file, set())
+    return results, completed
+
+
+
 # ============================================================================
 # Module exports
 # ============================================================================
@@ -954,4 +1104,9 @@ __all__ = [
     'suppress_optuna_trial_logs',
     'print_config_header',
     'print_cross_strategy_metrics',
+    "print_jij_tuning_summary",
+    "print_jij_benchmark_summary",
+    "print_jij_single_run",
+    "save_jij_results",
+    "load_jij_results",
 ]

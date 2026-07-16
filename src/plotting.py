@@ -1346,6 +1346,329 @@ def regenerate_plots(
     plot_cross_strategy_progress(results_df, save_dir, show_fig=show_fig)
     print("  ✅ Plots regenerated.")
 
+# =============================================================================
+# ADDITIONS TO src/plotting.py (JijModeling Pipeline)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Helper: extract QUBO matrix from instance
+# -----------------------------------------------------------------------------
+def _extract_qubo_matrix(instance, N: int) -> np.ndarray:
+    """
+    Extract full N×N QUBO matrix from an OMMX instance using to_qubo.
+    Assumes instance is already compiled.
+    """
+    qubo_dict, _ = instance.to_qubo(uniform_penalty_weight=1.0)  # weight doesn't matter for matrix extraction
+    Q = np.zeros((N, N))
+    for (i, j), coeff in qubo_dict.items():
+        if i == j:
+            Q[i, i] += coeff
+        else:
+            Q[i, j] += coeff
+            Q[j, i] += coeff
+    return Q
+
+
+# -----------------------------------------------------------------------------
+# Plot deployment map
+# -----------------------------------------------------------------------------
+def plot_jij_deployment(
+    instance_data: Dict,
+    solution: np.ndarray,
+    penalty_weights: Dict[int, float],
+    save_path: Optional[Union[str, Path]] = None,
+    show_fig: bool = True,
+    dpi: int = 150,
+) -> None:
+    """
+    Plot the deployment map from a JijModeling solution.
+    Uses coordinates and utility from instance_data.
+    """
+    N = instance_data["N"]
+    coords = instance_data["coords"]
+    U = instance_data["U"]
+    M_indices = []  # not used in current synthetic data; we can compute if needed
+    # Assuming greenfield for now (no existing stations)
+    # But we can add existing stations if M_indices is provided in instance_data
+    M_indices = instance_data.get("M_indices", [])
+    selected = np.where(solution == 1)[0]
+    selected_new = [i for i in selected if i not in M_indices]
+    selected_m = [i for i in selected if i in M_indices]
+
+    DOMAIN_SIZE = 50.0  # default
+    CONNECTIVITY_RANGE = 8.0  # default; could be stored in instance_data
+    # If we have connectivity range in instance_data, use it
+    if "D_max" in instance_data:
+        CONNECTIVITY_RANGE = instance_data["D_max"]
+
+    # Create grid for utility contour
+    grid_x = np.linspace(0, DOMAIN_SIZE, 100)
+    grid_y = np.linspace(0, DOMAIN_SIZE, 100)
+    grid_z = griddata(coords, U, (grid_x[None, :], grid_y[:, None]), method='cubic')
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Background contour
+    cf = ax.contourf(grid_x, grid_y, grid_z, levels=20, cmap='viridis', alpha=0.3)
+    cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.8)
+    cbar.set_label('Utility $U_i$', fontsize=12)
+
+    # All candidates
+    ax.scatter(coords[:, 0], coords[:, 1], c='lightgray', s=30, alpha=0.5,
+               edgecolor='gray', linewidth=0.2, label='Candidates')
+
+    # Existing stations (if any)
+    if selected_m:
+        ax.scatter(coords[selected_m, 0], coords[selected_m, 1],
+                   c='blue', s=120, marker='s', edgecolor='black', label='Existing (M)')
+
+    # New selected stations
+    if selected_new:
+        # Size proportional to utility
+        sizes = 100 + 200 * (U[selected_new] - U[selected_new].min()) / (U[selected_new].max() - U[selected_new].min() + 1e-6)
+        ax.scatter(coords[selected_new, 0], coords[selected_new, 1],
+                   c='red', s=sizes, edgecolor='black', linewidth=2, zorder=3,
+                   label=f'New Stations ({len(selected_new)})')
+
+    # Connectivity links (for selected stations within D_max)
+    all_selected = selected_m + selected_new
+    for i, idx_i in enumerate(all_selected):
+        for j, idx_j in enumerate(all_selected):
+            if i < j:
+                dist = np.linalg.norm(coords[idx_i] - coords[idx_j])
+                if dist <= CONNECTIVITY_RANGE:
+                    ax.plot([coords[idx_i, 0], coords[idx_j, 0]],
+                            [coords[idx_i, 1], coords[idx_j, 1]],
+                            color='gray', alpha=0.4, linewidth=1.5, linestyle='--')
+
+    ax.set_xlabel('X (km)', fontsize=12)
+    ax.set_ylabel('Y (km)', fontsize=12)
+    ax.set_title('Deployment Solution (JijModeling)', fontsize=14, fontweight='bold')
+    ax.set_aspect('equal')
+    ax.set_xlim(-2, DOMAIN_SIZE + 2)
+    ax.set_ylim(-2, DOMAIN_SIZE + 2)
+
+    # Legend outside
+    handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='New'),
+               plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='blue', markersize=10, label='Existing (M)'),
+               plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightgray', markersize=8, label='Candidates')]
+    ax.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+
+    # Info text outside
+    info_text = (
+        f"N: {N} | K: {instance_data['K']}\n"
+        f"Selected: {len(selected_new)} new, {len(selected_m)} existing\n"
+        f"Energy: {compute_energy(solution, instance_data['a'], instance_data['Q']):.6f}"
+    )
+    plt.figtext(0.601, 0.15, info_text, fontsize=9, verticalalignment='bottom',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.95, edgecolor='gray'))
+
+    plt.tight_layout(rect=[0, 0, 0.68, 1])
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
+# Plot QUBO matrix heatmap
+# -----------------------------------------------------------------------------
+def plot_jij_qubo_matrix(
+    instance_data: Dict,
+    penalty_weights: Dict[int, float],
+    save_path: Optional[Union[str, Path]] = None,
+    show_fig: bool = True,
+    dpi: int = 150,
+) -> None:
+    """
+    Plot the QUBO matrix heatmap from a JijModeling instance.
+    Includes spatial ordering by x-coordinate.
+    """
+    from .jij_model import build_augmented_model, compile_instance
+
+    N = instance_data["N"]
+    model = build_augmented_model()
+    instance = compile_instance(model, instance_data)
+    qubo_dict, _ = instance.to_qubo(penalty_weights=penalty_weights)
+
+    # Build full matrix
+    Q = np.zeros((N, N))
+    for (i, j), coeff in qubo_dict.items():
+        if i == j:
+            Q[i, i] += coeff
+        else:
+            Q[i, j] += coeff
+            Q[j, i] += coeff
+
+    # Spatial ordering by x-coordinate
+    coords = instance_data["coords"]
+    spatial_order = np.argsort(coords[:, 0])
+    Q_reordered = Q[spatial_order, :][:, spatial_order]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(Q_reordered, cmap='coolwarm', aspect='auto')
+    ax.set_title('QUBO Matrix (with penalties)', fontsize=14)
+    ax.set_xlabel('Site index (spatial order)', fontsize=12)
+    ax.set_ylabel('Site index (spatial order)', fontsize=12)
+    plt.colorbar(im, ax=ax, label='Energy coefficient')
+
+    if save_path:
+        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+    if show_fig:
+        plt.show()
+    plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
+# Scaling benchmark plots
+# -----------------------------------------------------------------------------
+def plot_jij_scaling_benchmark(
+    df: pd.DataFrame,
+    save_dir: Optional[Union[str, Path]] = None,
+    show_fig: bool = True,
+    dpi: int = 150,
+) -> None:
+    """
+    Generate scaling plots: SQR vs N, Runtime vs N, Feasibility vs N.
+    """
+    if df.empty:
+        print("⚠️ No data for scaling plots.")
+        return
+
+    save_dir = Path(save_dir) if save_dir else Path("scaling_plots")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Aggregate by solver, N
+    agg = df.groupby(["solver", "N"]).agg({
+        "sqr": ["mean", "std"],
+        "runtime": ["mean", "std"],
+        "feasible": "mean"
+    }).reset_index()
+    agg.columns = ["solver", "N", "sqr_mean", "sqr_std", "runtime_mean", "runtime_std", "feasibility"]
+
+    # 1. SQR vs N
+    plt.figure(figsize=(10, 6))
+    for solver in agg["solver"].unique():
+        sub = agg[agg["solver"] == solver]
+        plt.errorbar(sub["N"], sub["sqr_mean"], yerr=sub["sqr_std"], marker='o', label=solver, capsize=5)
+    plt.xlabel('Number of candidate sites (N)', fontsize=12)
+    plt.ylabel('Mean SQR', fontsize=12)
+    plt.title('Scaling: SQR vs N')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_dir / "sqr_vs_N.png", dpi=dpi)
+    if show_fig:
+        plt.show()
+    plt.close()
+
+    # 2. Runtime vs N
+    plt.figure(figsize=(10, 6))
+    for solver in agg["solver"].unique():
+        sub = agg[agg["solver"] == solver]
+        plt.errorbar(sub["N"], sub["runtime_mean"], yerr=sub["runtime_std"], marker='o', label=solver, capsize=5)
+    plt.xlabel('Number of candidate sites (N)', fontsize=12)
+    plt.ylabel('Mean Runtime (s)', fontsize=12)
+    plt.title('Scaling: Runtime vs N')
+    plt.yscale('log')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_dir / "runtime_vs_N.png", dpi=dpi)
+    if show_fig:
+        plt.show()
+    plt.close()
+
+    # 3. Feasibility vs N
+    plt.figure(figsize=(10, 6))
+    for solver in agg["solver"].unique():
+        sub = agg[agg["solver"] == solver]
+        plt.plot(sub["N"], sub["feasibility"], marker='o', label=solver)
+    plt.xlabel('Number of candidate sites (N)', fontsize=12)
+    plt.ylabel('Mean Feasibility Rate', fontsize=12)
+    plt.title('Scaling: Feasibility vs N')
+    plt.ylim(-0.05, 1.05)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_dir / "feasibility_vs_N.png", dpi=dpi)
+    if show_fig:
+        plt.show()
+    plt.close()
+
+
+# -----------------------------------------------------------------------------
+# Benchmark summary plots (boxplots, scatter, etc.)
+# -----------------------------------------------------------------------------
+def plot_jij_benchmark_summary(
+    df: pd.DataFrame,
+    save_dir: Optional[Union[str, Path]] = None,
+    show_fig: bool = True,
+    dpi: int = 150,
+) -> None:
+    """
+    Generate summary plots: SQR boxplots, Runtime vs SQR scatter, Feasibility bar.
+    """
+    if df.empty:
+        print("⚠️ No data for summary plots.")
+        return
+
+    save_dir = Path(save_dir) if save_dir else Path("benchmark_plots")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. SQR boxplots by solver and N
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(data=df, x="solver", y="sqr", hue="N")
+    plt.title("SQR by Solver and N")
+    plt.ylabel("SQR")
+    plt.ylim(0, 1.05)
+    plt.grid(True, alpha=0.3)
+    plt.legend(title="N")
+    plt.tight_layout()
+    plt.savefig(save_dir / "sqr_boxplot.png", dpi=dpi)
+    if show_fig:
+        plt.show()
+    plt.close()
+
+    # 2. Runtime vs SQR scatter (Pareto frontier)
+    plt.figure(figsize=(10, 6))
+    for solver in df["solver"].unique():
+        sub = df[df["solver"] == solver]
+        plt.scatter(sub["runtime"], sub["sqr"], label=solver, alpha=0.6, s=60)
+    plt.xlabel("Runtime (s)")
+    plt.ylabel("SQR")
+    plt.xscale("log")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_dir / "runtime_vs_sqr.png", dpi=dpi)
+    if show_fig:
+        plt.show()
+    plt.close()
+
+    # 3. Feasibility rate bar chart
+    feasible_rate = df.groupby(["solver", "N"])["feasible"].mean().reset_index()
+    plt.figure(figsize=(10, 6))
+    sns.barplot(data=feasible_rate, x="solver", y="feasible", hue="N")
+    plt.title("Feasibility Rate")
+    plt.ylabel("Proportion Feasible")
+    plt.ylim(0, 1.05)
+    plt.grid(True, axis='y', alpha=0.3)
+    plt.legend(title="N")
+    plt.tight_layout()
+    plt.savefig(save_dir / "feasibility_bar.png", dpi=dpi)
+    if show_fig:
+        plt.show()
+    plt.close()
+
+
+# -----------------------------------------------------------------------------
+# Helper: compute energy (for info text)
+# -----------------------------------------------------------------------------
+def _compute_energy_from_solution(x: np.ndarray, a: np.ndarray, Q: np.ndarray) -> float:
+    return np.dot(a, x) + 0.5 * np.dot(x, np.dot(Q, x))
+
 
 # ============================================================================
 # Module exports
@@ -1369,4 +1692,8 @@ __all__ = [
     'plot_sqr_vs_runtime',
     'plot_cross_strategy_progress',
     'regenerate_plots',
+    'plot_jij_deployment',
+    'plot_jij_qubo_matrix',
+    'plot_jij_scaling_benchmark',
+    'plot_jij_benchmark_summary',
 ]
