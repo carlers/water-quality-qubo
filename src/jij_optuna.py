@@ -21,7 +21,7 @@ import numpy as np
 import json
 import warnings
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List, Any, Callable
+from typing import Dict, Optional, Tuple, List, Any, Callable, Union
 
 from .jij_model import build_augmented_model, compile_instance, get_penalty_weights
 from .jij_solvers import solve_sa_jij, solve_sqa_jij
