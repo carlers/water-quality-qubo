@@ -355,7 +355,7 @@ def tune_sqa(
     instance = compile_instance(model, filtered_data)
 
     def objective(trial):
-        lambda_budget = trial.suggest_float("lambda_budget", 0.01, qsum, log=True)
+        lambda_budget = trial.suggest_float("lambda_budget", 0.1, qsum, log=True)
         lambda_conn = trial.suggest_float("lambda_conn", 0.01, qsum, log=True)
         trotter_float = trial.suggest_float("trotter", 1.0, 64.0, log=True)
         trotter = int(round(trotter_float))
@@ -414,11 +414,14 @@ def tune_sqa(
     callbacks = [callback]
     if wandb_run is not None and WANDB_AVAILABLE:
         try:
-            wandb_callback = optuna.integration.WandbCallback(
+            from optuna.integration.wandb import WeightsAndBiasesCallback
+
+            wandb_callback = WeightsAndBiasesCallback(
                 metric_name=["miqp_energy", "violation_rate"],
                 wandb_kwargs={"run": wandb_run},
                 as_multirun=True,
             )
+        
             callbacks.append(wandb_callback)
         except Exception as e:
             if verbose:
