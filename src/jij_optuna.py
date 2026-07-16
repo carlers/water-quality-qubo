@@ -65,7 +65,6 @@ def tune_sa(
     # Build model once for penalty ID mapping
     model = build_augmented_model()
     instance = compile_instance(model, instance_data)
-    penalty_ids = {c.name: c.id for c in instance.constraints}
 
     def objective(trial):
         lambda_budget = trial.suggest_float("lambda_budget", lb_min, lb_max, log=True)
@@ -73,10 +72,7 @@ def tune_sa(
         num_sweeps = trial.suggest_int("num_sweeps", 500, 3000, step=100)
         num_reads = trial.suggest_int("num_reads", 50, 200, step=50)
 
-        penalty_weights = {
-            penalty_ids["budget"]: lambda_budget,
-            penalty_ids["connectivity"]: lambda_conn,
-        }
+        penalty_weights = get_penalty_weights(instance, lambda_budget, lambda_conn)
 
         result = solve_sa_jij(
             instance_data,
@@ -128,7 +124,6 @@ def tune_sqa(
 
     model = build_augmented_model()
     instance = compile_instance(model, instance_data)
-    penalty_ids = {c.name: c.id for c in instance.constraints}
 
     def objective(trial):
         lambda_budget = trial.suggest_float("lambda_budget", lb_min, lb_max, log=True)
@@ -137,10 +132,7 @@ def tune_sqa(
         num_reads = trial.suggest_int("num_reads", 50, 200, step=50)
         trotter = trial.suggest_int("trotter", 4, 32, step=4)
 
-        penalty_weights = {
-            penalty_ids["budget"]: lambda_budget,
-            penalty_ids["connectivity"]: lambda_conn,
-        }
+        penalty_weights = get_penalty_weights(instance, lambda_budget, lambda_conn)
 
         result = solve_sqa_jij(
             instance_data,
