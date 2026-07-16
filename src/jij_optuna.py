@@ -32,7 +32,6 @@ from .utils import (
     safe_save_pickle,
     safe_load_pickle,
     NumpyEncoder,
-    compute_qsum,
 )
 
 # Try importing wandb for optional logging

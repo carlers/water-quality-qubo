@@ -351,7 +351,6 @@ def main():
 
     # Determine tune_dir
     if args.tune_dir is None:
-        # Look for tuning results in default location
         possible_dir = Path(f"results_tuning_{args.mode}")
         if possible_dir.exists():
             args.tune_dir = str(possible_dir)
@@ -359,7 +358,10 @@ def main():
             raise ValueError(f"No tuning results found. Please specify --tune_dir.")
     tune_dir = Path(args.tune_dir)
     if not tune_dir.exists():
-        raise ValueError(f"Tune directory not found: {tune_dir}")
+        raise ValueError(
+            f"Tune directory not found: {tune_dir}\n"
+            f"Please run 'python tuning.py --mode {args.mode}' first to generate tuning results."      
+        )
 
     # Load best parameters
     sa_params_path = tune_dir / "best_sa_params.json"
@@ -370,14 +372,14 @@ def main():
         print(f"✅ Loaded SA params from {sa_params_path}")
     else:
         sa_params = None
-        print("⚠️ No SA params found; SA will be skipped.")
+        print(f"⚠️ No SA params found at {sa_params_path}; SA will be skipped.")
     if sqa_params_path.exists():
         with open(sqa_params_path, "r") as f:
             sqa_params = json.load(f)
         print(f"✅ Loaded SQA params from {sqa_params_path}")
     else:
         sqa_params = None
-        print("⚠️ No SQA params found; SQA will be skipped.")
+        print(f"⚠️ No SQA params found at {sqa_params_path}; SQA will be skipped.")
 
     # Define N list
     if args.mode == "test":
