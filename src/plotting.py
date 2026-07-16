@@ -28,7 +28,7 @@ import pickle
 import time
 import gc
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 
 import numpy as np
 import pandas as pd
