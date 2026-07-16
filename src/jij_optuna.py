@@ -115,8 +115,8 @@ def tune_sqa(
         lambda_budget, lambda_conn, num_sweeps, num_reads, trotter
     """
     qsum = compute_qsum(instance_data)
-    lb_min = 0.1 * qsum
-    lb_max = 20.0 * qsum
+    lb_min = 0.01
+    lb_max = qsum
 
     if verbose:
         print(f"Qsum = {qsum:.4f}")
