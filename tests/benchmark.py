@@ -241,11 +241,8 @@ def run_benchmark(
         # SA
         model = build_augmented_model()
         instance = compile_instance(model, inst)
-        penalty_ids = {c.name: c.id for c in instance.constraints}
-        sa_penalty_weights = {
-            penalty_ids["budget"]: sa_params["lambda_budget"],
-            penalty_ids["connectivity"]: sa_params["lambda_conn"],
-        }
+        # --- FIXED: use get_penalty_weights instead of manual dict ---
+        sa_penalty_weights = get_penalty_weights(instance, sa_params["lambda_budget"], sa_params["lambda_conn"])
         sa = solve_sa_jij(
             inst,
             sa_penalty_weights,
@@ -255,10 +252,8 @@ def run_benchmark(
         )
 
         # SQA
-        sqa_penalty_weights = {
-            penalty_ids["budget"]: sqa_params["lambda_budget"],
-            penalty_ids["connectivity"]: sqa_params["lambda_conn"],
-        }
+        # --- FIXED: use get_penalty_weights instead of manual dict ---
+        sqa_penalty_weights = get_penalty_weights(instance, sqa_params["lambda_budget"], sqa_params["lambda_conn"])
         sqa = solve_sqa_jij(
             inst,
             sqa_penalty_weights,
@@ -335,16 +330,9 @@ def run_solver_benchmark(
         return
     optimal_solution = gurobi["solution"]
 
-    # Penalty dicts
-    penalty_ids = {c.name: c.id for c in instance.constraints}
-    sa_penalty_weights = {
-        penalty_ids["budget"]: sa_params["lambda_budget"],
-        penalty_ids["connectivity"]: sa_params["lambda_conn"],
-    }
-    sqa_penalty_weights = {
-        penalty_ids["budget"]: sqa_params["lambda_budget"],
-        penalty_ids["connectivity"]: sqa_params["lambda_conn"],
-    }
+    # --- FIXED: use get_penalty_weights instead of manual dict ---
+    sa_penalty_weights = get_penalty_weights(instance, sa_params["lambda_budget"], sa_params["lambda_conn"])
+    sqa_penalty_weights = get_penalty_weights(instance, sqa_params["lambda_budget"], sqa_params["lambda_conn"])
 
     # Build QUBO for SA and SQA (separately because penalties differ)
     qubo_sa, _ = instance.to_qubo(penalty_weights=sa_penalty_weights)
@@ -482,8 +470,6 @@ def main():
     )
 
     # Print tuning summaries
-    # We need the best values (energies) – we don't have them directly, so we'll re-evaluate.
-    # For simplicity, we just print the parameters.
     print("\n" + "=" * 80)
     print("🏆 TUNING COMPLETE")
     print("=" * 80)
@@ -498,19 +484,17 @@ def main():
     # 2. Visualise deployment and QUBO matrix for tuned models
     # -------------------------------------------------------------------------
     print("\n📊 Visualising deployment and QUBO matrix...")
-    # Build penalty dicts for visualisation
-    model = build_augmented_model()
-    instance = compile_instance(model, tune_inst)
-    penalty_ids = {c.name: c.id for c in instance.constraints}
 
-    sa_penalty_weights = {
-        penalty_ids["budget"]: sa_params["lambda_budget"],
-        penalty_ids["connectivity"]: sa_params["lambda_conn"],
-    }
-    sqa_penalty_weights = {
-        penalty_ids["budget"]: sqa_params["lambda_budget"],
-        penalty_ids["connectivity"]: sqa_params["lambda_conn"],
-    }
+    # Build model and compile instance
+    model = build_augmented_model()
+    # Filter out extra keys for compilation
+    model_keys = {"N", "K", "a", "Q", "neigh"}
+    filtered_tune_data = {k: v for k, v in tune_inst.items() if k in model_keys}
+    instance = compile_instance(model, filtered_tune_data)
+
+    # --- FIXED: use get_penalty_weights instead of manual dict ---
+    sa_penalty_weights = get_penalty_weights(instance, sa_params["lambda_budget"], sa_params["lambda_conn"])
+    sqa_penalty_weights = get_penalty_weights(instance, sqa_params["lambda_budget"], sqa_params["lambda_conn"])
 
     # Solve with SA and SQA to get solutions for visualisation
     sa_res = solve_sa_jij(
