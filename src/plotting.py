@@ -39,6 +39,7 @@ from scipy.interpolate import griddata
 from scipy.spatial.distance import cdist
 import scipy.stats as stats
 import seaborn as sns
+from src.jij_solvers import compute_energy
 
 # Optional: optuna for posterior plots
 try:

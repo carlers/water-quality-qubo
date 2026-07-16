@@ -485,14 +485,11 @@ def main():
     # -------------------------------------------------------------------------
     print("\n📊 Visualising deployment and QUBO matrix...")
 
-    # Build model and compile instance
     model = build_augmented_model()
-    # Filter out extra keys for compilation
     model_keys = {"N", "K", "a", "Q", "neigh"}
     filtered_tune_data = {k: v for k, v in tune_inst.items() if k in model_keys}
     instance = compile_instance(model, filtered_tune_data)
 
-    # --- FIXED: use get_penalty_weights instead of manual dict ---
     sa_penalty_weights = get_penalty_weights(instance, sa_params["lambda_budget"], sa_params["lambda_conn"])
     sqa_penalty_weights = get_penalty_weights(instance, sqa_params["lambda_budget"], sqa_params["lambda_conn"])
 
@@ -513,17 +510,24 @@ def main():
         verbose=True,
     )
 
-    # Deployment plots
-    plot_jij_deployment(tune_inst, sa_res["solution"], sa_penalty_weights,
-                        save_path=SAVE_DIR / "deployment_sa.png", show_fig=True)
-    plot_jij_deployment(tune_inst, sqa_res["solution"], sqa_penalty_weights,
-                        save_path=SAVE_DIR / "deployment_sqa.png", show_fig=True)
+    # Deployment plots (skip if no solution)
+    if sa_res["solution"] is not None:
+        plot_jij_deployment(tune_inst, sa_res["solution"], sa_penalty_weights,
+                            save_path=SAVE_DIR / "deployment_sa.png", show_fig=True)
+    else:
+        print("⚠️ SA solution not available; skipping deployment plot for SA.")
 
-    # QUBO matrix plots
+    if sqa_res["solution"] is not None:
+        plot_jij_deployment(tune_inst, sqa_res["solution"], sqa_penalty_weights,
+                            save_path=SAVE_DIR / "deployment_sqa.png", show_fig=True)
+    else:
+        print("⚠️ SQA solution not available; skipping deployment plot for SQA.")
+
+    # QUBO matrix plots (always available)
     plot_jij_qubo_matrix(tune_inst, sa_penalty_weights,
-                         save_path=SAVE_DIR / "qubo_matrix_sa.png", show_fig=True)
+                        save_path=SAVE_DIR / "qubo_matrix_sa.png", show_fig=True)
     plot_jij_qubo_matrix(tune_inst, sqa_penalty_weights,
-                         save_path=SAVE_DIR / "qubo_matrix_sqa.png", show_fig=True)
+                        save_path=SAVE_DIR / "qubo_matrix_sqa.png", show_fig=True)
 
     # -------------------------------------------------------------------------
     # 3. Run scaling benchmark
