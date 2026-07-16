@@ -66,6 +66,7 @@ from src.plotting import (
     plot_cross_strategy_progress,
     plot_sqr_vs_runtime,
     regenerate_plots,
+    save_optuna_plots,  # <-- IMPORT ADDED
 )
 
 warnings.filterwarnings('ignore')
@@ -255,6 +256,21 @@ def run_one_config(
         load_if_exists=True,  # crash recovery
         verbose=False,
     )
+
+    # ---- Log Optuna summary plots to W&B ----
+    if WANDB_AVAILABLE and wandb.run is not None:
+        try:
+            optuna_plot_dir = STUDIES_DIR / study_name / "optuna_plots"
+            optuna_plot_dir.mkdir(parents=True, exist_ok=True)
+            save_optuna_plots(study, optuna_plot_dir, show_fig=False)
+            # Log each generated plot as an image
+            for fname in ["optuna_param_importance.png", "optuna_parallel_coordinate.png",
+                          "optuna_slice.png", "optuna_learning_curve.png"]:
+                p = optuna_plot_dir / fname
+                if p.exists():
+                    wandb.log({f"optuna_{fname}": wandb.Image(str(p))})
+        except Exception as e:
+            print(f"  ⚠️ Optuna plot logging failed: {e}")
 
     # Print tuning summary (horizontal compact)
     print_tuning_summary(study, f"Tuning: {study_name}", compact=True, width=200)
@@ -549,12 +565,6 @@ def run_stage(stage, configs, stage_name, desc):
                         save_path=deploy_path,
                         show_fig=True,
                     )
-
-                # ---- Log learning curve ----
-                # We need to get the study from the run_one_config? It's not returned.
-                # We can re-fetch the study from the DB or we can already have the study object.
-                # To simplify, we'll skip logging learning curve for now, or we can re-create it.
-                # For the MVP, we'll just log the plots we already have.
 
                 # ---- Log to W&B ----
                 if WANDB_AVAILABLE and wandb.run is not None:
