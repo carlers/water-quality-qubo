@@ -358,7 +358,7 @@ def main():
     L_w = 1.0
     beta = 1.0
     delta = 1.0
-    connectivity_range = 8.0
+    connectivity_range = 12.0
     current_vector = (1.0, 0.0)
     pairwise = compute_pairwise_terms(
         coords=coords,
