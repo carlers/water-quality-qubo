@@ -13,7 +13,7 @@ This module creates a master set of candidate sites with:
 All outputs are saved to the `data/` directory as .npy, .pkl, and .json files.
 
 Usage (command line):
-    python data/synthetic_data.py --seed 123 --n_master 200 --subset_sizes 10,20,30,50,100,150,200
+    python data/synthetic_data.py --seed 123 --n_master 600 --subset_sizes 10,20,30,50,100,150,200,300,500
     python data/synthetic_data.py --seed random  # Random seed (uses current time)
 """
 
@@ -38,8 +38,8 @@ RANDOM_SEED: int = 42
 # Domain: square of size DOMAIN_SIZE x DOMAIN_SIZE (kilometers)
 DOMAIN_SIZE: float = 50.0
 
-# Number of master candidate sites (INCREASED to 200 to support scaling)
-N_MASTER: int = 200
+# Number of master candidate sites (INCREASED to 600 to support scaling to N=500)
+N_MASTER: int = 600
 
 # AHP baseline weights (from Table I in the paper)
 # Order: [Pollution Load, Ecological Sensitivity, Hydrodynamic Variability,
@@ -55,8 +55,8 @@ CURRENT_VECTOR: Tuple[float, float] = (1.0, 0.0)
 # Number of existing stations (for incremental scenario)
 N_EXISTING: int = 3
 
-# Sizes of nested subsets to generate (EXTENDED to include 150 and 200)
-SUBSET_SIZES: List[int] = [10, 20, 30, 50, 100, 150, 200]
+# Sizes of nested subsets to generate (EXTENDED to include 300 and 500)
+SUBSET_SIZES: List[int] = [10, 20, 30, 50, 100, 150, 200, 300, 500]
 
 # Output directory (relative to project root)
 OUTPUT_DIR: str = "data"
@@ -92,12 +92,6 @@ def generate_coordinates(
     if len(coords) > n:
         idx = rng.choice(len(coords), size=n, replace=False)
         coords = coords[idx]
-    
-    # # Add a tiny amount of jitter (e.g., up to 5% of spacing) to avoid exact alignment
-    # # This mimics real GPS / QGIS noise without breaking the structure.
-    # spacing = domain_size / max(cols, rows)
-    # jitter = rng.uniform(-0.3 * spacing, 0.3 * spacing, size=coords.shape)
-    # coords += jitter
     
     # Ensure points stay within bounds
     coords = np.clip(coords, 0, domain_size)
@@ -646,7 +640,7 @@ def generate_and_save_all(
         start_idx=start_idx,
         seed=seed,
         domain_size=domain_size,
-        fixed_indices=existing_indices,  # <-- CRITICAL FIX
+        fixed_indices=existing_indices,
     )
     print(f"✓ Subsets created: {list(subsets.keys())}")
 
@@ -736,7 +730,7 @@ def parse_args():
         "--subset_sizes", 
         type=str, 
         default=None,
-        help='Comma-separated subset sizes, e.g., "10,20,30,50,100,150,200"'
+        help='Comma-separated subset sizes, e.g., "10,20,30,50,100,150,200,300,500"'
     )
     parser.add_argument(
         "--output_dir", 

@@ -13,13 +13,23 @@ This module provides:
     7. Loaded seed summary
     8. Dynamic summary N (get_summary_n)
     9. tqdm cleanup
-   10. Enhanced summary printers for tuning, validation, sharpening, and global results.
-   11. Single-run summary printer
-   12. Cross-strategy summary printer (dynamic ranked table)
-   13. Optuna trial log suppressor
-   14. NEW: Config header printer
-   15. NEW: Cross-strategy metrics (correlations, efficiency, CV, rankings)
-   16. NEW: Horizontal formatting for tuning/validation summaries
+    10. Enhanced summary printers for tuning, validation, sharpening, and global results.
+    11. Single-run summary printer
+    12. Cross-strategy summary printer (dynamic ranked table)
+    13. Optuna trial log suppressor
+    14. Config header printer
+    15. Cross-strategy metrics (correlations, efficiency, CV, rankings)
+    16. Horizontal formatting helpers
+    17. JijModeling tuning summary
+    18. JijModeling benchmark summary
+    19. JijModeling single run summary
+    20. JijModeling result saving/loading (crash recovery)
+    21. NEW: compute_violation_rate
+    22. NEW: compute_matrix_differences
+    23. NEW: print_multiobjective_tuning_summary
+    24. NEW: print_benchmark_summary
+    25. NEW: select_best_from_pareto
+    26. NEW: build_full_qubo_matrix
 
 All plotting functions have been moved to src/plotting.py.
 """
@@ -930,7 +940,7 @@ def print_cross_strategy_metrics(results_df: pd.DataFrame, title: str = "Cross-S
 
 # =============================================================================
 # ADDITIONS TO src/utils.py (JijModeling Pipeline)
-# ============================================================================
+# =============================================================================
 
 # -----------------------------------------------------------------------------
 # JijModeling tuning summary
@@ -1077,6 +1087,289 @@ def load_jij_results(
     return results, completed
 
 
+# =============================================================================
+# NEW FUNCTIONS FOR MULTI-OBJECTIVE TUNING
+# =============================================================================
+
+def compute_violation_rate(
+    x_sol: np.ndarray,
+    neigh: np.ndarray,
+    K: int
+) -> float:
+    """
+    Compute violation rate for a solution.
+    
+    Returns:
+        0.0  -> both budget and connectivity constraints satisfied
+        0.5  -> exactly one constraint violated
+        1.0  -> both constraints violated
+    """
+    if x_sol is None or neigh is None:
+        return 1.0
+    
+    x_sol = np.asarray(x_sol)
+    neigh = np.asarray(neigh)
+    selected = np.where(x_sol == 1)[0]
+    
+    # Budget constraint
+    budget_ok = (len(selected) == K)
+    
+    # Connectivity constraint
+    if len(selected) == 0:
+        conn_ok = False
+    else:
+        conn_ok = all(np.any(neigh[i, selected] == 1) for i in selected)
+    
+    if budget_ok and conn_ok:
+        return 0.0
+    elif budget_ok or conn_ok:
+        return 0.5
+    else:
+        return 1.0
+
+
+def compute_matrix_differences(
+    mat1: np.ndarray,
+    mat2: np.ndarray
+) -> Dict[str, float]:
+    """
+    Compute difference metrics between two matrices.
+    
+    Args:
+        mat1: First matrix (e.g., MIQP objective matrix)
+        mat2: Second matrix (e.g., QUBO matrix with penalties)
+    
+    Returns:
+        dict with 'MSE', 'RMSE', 'Frobenius' keys
+    """
+    if mat1.shape != mat2.shape:
+        raise ValueError(f"Matrix shapes must match: {mat1.shape} vs {mat2.shape}")
+    
+    diff = mat1 - mat2
+    mse = np.mean(diff ** 2)
+    rmse = np.sqrt(mse)
+    frob = np.linalg.norm(diff, 'fro')
+    
+    return {
+        'MSE': float(mse),
+        'RMSE': float(rmse),
+        'Frobenius': float(frob)
+    }
+
+
+def build_full_qubo_matrix(
+    h: Dict[int, float],
+    J: Dict[Tuple[int, int], float],
+    N: int
+) -> np.ndarray:
+    """
+    Build a symmetric full N×N QUBO matrix from h (linear) and J (quadratic) dicts.
+    
+    Args:
+        h: dict {i: coeff} for linear terms
+        J: dict {(i,j): coeff} for quadratic terms (i < j)
+        N: total number of variables
+    
+    Returns:
+        N×N symmetric matrix
+    """
+    Q = np.zeros((N, N))
+    
+    # Linear terms (on diagonal)
+    for i, coeff in h.items():
+        if i < N:
+            Q[i, i] += coeff
+    
+    # Quadratic terms (off-diagonal, symmetric)
+    for (i, j), coeff in J.items():
+        if i < N and j < N:
+            if i == j:
+                Q[i, i] += coeff
+            else:
+                Q[i, j] += coeff
+                Q[j, i] += coeff
+    
+    return Q
+
+
+def select_best_from_pareto(
+    study: 'optuna.Study'
+) -> Optional['optuna.trial.FrozenTrial']:
+    """
+    Select the best trial from the Pareto front.
+    
+    Selection criteria:
+        1. Prefer trials with violation_rate = 0.0
+        2. Among those, select the one with lowest MIQP energy
+        3. If no zero-violation trials, select the one with lowest violation_rate
+        4. Among equal violation_rate, select lowest MIQP energy
+    
+    Returns:
+        The selected FrozenTrial, or None if no trials exist
+    """
+    pareto_trials = study.best_trials
+    
+    if not pareto_trials:
+        return None
+    
+    # Filter by violation_rate (stored in user_attrs)
+    zero_violation = []
+    for t in pareto_trials:
+        vio = t.user_attrs.get('violation_rate', 1.0)
+        if isinstance(vio, (int, float)) and vio == 0.0:
+            zero_violation.append(t)
+    
+    if zero_violation:
+        # Pick the one with lowest MIQP energy (first objective)
+        best = min(zero_violation, key=lambda t: t.values[0] if t.values else float('inf'))
+    else:
+        # Pick the one with lowest violation_rate, then lowest MIQP
+        best = min(pareto_trials, key=lambda t: (
+            t.user_attrs.get('violation_rate', 1.0),
+            t.values[0] if t.values else float('inf')
+        ))
+    
+    return best
+
+
+def print_multiobjective_tuning_summary(
+    study: 'optuna.Study',
+    title: str = "Multi-Objective Tuning Summary",
+    verbose: bool = True
+) -> None:
+    """
+    Print a comprehensive summary for a multi-objective Optuna study.
+    
+    Displays:
+        - Number of trials
+        - Number of Pareto-optimal trials
+        - Best trial selected by our heuristic
+        - Hyperparameters of the best trial
+        - Objective values of the best trial
+        - User attributes (violation_rate, ESR, MCR, etc.)
+    """
+    if study is None or len(study.trials) == 0:
+        print(f"⚠️ No trials found for {title}.")
+        return
+    
+    n_trials = len(study.trials)
+    n_pareto = len(study.best_trials)
+    
+    best_trial = select_best_from_pareto(study)
+    
+    print("\n" + "=" * 80)
+    print(f"📊 {title}")
+    print("=" * 80)
+    print(f"  Total trials:            {n_trials}")
+    print(f"  Pareto-optimal trials:   {n_pareto}")
+    print("-" * 40)
+    
+    if best_trial is None:
+        print("  No valid trials found.")
+        print("=" * 80)
+        return
+    
+    print("  Best Trial (selected):")
+    print(f"    Trial #:               {best_trial.number}")
+    
+    if best_trial.values:
+        print(f"    MIQP Energy:           {_safe_format(best_trial.values[0], '.6f')}")
+        if len(best_trial.values) > 1:
+            print(f"    Violation Rate:         {_safe_format(best_trial.values[1], '.2f')}")
+    
+    print("    Hyperparameters:")
+    for key, val in best_trial.params.items():
+        if isinstance(val, float):
+            print(f"      {key:20s}: {_safe_format(val, '.6f')}")
+        else:
+            print(f"      {key:20s}: {val}")
+    
+    # User attributes
+    if best_trial.user_attrs:
+        print("    User Attributes:")
+        attrs = best_trial.user_attrs
+        for key, val in attrs.items():
+            if key == 'best_solution' and val is not None:
+                # Summarise solution
+                if isinstance(val, list):
+                    selected = [i for i, v in enumerate(val) if v == 1]
+                    if len(selected) <= 15:
+                        val_str = str(selected)
+                    else:
+                        val_str = str(selected[:10]) + f" ... (total {len(selected)})"
+                    print(f"      {key:20s}: {val_str}")
+                else:
+                    print(f"      {key:20s}: {val}")
+            elif isinstance(val, float):
+                print(f"      {key:20s}: {_safe_format(val, '.6f')}")
+            else:
+                print(f"      {key:20s}: {val}")
+    
+    print("=" * 80)
+
+
+def print_benchmark_summary(
+    results_by_N: Dict[int, Dict],
+    title: str = "Benchmark Summary"
+) -> None:
+    """
+    Print a summary table for benchmark results across different N.
+    
+    Args:
+        results_by_N: dict mapping N -> dict with 'gurobi', 'greedy', 'sa', 'sqa' results
+        title: Title for the summary
+    """
+    if not results_by_N:
+        print("⚠️ No benchmark results to summarise.")
+        return
+    
+    print("\n" + "=" * 80)
+    print(f"📊 {title}")
+    print("=" * 80)
+    
+    # Collect rows
+    rows = []
+    for N, results in sorted(results_by_N.items()):
+        for solver_name, res in results.items():
+            if res is None:
+                continue
+            rows.append({
+                'N': N,
+                'Solver': solver_name,
+                'SQR': res.get('sqr', np.nan),
+                'Runtime (s)': res.get('runtime', np.nan),
+                'Violation Rate': res.get('violation_rate', np.nan),
+                'Feasible': res.get('feasible', False),
+                'Energy': res.get('energy', np.nan),
+            })
+    
+    if not rows:
+        print("  No data available.")
+        print("=" * 80)
+        return
+    
+    df = pd.DataFrame(rows)
+    
+    # Pivot for cleaner display
+    print("\n  SQR by N and Solver:")
+    pivot_sqr = df.pivot(index='N', columns='Solver', values='SQR')
+    print(pivot_sqr.round(4).to_string())
+    
+    print("\n  Runtime (seconds) by N and Solver:")
+    pivot_time = df.pivot(index='N', columns='Solver', values='Runtime (s)')
+    print(pivot_time.round(4).to_string())
+    
+    print("\n  Violation Rate by N and Solver:")
+    pivot_viol = df.pivot(index='N', columns='Solver', values='Violation Rate')
+    print(pivot_viol.round(4).to_string())
+    
+    # Additional stats
+    print("\n  Feasibility Summary:")
+    feas_summary = df.groupby(['N', 'Solver'])['Feasible'].mean().unstack()
+    print(feas_summary.round(4).to_string())
+    
+    print("=" * 80)
+
 
 # ============================================================================
 # Module exports
@@ -1104,9 +1397,17 @@ __all__ = [
     'suppress_optuna_trial_logs',
     'print_config_header',
     'print_cross_strategy_metrics',
-    "print_jij_tuning_summary",
-    "print_jij_benchmark_summary",
-    "print_jij_single_run",
-    "save_jij_results",
-    "load_jij_results",
+    'print_jij_tuning_summary',
+    'print_jij_benchmark_summary',
+    'print_jij_single_run',
+    'save_jij_results',
+    'load_jij_results',
+    # NEW
+    'compute_violation_rate',
+    'compute_matrix_differences',
+    'build_full_qubo_matrix',
+    'select_best_from_pareto',
+    'print_multiobjective_tuning_summary',
+    'print_benchmark_summary',
+    '_safe_format',
 ]

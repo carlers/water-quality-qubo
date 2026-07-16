@@ -19,6 +19,11 @@ This module provides:
    13. Gurobi baseline plot
    14. SQR vs Runtime scatter plot
    15. Cross‑strategy progress plots (with legends outside)
+   (NEW) 16. Objective vs reads curve
+   (NEW) 17. Violation rate vs reads curve
+   (NEW) 18. Optuna comprehensive plots (8 types via optuna.visualization.matplotlib)
+   (NEW) 19. Direct QUBO matrix heatmap with .npy saving
+   (NEW) 20. Optuna plot wrapper with W&B logging
 
 All functions accept a save_path and a show_fig flag (default True in Colab).
 """
@@ -48,10 +53,25 @@ try:
         plot_param_importances,
         plot_parallel_coordinate,
         plot_slice,
+        plot_pareto_front,
+        plot_timeline,
+        plot_intermediate_values,
+        plot_hypervolume_history,
+        plot_edf,
+        plot_optimization_history,
+        plot_rank,
     )
     OPTUNA_AVAILABLE = True
 except ImportError:
     OPTUNA_AVAILABLE = False
+
+# Optional: W&B
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
 
 # Local import for building QUBO matrices
 from src.model import build_qubo
@@ -1473,60 +1493,199 @@ def plot_jij_deployment(
 
 
 # -----------------------------------------------------------------------------
-# Plot QUBO matrix heatmap
+# Plot QUBO matrix heatmap (direct matrix input)
 # -----------------------------------------------------------------------------
-def plot_jij_qubo_matrix(
-    instance_data: Dict,
-    penalty_weights: Dict[int, float],
+def plot_qubo_matrix_direct(
+    Q_mat: np.ndarray,
     save_path: Optional[Union[str, Path]] = None,
+    title: str = "QUBO Matrix",
+    show_fig: bool = True,
+    dpi: int = 150,
+    cmap: str = 'coolwarm',
+) -> None:
+    """
+    Plot QUBO matrix heatmap directly from a numpy array and save .npy.
+    """
+    try:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sns.heatmap(Q_mat, ax=ax, cmap=cmap, square=False, cbar_kws={'label': 'Energy coefficient'})
+        ax.set_title(title)
+        ax.set_xlabel('Site index')
+        ax.set_ylabel('Site index')
+        plt.tight_layout()
+        if save_path:
+            # Save .npy alongside the figure
+            npy_path = Path(save_path).with_suffix('.npy')
+            np.save(npy_path, Q_mat)
+            # Save figure
+            plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        if show_fig:
+            plt.show()
+        plt.close(fig)
+    except Exception as e:
+        print(f"  ⚠️ Failed to plot QUBO matrix: {e}")
+
+
+# -----------------------------------------------------------------------------
+# QUBO matrix heatmap with spatial ordering
+# -----------------------------------------------------------------------------
+def plot_qubo_matrix_heatmap_with_order(
+    Q_mat: np.ndarray,
+    coords: np.ndarray,
+    save_path: Optional[Union[str, Path]] = None,
+    title: str = "QUBO Matrix (spatial order)",
     show_fig: bool = True,
     dpi: int = 150,
 ) -> None:
-    """Plot the QUBO matrix heatmap from a JijModeling instance."""
-    from .jij_model import build_augmented_model, compile_instance
+    """
+    Plot QUBO matrix heatmap reordered by spatial x-coordinate.
+    """
+    try:
+        spatial_order = np.argsort(coords[:, 0])
+        Q_reordered = Q_mat[spatial_order, :][:, spatial_order]
+        plot_qubo_matrix_direct(Q_reordered, save_path, title, show_fig, dpi)
+    except Exception as e:
+        print(f"  ⚠️ Failed to plot ordered QUBO matrix: {e}")
 
-    N = instance_data["N"]
-    model = build_augmented_model()
-    # Filter instance data to only model keys
-    model_keys = {"N", "K", "a", "Q", "neigh"}
-    filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
-    instance = compile_instance(model, filtered_data)
 
-    qubo_dict, _ = instance.to_qubo(penalty_weights=penalty_weights)
+# -----------------------------------------------------------------------------
+# Objective vs reads curve
+# -----------------------------------------------------------------------------
+def plot_objective_vs_reads(
+    ax: plt.Axes,
+    read_indices: np.ndarray,
+    objective_values: np.ndarray,
+    label: str,
+    color: str = 'blue',
+    marker: str = 'o',
+    linestyle: str = '-',
+) -> None:
+    """
+    Plot objective value (e.g., MIQP energy) vs read index.
+    """
+    ax.plot(read_indices, objective_values, linestyle=linestyle, marker=marker,
+            color=color, linewidth=1.5, markersize=4, label=label)
+    ax.set_xlabel('Read Index')
+    ax.set_ylabel('Objective Value (MIQP Energy)')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
 
-    # Build full matrix, but only for indices < N
-    Q = np.zeros((N, N))
-    for (i, j), coeff in qubo_dict.items():
-        if i < N and j < N:
-            if i == j:
-                Q[i, i] += coeff
+
+# -----------------------------------------------------------------------------
+# Violation rate vs reads curve
+# -----------------------------------------------------------------------------
+def plot_violation_vs_reads(
+    ax: plt.Axes,
+    read_indices: np.ndarray,
+    violation_rates: np.ndarray,
+    label: str,
+    color: str = 'red',
+    marker: str = 's',
+    linestyle: str = '-',
+) -> None:
+    """
+    Plot violation rate vs read index (step-like).
+    """
+    # Use step plot for discrete values
+    ax.step(read_indices, violation_rates, where='post', linestyle=linestyle,
+            color=color, linewidth=1.5, label=label)
+    ax.set_xlabel('Read Index')
+    ax.set_ylabel('Violation Rate')
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+
+# -----------------------------------------------------------------------------
+# Optuna comprehensive plots (8 types + parallel_coordinate)
+# -----------------------------------------------------------------------------
+def save_and_log_optuna_plots(
+    study: 'optuna.Study',
+    save_dir: Union[str, Path],
+    wandb_run=None,
+    show_fig: bool = True,
+    dpi: int = 150,
+) -> Dict[str, plt.Figure]:
+    """
+    Generate all 8 Optuna visualisation plots (plus parallel_coordinate) and
+    optionally log them to W&B.
+
+    Plots generated:
+        - timeline
+        - pareto_front
+        - intermediate_values
+        - hypervolume_history
+        - edf
+        - optimization_history
+        - param_importances
+        - rank
+        - parallel_coordinate (extra)
+
+    Args:
+        study: Optuna study object.
+        save_dir: Directory to save images.
+        wandb_run: Optional W&B run object to log images.
+        show_fig: Whether to display figures inline.
+        dpi: Resolution for saved images.
+
+    Returns:
+        Dict mapping plot name to matplotlib Figure object.
+    """
+    if not OPTUNA_AVAILABLE:
+        print("  ⚠️ Optuna not available; skipping plot generation.")
+        return {}
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Define plot functions and their filenames
+    plot_specs = [
+        ('timeline', plot_timeline, 'optuna_timeline.png'),
+        ('pareto_front', plot_pareto_front, 'optuna_pareto_front.png'),
+        ('intermediate_values', plot_intermediate_values, 'optuna_intermediate_values.png'),
+        ('hypervolume_history', plot_hypervolume_history, 'optuna_hypervolume_history.png'),
+        ('edf', plot_edf, 'optuna_edf.png'),
+        ('optimization_history', plot_optimization_history, 'optuna_optimization_history.png'),
+        ('param_importances', plot_param_importances, 'optuna_param_importances.png'),
+        ('rank', plot_rank, 'optuna_rank.png'),
+        ('parallel_coordinate', plot_parallel_coordinate, 'optuna_parallel_coordinate.png'),
+    ]
+
+    figures = {}
+    for name, plot_func, filename in plot_specs:
+        try:
+            # For multi-objective studies, some plots require target function
+            # For rank, we can use default; for pareto_front, it works automatically
+            fig = plot_func(study)
+            # Some functions return a Figure object; others return an array of axes
+            if isinstance(fig, plt.Figure):
+                fig = fig
+            elif isinstance(fig, np.ndarray) and len(fig) > 0:
+                # Sometimes plot_* returns an array of axes; we need to get the figure
+                fig = fig[0].figure
             else:
-                Q[i, j] += coeff
-                Q[j, i] += coeff
+                # Try to get the current figure
+                fig = plt.gcf()
+            # Save
+            save_path = save_dir / filename
+            fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+            figures[name] = fig
+            if show_fig:
+                plt.show()
+            # Log to W&B
+            if wandb_run is not None and WANDB_AVAILABLE:
+                wandb_run.log({name: wandb.Image(str(save_path))})
+            plt.close(fig)
+        except Exception as e:
+            print(f"  ⚠️ Failed to generate {name} plot: {e}")
 
-    # Spatial ordering by x-coordinate
-    coords = instance_data["coords"]
-    spatial_order = np.argsort(coords[:, 0])
-    Q_reordered = Q[spatial_order, :][:, spatial_order]
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    im = ax.imshow(Q_reordered, cmap='coolwarm', aspect='auto')
-    ax.set_title('QUBO Matrix (with penalties)', fontsize=14)
-    ax.set_xlabel('Site index (spatial order)', fontsize=12)
-    ax.set_ylabel('Site index (spatial order)', fontsize=12)
-    plt.colorbar(im, ax=ax, label='Energy coefficient')
-
-    if save_path:
-        plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
-    if show_fig:
-        plt.show()
-    plt.close(fig)
+    return figures
 
 
-# -----------------------------------------------------------------------------
-# Scaling benchmark plots
-# -----------------------------------------------------------------------------
-def plot_jij_scaling_benchmark(
+# ============================================================================
+# Scaling plots
+# ============================================================================
+def plot_scaling_benchmark(
     df: pd.DataFrame,
     save_dir: Optional[Union[str, Path]] = None,
     show_fig: bool = True,
@@ -1666,9 +1825,9 @@ def plot_jij_benchmark_summary(
     plt.close()
 
 
-# -----------------------------------------------------------------------------
+# ============================================================================
 # Helper: compute energy (for info text)
-# -----------------------------------------------------------------------------
+# ============================================================================
 def _compute_energy_from_solution(x: np.ndarray, a: np.ndarray, Q: np.ndarray) -> float:
     return np.dot(a, x) + 0.5 * np.dot(x, np.dot(Q, x))
 
@@ -1696,7 +1855,11 @@ __all__ = [
     'plot_cross_strategy_progress',
     'regenerate_plots',
     'plot_jij_deployment',
-    'plot_jij_qubo_matrix',
-    'plot_jij_scaling_benchmark',
+    'plot_qubo_matrix_direct',
+    'plot_qubo_matrix_heatmap_with_order',
+    'plot_objective_vs_reads',
+    'plot_violation_vs_reads',
+    'save_and_log_optuna_plots',
+    'plot_scaling_benchmark',
     'plot_jij_benchmark_summary',
 ]
