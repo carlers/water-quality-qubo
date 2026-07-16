@@ -7,8 +7,8 @@ seaborn>=0.12
 
 # Optimization & Quantum
 openjij>=0.3
-jijmodeling>=0.2
-jijmodeling-transpiler>=0.2
+ommx-openjij-adapter
+jijmodeling
 optuna>=3.0
 gurobipy>=10.0
 
