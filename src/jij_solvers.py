@@ -37,34 +37,33 @@ __all__ = [
 # Helper: decode solution from OMMX solution or OpenJij response
 # -----------------------------------------------------------------------------
 def decode_solution(solution_obj, N: int) -> np.ndarray:
-    """
-    Decode a binary solution vector from an OMMX Solution or an OpenJij response.
-    Returns a binary numpy array of length N.
-    """
+    """Decode a binary solution vector from an OMMX Solution or OpenJij response."""
     x_sol = np.zeros(N, dtype=int)
 
     # OMMX Solution case
     if hasattr(solution_obj, "decision_variables_df"):
         df = solution_obj.decision_variables_df
+        # Filter only variables with name 'x'
         x_df = df[df["name"] == "x"]
         selected = x_df[x_df["value"] == 1]["subscripts"].tolist()
         for s in selected:
+            # subscripts is a tuple, e.g., (i,)
             idx = s[0] if isinstance(s, tuple) else s
             if idx < N:
                 x_sol[idx] = 1
         return x_sol
 
-    # OpenJij Response case (dict {index: value})
-    elif isinstance(solution_obj, dict):
-        for idx, val in solution_obj.items():
+    # OpenJij Response with .first.sample
+    elif hasattr(solution_obj, "first"):
+        best_sample = solution_obj.first.sample
+        for idx, val in best_sample.items():
             if idx < N:
                 x_sol[idx] = int(val)
         return x_sol
 
-    # OpenJij Response (from sample_qubo) has .first.sample
-    elif hasattr(solution_obj, "first"):
-        best_sample = solution_obj.first.sample
-        for idx, val in best_sample.items():
+    # Fallback: if it's a dict directly
+    elif isinstance(solution_obj, dict):
+        for idx, val in solution_obj.items():
             if idx < N:
                 x_sol[idx] = int(val)
         return x_sol
@@ -77,14 +76,12 @@ def decode_solution(solution_obj, N: int) -> np.ndarray:
 # Helper: check feasibility (budget + connectivity)
 # -----------------------------------------------------------------------------
 def check_feasibility(x_sol: np.ndarray, neigh: np.ndarray, K: int) -> bool:
-    """
-    Check budget and connectivity constraints.
-    """
-    selected = np.where(x_sol == 1)[0]
-    budget_ok = (len(selected) == K)
-    if not budget_ok:
+    """Check budget and connectivity constraints."""
+    if x_sol is None:
         return False
-    # Connectivity: each selected site must have at least one selected neighbor
+    selected = np.where(x_sol == 1)[0]
+    if len(selected) != K:
+        return False
     for i in selected:
         if not np.any(neigh[i, selected] == 1):
             return False
