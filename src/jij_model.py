@@ -51,5 +51,7 @@ def get_penalty_weights(instance, lambda_budget: float, lambda_conn: float) -> D
 
 
 def compile_instance(problem: jm.Problem, instance_data: Dict):
-    """Compile the problem with instance data into an OMMX Instance."""
-    return problem.eval(instance_data)
+    # Keep only keys that are placeholders in the model
+    placeholder_names = {p.name for p in problem.placeholders.values()}
+    filtered = {k: v for k, v in instance_data.items() if k in placeholder_names}
+    return problem.eval(filtered)
