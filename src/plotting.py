@@ -1482,25 +1482,27 @@ def plot_jij_qubo_matrix(
     show_fig: bool = True,
     dpi: int = 150,
 ) -> None:
-    """
-    Plot the QUBO matrix heatmap from a JijModeling instance.
-    Includes spatial ordering by x-coordinate.
-    """
+    """Plot the QUBO matrix heatmap from a JijModeling instance."""
     from .jij_model import build_augmented_model, compile_instance
 
     N = instance_data["N"]
     model = build_augmented_model()
-    instance = compile_instance(model, instance_data)
+    # Filter instance data to only model keys
+    model_keys = {"N", "K", "a", "Q", "neigh"}
+    filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
+    instance = compile_instance(model, filtered_data)
+
     qubo_dict, _ = instance.to_qubo(penalty_weights=penalty_weights)
 
-    # Build full matrix
+    # Build full matrix, but only for indices < N
     Q = np.zeros((N, N))
     for (i, j), coeff in qubo_dict.items():
-        if i == j:
-            Q[i, i] += coeff
-        else:
-            Q[i, j] += coeff
-            Q[j, i] += coeff
+        if i < N and j < N:
+            if i == j:
+                Q[i, i] += coeff
+            else:
+                Q[i, j] += coeff
+                Q[j, i] += coeff
 
     # Spatial ordering by x-coordinate
     coords = instance_data["coords"]
