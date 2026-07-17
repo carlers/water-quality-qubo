@@ -1409,9 +1409,6 @@ def plot_jij_deployment(
     N = instance_data["N"]
     coords = instance_data["coords"]
     U = instance_data["U"]
-    M_indices = []  # not used in current synthetic data; we can compute if needed
-    # Assuming greenfield for now (no existing stations)
-    # But we can add existing stations if M_indices is provided in instance_data
     M_indices = instance_data.get("M_indices", [])
     selected = np.where(solution == 1)[0]
     selected_new = [i for i in selected if i not in M_indices]
@@ -1446,10 +1443,8 @@ def plot_jij_deployment(
 
     # New selected stations
     if selected_new:
-        # Size proportional to utility
-        sizes = 100 + 200 * (U[selected_new] - U[selected_new].min()) / (U[selected_new].max() - U[selected_new].min() + 1e-6)
         ax.scatter(coords[selected_new, 0], coords[selected_new, 1],
-                   c='red', s=sizes, edgecolor='black', linewidth=2, zorder=3,
+                   c='red', s=120, edgecolor='black', linewidth=1, zorder=3,
                    label=f'New Stations ({len(selected_new)})')
 
     # Connectivity links (for selected stations within D_max)
@@ -1461,11 +1456,11 @@ def plot_jij_deployment(
                 if dist <= CONNECTIVITY_RANGE:
                     ax.plot([coords[idx_i, 0], coords[idx_j, 0]],
                             [coords[idx_i, 1], coords[idx_j, 1]],
-                            color='gray', alpha=0.4, linewidth=1.5, linestyle='--')
+                            color='gray', alpha=0.4, linewidth=1, linestyle='--')
 
     ax.set_xlabel('X (km)', fontsize=12)
     ax.set_ylabel('Y (km)', fontsize=12)
-    ax.set_title('Deployment Solution (JijModeling)', fontsize=14, fontweight='bold')
+    ax.set_title('Deployment Solution (SCIP)', fontsize=14, fontweight='bold')
     ax.set_aspect('equal')
     ax.set_xlim(-2, DOMAIN_SIZE + 2)
     ax.set_ylim(-2, DOMAIN_SIZE + 2)
@@ -1474,15 +1469,22 @@ def plot_jij_deployment(
     handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='New'),
                plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='blue', markersize=10, label='Existing (M)'),
                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightgray', markersize=8, label='Candidates')]
-    ax.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+    ax.legend(handles=handles, bbox_to_anchor=(1.25, 1), loc='upper left', fontsize=10)
 
-    # Info text outside
+    # Format selected indices as comma-separated strings
+    selected_new_str = ', '.join(map(str, selected_new)) if selected_new else 'None'
+    selected_m_str = ', '.join(map(str, selected_m)) if selected_m else 'None'
+    
+    # Info text outside with indices included
     info_text = (
         f"N: {N} | K: {instance_data['K']}\n"
         f"Selected: {len(selected_new)} new, {len(selected_m)} existing\n"
+        f"New indices: [{selected_new_str}]\n"
+        f"Existing indices: [{selected_m_str}]\n"
         f"Energy: {compute_energy(solution, instance_data['a'], instance_data['Q']):.6f}"
     )
-    plt.figtext(0.601, 0.15, info_text, fontsize=9, verticalalignment='bottom',
+    
+    plt.figtext(0.55, 0.08, info_text, fontsize=9, verticalalignment='bottom',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.95, edgecolor='gray'))
 
     plt.tight_layout(rect=[0, 0, 0.68, 1])
