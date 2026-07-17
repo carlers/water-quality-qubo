@@ -1400,6 +1400,7 @@ def plot_jij_deployment(
     save_path: Optional[Union[str, Path]] = None,
     show_fig: bool = True,
     dpi: int = 150,
+    domain_size: int = 50,
 ) -> None:
     """
     Plot the deployment map from a JijModeling solution.
@@ -1416,7 +1417,7 @@ def plot_jij_deployment(
     selected_new = [i for i in selected if i not in M_indices]
     selected_m = [i for i in selected if i in M_indices]
 
-    DOMAIN_SIZE = 50.0  # default
+    DOMAIN_SIZE = domain_size  # default
     CONNECTIVITY_RANGE = 8.0  # default; could be stored in instance_data
     # If we have connectivity range in instance_data, use it
     if "D_max" in instance_data:
