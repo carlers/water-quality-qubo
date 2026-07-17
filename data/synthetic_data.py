@@ -178,7 +178,6 @@ def farthest_point_sampling(
         selected = selected[:sizes[-1]]
 
     t_init = time.perf_counter() - t0
-    print(f"[DEBUG] Initialisation: {t_init:.4f} s, selected={len(selected)}")
 
     # ---------- Build distance array ----------
     # Efficient incremental initialisation: start from first point, then add others
@@ -198,11 +197,9 @@ def farthest_point_sampling(
     # Mark selected as -1 to ignore them
     dist_to_selected[selected] = -1.0
     t_dist = time.perf_counter() - t_dist0
-    print(f"[DEBUG] Distance init: {t_dist:.4f} s")
 
     # ---------- Main FPS loop ----------
     subsets = {}
-    prev_size = len(selected)
     total_loop_time = 0.0
     total_candidate_time = 0.0
     total_update_time = 0.0
@@ -242,24 +239,15 @@ def farthest_point_sampling(
             t_upd = time.perf_counter() - t_upd_start
             total_update_time += t_upd
 
-            # ---- Progress print (every 50 points) ----
-            if len(selected) % 50 == 0:
-                print(f"[DEBUG]   Added {len(selected)} points so far...")
-
         # ---- Store subset ----
         subsets[size] = selected.copy()
         t_size = time.perf_counter() - t_size_start
         total_loop_time += t_size
-        print(f"[DEBUG] Subset size {size}: completed in {t_size:.4f} s "
-              f"(added {size - prev_size} points)")
-        prev_size = size
+        print(f"Subset size {size}: completed in {t_size:.4f} s ")
 
     # ---- Summary ----
     total_time = time.perf_counter() - t0
-    print(f"[DEBUG] FPS total time: {total_time:.4f} s")
-    print(f"[DEBUG]   - Candidate selection: {total_candidate_time:.4f} s")
-    print(f"[DEBUG]   - Distance updates:    {total_update_time:.4f} s")
-    print(f"[DEBUG]   - Loop overhead:       {total_loop_time - total_candidate_time - total_update_time:.4f} s")
+    print(f"FPS total time: {total_time:.4f} s")
     return subsets
 
 
