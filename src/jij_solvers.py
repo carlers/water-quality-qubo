@@ -192,13 +192,7 @@ def solve_sa_jij(
     K = instance_data["K"]
     a = np.asarray(instance_data["a"])
     Q = np.asarray(instance_data["Q"])
-    neigh = np.asarray(instance_data["neigh"])
-
-    # 1. Check inputs for NaNs
-    print("[DEBUG] Checking inputs for NaN/inf:")
-    print(f"  a has NaN? {np.any(np.isnan(a))}, inf? {np.any(np.isinf(a))}")
-    print(f"  Q has NaN? {np.any(np.isnan(Q))}, inf? {np.any(np.isinf(Q))}")
-    print(f"  neigh has NaN? {np.any(np.isnan(neigh))}")
+    neigh = np.asarray(instance_data["neigh"])   
 
     # 2. Compile instance and build QUBO
     model = build_augmented_model()
@@ -206,15 +200,7 @@ def solve_sa_jij(
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
     instance = compile_instance(model, filtered_data)
     qubo_dict, offset = instance.to_qubo(penalty_weights=penalty_weights)
-    print(f"[DEBUG] QUBO dictionary size: {len(qubo_dict)}")
-    if not qubo_dict:
-        print("[DEBUG] ⚠️ QUBO dictionary is empty!")
-    else:
-        # Print first few items
-        items = list(qubo_dict.items())[:5]
-        print(f"[DEBUG] First 5 QUBO terms: {items}")
-    print(f"[DEBUG] QUBO offset: {offset}")
-
+   
     start = time.perf_counter()
     try:
         sampler = oj.SASampler()
@@ -226,19 +212,6 @@ def solve_sa_jij(
         )
         runtime = time.perf_counter() - start
 
-        # 3. Inspect the response object
-        print("[DEBUG] Response type:", type(response))
-        print("[DEBUG] Response dir:", dir(response))
-        if hasattr(response, 'record'):
-            print("[DEBUG] Response.record shape:", response.record.shape)
-            print("[DEBUG] Response.record.dtype:", response.record.dtype)
-            print("[DEBUG] Response.indices:", response.indices)
-            # Print the first sample
-            first_sample = response.record['sample'][0]
-            print("[DEBUG] First sample array (first 10):", first_sample[:10])
-        else:
-            print("[DEBUG] No 'record' attribute!")
-
         # 4. Decode solution using the same logic as SQA (direct from record)
         x_sol = np.zeros(N, dtype=int)
         if hasattr(response, 'record') and len(response.indices) > 0:
@@ -247,19 +220,12 @@ def solve_sa_jij(
             for var_idx, val in zip(response.indices, best_sample):
                 if var_idx < N:
                     x_sol[var_idx] = int(round(val))
-            print(f"[DEBUG] Decoded solution from record: {x_sol[:10]} ...")
-            print(f"[DEBUG] Number of selected (from decoded): {np.sum(x_sol)}")
         else:
-            print("[DEBUG] Could not decode from record; falling back to decode_solution")
-            # Fallback to original decode_solution (if defined)
             x_sol = decode_solution(response, N)
-            print(f"[DEBUG] decode_solution returned: {x_sol[:10]} ...")
 
         # 5. Compute energy manually with checks
         energy = compute_energy(x_sol, a, Q)
-        print(f"[DEBUG] compute_energy returned: {energy}")
         if np.isnan(energy):
-            print("[DEBUG] ⚠️ Energy is NaN! Checking components...")
             # Check dot products
             linear = np.dot(a, x_sol)
             quad = 0.0
@@ -267,11 +233,6 @@ def solve_sa_jij(
                 for j in range(i+1, N):
                     if Q[i, j] != 0:
                         quad += Q[i, j] * x_sol[i] * x_sol[j]
-            print(f"[DEBUG] Linear term: {linear}, Quadratic term: {quad}")
-            if np.isnan(linear) or np.isinf(linear):
-                print("[DEBUG] Linear term has NaN/inf! Check a or x_sol.")
-            if np.isnan(quad) or np.isinf(quad):
-                print("[DEBUG] Quadratic term has NaN/inf! Check Q or x_sol.")
         
         # 6. Feasibility checks (same as before)
         feas_detail = check_feasibility(x_sol, neigh, K)
