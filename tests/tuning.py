@@ -375,20 +375,24 @@ def run_tuning(mode="test", do_tune_sa=True, do_tune_sqa=True, force_retune=Fals
 
     # 5. Build reduced instance_data
     instance_data = {
-        "N": len(free_indices),          # number of decision variables (free stations)
-        "K": K,                          # number of NEW stations to place (not +|M|)
+        "N": len(free_indices),
+        "K": K,
         "a": a_new,
         "Q": Q_new,
         "neigh": neigh_new,
-        "coords": coords[free_indices],  # only free stations' coordinates
+        "coords": coords[free_indices],          # reduced coords
         "U": U[free_indices],
-        "M_indices": [],                 # no fixed indices in decision space
+        "M_indices": [],                         # no fixed indices in decision space
         "D_max": connectivity_range,
-        "original_indices": free_indices,
-        "fixed_indices": M_indices,
+        "original_indices": free_indices,        # mapping from new index to original
+        "fixed_indices": M_indices,              # original fixed indices
         "fixed_neighbors": fixed_neighbors,
-        "has_fixed_neighbor": has_fixed_neighbor,   # for easy connectivity check
+        "has_fixed_neighbor": has_fixed_neighbor,
         "L_c": L_c, "L_w": L_w,
+        # --- Add these for plotting ---
+        "original_coords": coords,               # full coordinates (all stations)
+        "original_U": U,                         # full utilities
+        "original_all_indices": list(range(N)),  # optional
     }
 
     print(f"  Loaded subset N={N} with |M|={len(M_indices)}")

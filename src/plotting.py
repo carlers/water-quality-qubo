@@ -1404,58 +1404,86 @@ def plot_jij_deployment(
 ) -> None:
     """
     Plot the deployment map from a JijModeling solution.
-    Uses coordinates and utility from instance_data.
+    
+    Handles both the original (with fixed stations) and reduced (fixed stations removed)
+    formulations. If original_coords and original_fixed_indices are present in
+    instance_data, they will be used to show existing stations and all candidates.
     """
-    N = instance_data["N"]
-    coords = instance_data["coords"]
-    U = instance_data["U"]
-    M_indices = instance_data.get("M_indices", [])
-    selected = np.where(solution == 1)[0]
-    selected_new = [i for i in selected if i not in M_indices]
-    selected_m = [i for i in selected if i in M_indices]
+    # --- Decide which coordinates and indices to use ---
+    # If we have original data, use it for candidates and existing stations
+    if "original_coords" in instance_data:
+        coords_all = instance_data["original_coords"]
+        U_all = instance_data.get("original_U", None)
+        fixed_indices = instance_data.get("fixed_indices", [])
+        # Candidate indices are all original indices except fixed ones
+        candidate_indices = [i for i in range(len(coords_all)) if i not in fixed_indices]
+    else:
+        # Fallback to the old behavior (no fixed stations)
+        coords_all = instance_data["coords"]
+        U_all = instance_data.get("U", None)
+        fixed_indices = instance_data.get("M_indices", [])
+        candidate_indices = list(range(len(coords_all)))
 
-    DOMAIN_SIZE = domain_size  # default
-    CONNECTIVITY_RANGE = 8.0  # default; could be stored in instance_data
-    # If we have connectivity range in instance_data, use it
-    if "D_max" in instance_data:
-        CONNECTIVITY_RANGE = instance_data["D_max"]
+    # The solution is always for the free (candidate) stations
+    # The original_indices mapping tells us which original index each free station corresponds to
+    original_indices = instance_data.get("original_indices", None)
+    if original_indices is not None:
+        # Map solution indices to original indices
+        selected_original = [original_indices[i] for i in np.where(solution == 1)[0]]
+    else:
+        # If no mapping, assume solution indices are the original indices
+        selected_original = list(np.where(solution == 1)[0])
 
-    # Create grid for utility contour
-    grid_x = np.linspace(0, DOMAIN_SIZE, 100)
-    grid_y = np.linspace(0, DOMAIN_SIZE, 100)
-    grid_z = griddata(coords, U, (grid_x[None, :], grid_y[:, None]), method='cubic')
+    # Split selected into new stations vs existing
+    selected_new = [i for i in selected_original if i not in fixed_indices]
+    selected_m = [i for i in selected_original if i in fixed_indices]
+
+    # --- Plotting setup ---
+    CONNECTIVITY_RANGE = instance_data.get("D_max", 8.0)
+    DOMAIN_SIZE = domain_size
+
+    # Create grid for utility contour (use U_all if available)
+    if U_all is not None:
+        grid_x = np.linspace(0, DOMAIN_SIZE, 100)
+        grid_y = np.linspace(0, DOMAIN_SIZE, 100)
+        # Use all coordinates for the interpolation
+        grid_z = griddata(coords_all, U_all, (grid_x[None, :], grid_y[:, None]), method='cubic')
+    else:
+        grid_z = None
 
     fig, ax = plt.subplots(figsize=(10, 8))
 
     # Background contour
-    cf = ax.contourf(grid_x, grid_y, grid_z, levels=20, cmap='viridis', alpha=0.3)
-    cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.8)
-    cbar.set_label('Utility $U_i$', fontsize=12)
+    if grid_z is not None:
+        cf = ax.contourf(grid_x, grid_y, grid_z, levels=20, cmap='viridis', alpha=0.3)
+        cbar = plt.colorbar(cf, ax=ax, orientation='vertical', pad=0.02, shrink=0.8)
+        cbar.set_label('Utility $U_i$', fontsize=12)
 
-    # All candidates
-    ax.scatter(coords[:, 0], coords[:, 1], c='lightgray', s=30, alpha=0.5,
-               edgecolor='gray', linewidth=0.2, label='Candidates')
+    # All candidates (including existing)
+    ax.scatter(coords_all[candidate_indices, 0], coords_all[candidate_indices, 1],
+               c='lightgray', s=30, alpha=0.5, edgecolor='gray', linewidth=0.2,
+               label='Candidates')
 
     # Existing stations (if any)
     if selected_m:
-        ax.scatter(coords[selected_m, 0], coords[selected_m, 1],
+        ax.scatter(coords_all[selected_m, 0], coords_all[selected_m, 1],
                    c='blue', s=120, marker='s', edgecolor='black', label='Existing (M)')
 
     # New selected stations
     if selected_new:
-        ax.scatter(coords[selected_new, 0], coords[selected_new, 1],
+        ax.scatter(coords_all[selected_new, 0], coords_all[selected_new, 1],
                    c='red', s=120, edgecolor='black', linewidth=1, zorder=3,
                    label=f'New Stations ({len(selected_new)})')
 
-    # Connectivity links (for selected stations within D_max)
+    # Connectivity links among all selected (new + existing)
     all_selected = selected_m + selected_new
     for i, idx_i in enumerate(all_selected):
         for j, idx_j in enumerate(all_selected):
             if i < j:
-                dist = np.linalg.norm(coords[idx_i] - coords[idx_j])
+                dist = np.linalg.norm(coords_all[idx_i] - coords_all[idx_j])
                 if dist <= CONNECTIVITY_RANGE:
-                    ax.plot([coords[idx_i, 0], coords[idx_j, 0]],
-                            [coords[idx_i, 1], coords[idx_j, 1]],
+                    ax.plot([coords_all[idx_i, 0], coords_all[idx_j, 0]],
+                            [coords_all[idx_i, 1], coords_all[idx_j, 1]],
                             color='gray', alpha=0.4, linewidth=1, linestyle='--')
 
     ax.set_xlabel('X (km)', fontsize=12)
@@ -1465,25 +1493,31 @@ def plot_jij_deployment(
     ax.set_xlim(-2, DOMAIN_SIZE + 2)
     ax.set_ylim(-2, DOMAIN_SIZE + 2)
 
-    # Legend outside
+    # Legend
     handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10, label='New'),
                plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='blue', markersize=10, label='Existing (M)'),
                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightgray', markersize=8, label='Candidates')]
     ax.legend(handles=handles, bbox_to_anchor=(1.25, 1), loc='upper left', fontsize=10)
 
-    # Format selected indices as comma-separated strings
+    # Info text (use the original a, Q if available, else fallback)
+    if "original_indices" in instance_data:
+        # Reconstruct energy from original a, Q? For simplicity, we use compute_energy with the solution
+        # but we need the original a and Q. Since we stored them implicitly, we can just compute using the solution.
+        energy = compute_energy(solution, instance_data["a"], instance_data["Q"])
+    else:
+        energy = compute_energy(solution, instance_data["a"], instance_data["Q"])
+
     selected_new_str = ', '.join(map(str, selected_new)) if selected_new else 'None'
     selected_m_str = ', '.join(map(str, selected_m)) if selected_m else 'None'
-    
-    # Info text outside with indices included
+    all_selected_str = ', '.join(map(str, all_selected)) if all_selected else 'None'
     info_text = (
-        f"N: {N} | K: {instance_data['K']}\n"
+        f"N: {len(coords_all)} | K: {instance_data['K']}\n"
         f"Selected: {len(selected_new)} new, {len(selected_m)} existing\n"
         f"New indices: [{selected_new_str}]\n"
         f"Existing indices: [{selected_m_str}]\n"
-        f"Energy: {compute_energy(solution, instance_data['a'], instance_data['Q']):.6f}"
+        f"All selected: [{all_selected_str}]\n"
+        f"Energy: {energy:.6f}"
     )
-    
     plt.figtext(0.55, 0.08, info_text, fontsize=9, verticalalignment='bottom',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.95, edgecolor='gray'))
 
