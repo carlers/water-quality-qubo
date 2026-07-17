@@ -251,10 +251,12 @@ def tune_sa(
     callbacks = [callback]
     if wandb_run is not None and WANDB_AVAILABLE:
         try:
-            wandb_callback = optuna.integration.WandbCallback(
+            from optuna.integration.wandb import WeightsAndBiasesCallback
+            
+            # When as_multirun=False, Optuna automatically uses the active wandb.run
+            wandb_callback = WeightsAndBiasesCallback(
                 metric_name=["miqp_energy", "violation_rate"],
-                wandb_kwargs={"run": wandb_run},
-                as_multirun=True,
+                as_multirun=False,
             )
             callbacks.append(wandb_callback)
         except Exception as e:
