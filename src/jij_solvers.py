@@ -95,55 +95,34 @@ def decode_solution(solution_obj, N: int) -> np.ndarray:
 # -----------------------------------------------------------------------------
 # Helper: check feasibility (budget + connectivity)
 # -----------------------------------------------------------------------------
-def check_feasibility(
-    x_sol: np.ndarray,
-    neigh: np.ndarray,
-    K: int
-) -> Dict[str, Any]:
-    """
-    Check budget and connectivity constraints.
-    
-    Returns:
-        dict with:
-            - budget_ok: bool
-            - connectivity_ok: bool
-            - feasible: bool
-            - num_selected: int
-            - isolated_indices: List[int]
-    """
-    if x_sol is None or neigh is None:
-        return {
-            "budget_ok": False,
-            "connectivity_ok": False,
-            "feasible": False,
-            "num_selected": 0,
-            "isolated_indices": [],
-        }
-    
-    x_sol = np.asarray(x_sol)
-    neigh = np.asarray(neigh)
-    selected = np.where(x_sol == 1)[0]
-    num_selected = len(selected)
-    
-    # Budget constraint
+def check_feasibility(x, neigh, K, fixed_indices=None):
+    num_selected = np.sum(x)
     budget_ok = (num_selected == K)
     
-    # Connectivity constraint
-    isolated_indices = []
-    if num_selected == 0:
-        connectivity_ok = False
-    else:
-        for i in selected:
-            if not np.any(neigh[i, selected] == 1):
-                isolated_indices.append(int(i))
-        connectivity_ok = (len(isolated_indices) == 0)
+    # Check fixed stations
+    fixed_ok = True
+    if fixed_indices is not None:
+        for idx in fixed_indices:
+            if x[idx] != 1:
+                fixed_ok = False
+                break
     
+    # Check connectivity
+    connectivity_ok = True
+    selected = np.where(x == 1)[0]
+    for i in selected:
+        if np.sum(neigh[i] * x) == 0:
+            connectivity_ok = False
+            break
+
+    feasible = budget_ok and connectivity_ok and fixed_ok
     return {
+        "feasible": feasible,
         "budget_ok": budget_ok,
         "connectivity_ok": connectivity_ok,
-        "feasible": budget_ok and connectivity_ok,
+        "fixed_ok": fixed_ok,
         "num_selected": num_selected,
-        "isolated_indices": isolated_indices,
+        "isolated_indices": [...]
     }
 
 
@@ -235,7 +214,8 @@ def solve_sa_jij(
                         quad += Q[i, j] * x_sol[i] * x_sol[j]
         
         # 6. Feasibility checks (same as before)
-        feas_detail = check_feasibility(x_sol, neigh, K)
+        fixed_indices = instance_data.get("M_indices", [])
+        feas_detail = check_feasibility(x_sol, neigh, K, fixed_indices=fixed_indices)
         feasible = feas_detail["feasible"]
         violation_rate = compute_violation_rate(x_sol, neigh, K)
         status = "optimal" if feasible else "infeasible"
@@ -251,7 +231,7 @@ def solve_sa_jij(
                         x_sample[var_idx] = int(round(val))
                 e_sample = compute_energy(x_sample, a, Q)
                 v_sample = compute_violation_rate(x_sample, neigh, K)
-                f_sample = check_feasibility(x_sample, neigh, K)
+                f_sample = check_feasibility(x_sample, neigh, K, fixed_indices=fixed_indices)
                 all_samples.append({
                     "solution": x_sample.copy(),
                     "energy": e_sample,
@@ -361,7 +341,8 @@ def solve_sqa_jij(
         
         # Compute energy and feasibility
         energy = compute_energy(x_sol, a, Q)
-        feas_detail = check_feasibility(x_sol, neigh, K)
+        fixed_indices = instance_data.get("M_indices", [])
+        feas_detail = check_feasibility(x_sol, neigh, K, fixed_indices=fixed_indices)
         feasible = feas_detail["feasible"]
         violation_rate = compute_violation_rate(x_sol, neigh, K)
         status = "optimal" if feasible else "infeasible"
@@ -381,7 +362,7 @@ def solve_sqa_jij(
                 # Compute energy and violation for this sample
                 e_sample = compute_energy(x_sample, a, Q)
                 v_sample = compute_violation_rate(x_sample, neigh, K)
-                f_sample = check_feasibility(x_sample, neigh, K)
+                f_sample = check_feasibility(x_sample, neigh, K, fixed_indices=fixed_indices)
                 
                 all_samples.append({
                     "solution": x_sample.copy(),
