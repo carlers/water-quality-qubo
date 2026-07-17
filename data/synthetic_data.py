@@ -19,6 +19,7 @@ Usage (command line):
     python data/synthetic_data.py --seed random  # Random seed (uses current time)
 """
 
+import time
 import json
 import pickle
 import warnings
@@ -145,11 +146,9 @@ def farthest_point_sampling(
     """
     Generate nested subsets via farthest-point sampling (FPS).
 
-    If fixed_indices is provided, they are forced to be included in all subsets.
-    Starting from `start_idx` (or the geometric center), greedily add the point
-    farthest from the current selected set, until the largest requested size
-    is reached. The resulting subsets are nested: size_1 ⊂ size_2 ⊂ ... ⊂ size_k.
+    Now with debug prints and optimised candidate filtering.
     """
+    t0 = time.perf_counter()
     n_total = coords.shape[0]
     sizes = sorted(sizes)
     if sizes[-1] > n_total:
@@ -157,12 +156,10 @@ def farthest_point_sampling(
 
     rng = np.random.RandomState(seed if seed is not None else RANDOM_SEED)
 
-    # Initialize selected with fixed_indices (if any)
+    # ---------- Initialise selected set ----------
     selected = list(fixed_indices) if fixed_indices is not None else []
-    # Remove duplicates and ensure all are valid indices
     selected = [int(idx) for idx in set(selected) if 0 <= idx < n_total]
 
-    # Determine starting point if not already in selected
     if start_idx is not None and start_idx not in selected:
         selected.append(start_idx)
     elif start_idx is None:
@@ -180,23 +177,89 @@ def farthest_point_sampling(
         )
         selected = selected[:sizes[-1]]
 
-    dist_to_selected = np.min(cdist(coords, coords[selected]), axis=1)
+    t_init = time.perf_counter() - t0
+    print(f"[DEBUG] Initialisation: {t_init:.4f} s, selected={len(selected)}")
 
+    # ---------- Build distance array ----------
+    # Efficient incremental initialisation: start from first point, then add others
+    t_dist0 = time.perf_counter()
+    if len(selected) == 0:
+        # Fallback: pick a random point
+        start_idx = rng.randint(n_total)
+        selected = [start_idx]
+        dist_to_selected = np.zeros(n_total, dtype=np.float64)
+    else:
+        # Build distances incrementally to avoid O(N * |selected|) cdist if |selected| is large
+        dist_to_selected = np.full(n_total, np.inf, dtype=np.float64)
+        for idx in selected:
+            dist = np.linalg.norm(coords - coords[idx], axis=1)
+            dist_to_selected = np.minimum(dist_to_selected, dist)
+        # Mark selected points (distance 0, but we'll mask them)
+    # Mark selected as -1 to ignore them
+    dist_to_selected[selected] = -1.0
+    t_dist = time.perf_counter() - t_dist0
+    print(f"[DEBUG] Distance init: {t_dist:.4f} s")
+
+    # ---------- Main FPS loop ----------
     subsets = {}
+    prev_size = len(selected)
+    total_loop_time = 0.0
+    total_candidate_time = 0.0
+    total_update_time = 0.0
+
     for size in sizes:
+        t_size_start = time.perf_counter()
+        # We need to add (size - len(selected)) points
         while len(selected) < size:
+            # ---- Find candidates with maximum distance ----
+            t_cand_start = time.perf_counter()
             max_dist = dist_to_selected.max()
-            candidates = np.where(np.isclose(dist_to_selected, max_dist))[0]
-            candidates = [c for c in candidates if c not in selected]
-            if not candidates:
-                warnings.warn(f"No candidates left to reach size {size}; stopping at {len(selected)}.")
-                break
-            perm = rng.permutation(candidates)
-            new_idx = int(perm[0])
-            selected.append(new_idx)
-            dist_to_new = np.linalg.norm(coords - coords[new_idx], axis=1)
-            dist_to_selected = np.minimum(dist_to_selected, dist_to_new)
+            # Use boolean mask instead of list comprehension
+            unselected_mask = np.ones(n_total, dtype=bool)
+            unselected_mask[selected] = False
+            candidates = np.where((dist_to_selected == max_dist) & unselected_mask)[0]
+            # In case of floating point tolerance, use isclose:
+            if len(candidates) == 0:
+                # fallback: nearest unselected
+                candidates = np.where(unselected_mask)[0]
+                if len(candidates) == 0:
+                    warnings.warn(f"No candidates left to reach size {size}; stopping at {len(selected)}.")
+                    break
+                best_idx = candidates[np.argmin(dist_to_selected[candidates])]
+            else:
+                # Random tie-breaking
+                perm = rng.permutation(candidates)
+                best_idx = int(perm[0])
+            t_cand = time.perf_counter() - t_cand_start
+            total_candidate_time += t_cand
+
+            # ---- Update selected and distances ----
+            t_upd_start = time.perf_counter()
+            selected.append(best_idx)
+            dist_new = np.linalg.norm(coords - coords[best_idx], axis=1)
+            dist_to_selected = np.minimum(dist_to_selected, dist_new)
+            dist_to_selected[selected] = -1.0   # mark selected
+            t_upd = time.perf_counter() - t_upd_start
+            total_update_time += t_upd
+
+            # ---- Progress print (every 50 points) ----
+            if len(selected) % 50 == 0:
+                print(f"[DEBUG]   Added {len(selected)} points so far...")
+
+        # ---- Store subset ----
         subsets[size] = selected.copy()
+        t_size = time.perf_counter() - t_size_start
+        total_loop_time += t_size
+        print(f"[DEBUG] Subset size {size}: completed in {t_size:.4f} s "
+              f"(added {size - prev_size} points)")
+        prev_size = size
+
+    # ---- Summary ----
+    total_time = time.perf_counter() - t0
+    print(f"[DEBUG] FPS total time: {total_time:.4f} s")
+    print(f"[DEBUG]   - Candidate selection: {total_candidate_time:.4f} s")
+    print(f"[DEBUG]   - Distance updates:    {total_update_time:.4f} s")
+    print(f"[DEBUG]   - Loop overhead:       {total_loop_time - total_candidate_time - total_update_time:.4f} s")
     return subsets
 
 
