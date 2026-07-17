@@ -243,7 +243,6 @@ def farthest_point_sampling(
         subsets[size] = selected.copy()
         t_size = time.perf_counter() - t_size_start
         total_loop_time += t_size
-        print(f"Subset size {size}: completed in {t_size:.4f} s ")
 
     # ---- Summary ----
     total_time = time.perf_counter() - t0
