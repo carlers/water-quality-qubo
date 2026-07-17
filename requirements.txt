@@ -12,6 +12,7 @@ ommx-pyscipopt-adapter
 jijmodeling>=2.0
 optuna>=3.0
 gurobipy>=10.0
+pyomo
 
 # Quantum computing
 qiskit>=0.45
