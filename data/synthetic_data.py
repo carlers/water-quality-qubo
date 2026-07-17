@@ -213,10 +213,12 @@ def create_nested_subsets(
     """
     Generate nested subsets with full data (coords, factors, utility, indices).
     """
+    print(f"Conducting farthest-point sampling...")
     indices_dict = farthest_point_sampling(
         coords, sizes, start_idx, seed, domain_size, fixed_indices=fixed_indices
     )
 
+    print(f"Adding to indices...")
     subsets = {}
     for size, indices in indices_dict.items():
         indices_arr = np.array(indices, dtype=int)
