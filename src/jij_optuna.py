@@ -177,6 +177,14 @@ def tune_sa(
     else:
         storage = None
     
+    if force_retune:
+        try:
+            optuna.delete_study(study_name=study_name, storage=storage)
+            if verbose:
+                print(f"  Deleted existing study '{study_name}' (force_retune)")
+        except optuna.exceptions.StudyNotFoundError:
+            pass  # no existing study, fine
+    
     if verbose:
         print(f"\n🔬 Tuning SA (sweeps={num_sweeps}, reads={num_reads})")
         print(f"  Qsum = {qsum:.4f}")
@@ -340,6 +348,14 @@ def tune_sqa(
         )
     else:
         storage = None
+
+    if force_retune:
+        try:
+            optuna.delete_study(study_name=study_name, storage=storage)
+            if verbose:
+                print(f"  Deleted existing study '{study_name}' (force_retune)")
+        except optuna.exceptions.StudyNotFoundError:
+            pass  # no existing study, fine
     
     if verbose:
         print(f"\n🔬 Tuning SQA (sweeps={num_sweeps}, reads={num_reads})")
