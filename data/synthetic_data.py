@@ -264,12 +264,10 @@ def create_nested_subsets(
     """
     Generate nested subsets with full data (coords, factors, utility, indices).
     """
-    print(f"Conducting farthest-point sampling...")
     indices_dict = farthest_point_sampling(
         coords, sizes, start_idx, seed, domain_size, fixed_indices=fixed_indices
     )
 
-    print(f"Adding to indices...")
     subsets = {}
     for size, indices in indices_dict.items():
         indices_arr = np.array(indices, dtype=int)
@@ -467,17 +465,13 @@ def generate_and_save_all(
     print(f"✓ Connected core (size {len(core_indices)}): {core_indices}")
 
     # Combine: core will be forced into all subsets
-    print(f"Adding core indices to all subsets to guarantee connectivity...")
     fixed_indices = list(set(core_indices))
-    print(f"Done.")
 
     # Step 6: Create nested subsets using FPS, forcing fixed_indices
-    print(f"Creating nested subsets...")
     center = np.array([domain_size / 2.0, domain_size / 2.0])
     dist_to_center = np.linalg.norm(coords - center, axis=1)
     start_idx = int(np.argmin(dist_to_center))
 
-    print(f"Creating nested subsets...")
     subsets = create_nested_subsets(
         coords=coords,
         factors=factors,
