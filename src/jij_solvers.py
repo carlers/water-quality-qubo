@@ -295,7 +295,6 @@ def solve_sqa_jij(
     num_reads: int = 1024,
     num_sweeps: int = 10000,
     trotter: int = 16,
-    seed: Optional[int] = 42,
     return_all: bool = False,
     verbose: bool = False,
 ) -> Dict:
@@ -339,7 +338,6 @@ def solve_sqa_jij(
             num_sweeps=num_sweeps,
             trotter=trotter,
             sparse=True,
-            seed=seed,
         )
         runtime = time.perf_counter() - start
 
