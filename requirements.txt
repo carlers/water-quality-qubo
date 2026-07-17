@@ -11,6 +11,7 @@ ommx-openjij-adapter
 ommx-pyscipopt-adapter
 jijmodeling>=2.0
 optuna>=3.0
+optuna-integration[wandb]
 gurobipy>=10.0
 pyomo
 
