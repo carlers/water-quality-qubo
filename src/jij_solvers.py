@@ -95,32 +95,28 @@ def decode_solution(solution_obj, N: int) -> np.ndarray:
 # -----------------------------------------------------------------------------
 # Helper: check feasibility (budget + connectivity)
 # -----------------------------------------------------------------------------
-def check_feasibility(x, neigh, K, fixed_indices=None):
+def check_feasibility(x, neigh, K, fixed_neighbors=None):
     num_selected = np.sum(x)
     budget_ok = (num_selected == K)
     
-    # Check fixed stations
-    fixed_ok = True
-    if fixed_indices is not None:
-        for idx in fixed_indices:
-            if x[idx] != 1:
-                fixed_ok = False
-                break
-    
-    # Check connectivity
     connectivity_ok = True
     selected = np.where(x == 1)[0]
     for i in selected:
-        if np.sum(neigh[i] * x) == 0:
+        # Check if it has a free neighbor
+        has_neighbor = np.sum(neigh[i] * x) > 0
+        # If not, check if it connects to any fixed station
+        if not has_neighbor and fixed_neighbors is not None:
+            if len(fixed_neighbors[i]) > 0:
+                has_neighbor = True
+        if not has_neighbor:
             connectivity_ok = False
             break
-
-    feasible = budget_ok and connectivity_ok and fixed_ok
+    
+    feasible = budget_ok and connectivity_ok
     return {
         "feasible": feasible,
         "budget_ok": budget_ok,
         "connectivity_ok": connectivity_ok,
-        "fixed_ok": fixed_ok,
         "num_selected": num_selected,
         "isolated_indices": [...]
     }
@@ -214,10 +210,11 @@ def solve_sa_jij(
                         quad += Q[i, j] * x_sol[i] * x_sol[j]
         
         # 6. Feasibility checks (same as before)
-        fixed_indices = instance_data.get("M_indices", [])
-        feas_detail = check_feasibility(x_sol, neigh, K, fixed_indices=fixed_indices)
+        # Inside solve_sa_jij, after computing x_sol:
+        fixed_neighbors = instance_data.get("fixed_neighbors", None)
+        feas_detail = check_feasibility(x_sol, neigh, K, fixed_neighbors=fixed_neighbors)
         feasible = feas_detail["feasible"]
-        violation_rate = compute_violation_rate(x_sol, neigh, K)
+        violation_rate = compute_violation_rate(x_sol, neigh, K, fixed_neighbors=fixed_neighbors, continuous=True)
         status = "optimal" if feasible else "infeasible"
 
         # 7. Build all_samples if requested
@@ -230,8 +227,8 @@ def solve_sa_jij(
                     if var_idx < N:
                         x_sample[var_idx] = int(round(val))
                 e_sample = compute_energy(x_sample, a, Q)
-                v_sample = compute_violation_rate(x_sample, neigh, K)
-                f_sample = check_feasibility(x_sample, neigh, K, fixed_indices=fixed_indices)
+                v_sample = compute_violation_rate(x_sample, neigh, K, fixed_neighbors=fixed_neighbors, continuous=True)
+                f_sample = check_feasibility(x_sample, neigh, K, fixed_neighbors=fixed_neighbors)
                 all_samples.append({
                     "solution": x_sample.copy(),
                     "energy": e_sample,
@@ -341,10 +338,10 @@ def solve_sqa_jij(
         
         # Compute energy and feasibility
         energy = compute_energy(x_sol, a, Q)
-        fixed_indices = instance_data.get("M_indices", [])
-        feas_detail = check_feasibility(x_sol, neigh, K, fixed_indices=fixed_indices)
+        fixed_neighbors = instance_data.get("fixed_neighbors", None)
+        feas_detail = check_feasibility(x_sol, neigh, K, fixed_neighbors=fixed_neighbors)
         feasible = feas_detail["feasible"]
-        violation_rate = compute_violation_rate(x_sol, neigh, K)
+        violation_rate = compute_violation_rate(x_sol, neigh, K, fixed_neighbors=fixed_neighbors, continuous=True)
         status = "optimal" if feasible else "infeasible"
         
         # Build all_samples if requested
@@ -361,9 +358,9 @@ def solve_sqa_jij(
                 
                 # Compute energy and violation for this sample
                 e_sample = compute_energy(x_sample, a, Q)
-                v_sample = compute_violation_rate(x_sample, neigh, K)
-                f_sample = check_feasibility(x_sample, neigh, K, fixed_indices=fixed_indices)
-                
+                v_sample = compute_violation_rate(x_sample, neigh, K, fixed_neighbors=fixed_neighbors, continuous=True)
+                f_sample = check_feasibility(x_sample, neigh, K, fixed_neighbors=fixed_neighbors)
+
                 all_samples.append({
                     "solution": x_sample.copy(),
                     "energy": e_sample,
@@ -441,9 +438,10 @@ def solve_greedy_jij(
     energy = compute_energy(x_sol, a, Q)
     runtime = time.perf_counter() - start
     
-    feas_detail = check_feasibility(x_sol, neigh, K)
+    fixed_neighbors = instance_data.get("fixed_neighbors", None)
+    feas_detail = check_feasibility(x_sol, neigh, K, fixed_neighbors=fixed_neighbors)
     feasible = feas_detail["feasible"]
-    violation_rate = compute_violation_rate(x_sol, neigh, K)
+    violation_rate = compute_violation_rate(x_sol, neigh, K, fixed_neighbors=fixed_neighbors, continuous=True)
     
     if verbose:
         print(f"    Greedy: energy={energy:.6f}, runtime={runtime:.4f}s, "

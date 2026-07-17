@@ -1091,41 +1091,48 @@ def load_jij_results(
 # NEW FUNCTIONS FOR MULTI-OBJECTIVE TUNING
 # =============================================================================
 
-def compute_violation_rate(
-    x_sol: np.ndarray,
-    neigh: np.ndarray,
-    K: int
-) -> float:
+def compute_violation_rate(x, neigh, K, fixed_neighbors=None, continuous=False):
     """
-    Compute violation rate for a solution.
+    Compute violation rate or continuous violation metric.
+    
+    Args:
+        x: binary decision vector (length N)
+        neigh: binary matrix (N x N) of connectivity among free stations
+        K: required number of selected stations
+        fixed_neighbors: optional dict mapping free index -> list of fixed station indices
+                         that are within range
+        continuous: if True, return a continuous metric (budget deviation + isolated count)
+                    if False, return discrete fraction {0.0, 0.5, 1.0}
     
     Returns:
-        0.0  -> both budget and connectivity constraints satisfied
-        0.5  -> exactly one constraint violated
-        1.0  -> both constraints violated
+        float: violation metric (continuous or discrete)
     """
-    if x_sol is None or neigh is None:
-        return 1.0
+    num_selected = np.sum(x)
+    budget_deviation = abs(num_selected - K)
+    budget_ok = (budget_deviation == 0)
     
-    x_sol = np.asarray(x_sol)
-    neigh = np.asarray(neigh)
-    selected = np.where(x_sol == 1)[0]
+    # Count isolated selected stations (no free neighbor AND no fixed neighbor)
+    selected = np.where(x == 1)[0]
+    isolated_count = 0
+    for i in selected:
+        has_free_neighbor = np.sum(neigh[i] * x) > 0
+        has_fixed_neighbor = False
+        if not has_free_neighbor and fixed_neighbors is not None:
+            if len(fixed_neighbors.get(i, [])) > 0:
+                has_fixed_neighbor = True
+        if not (has_free_neighbor or has_fixed_neighbor):
+            isolated_count += 1
+    connectivity_ok = (isolated_count == 0)
     
-    # Budget constraint
-    budget_ok = (len(selected) == K)
-    
-    # Connectivity constraint
-    if len(selected) == 0:
-        conn_ok = False
+    if continuous:
+        # Continuous metric: sum of absolute deviations and isolated count
+        # This can be used directly in Optuna objectives.
+        return float(budget_deviation + isolated_count)
     else:
-        conn_ok = all(np.any(neigh[i, selected] == 1) for i in selected)
-    
-    if budget_ok and conn_ok:
-        return 0.0
-    elif budget_ok or conn_ok:
-        return 0.5
-    else:
-        return 1.0
+        # Discrete fraction: each constraint contributes 0.5 if violated
+        budget_violation = 0.0 if budget_ok else 0.5
+        connectivity_violation = 0.0 if connectivity_ok else 0.5
+        return budget_violation + connectivity_violation
 
 
 def compute_matrix_differences(

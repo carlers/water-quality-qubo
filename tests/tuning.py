@@ -73,6 +73,7 @@ except ImportError:
 
 # ============================================================================
 # SCIP MIQP solver (sparse, using JijModeling + OMMX adapter)
+# – Now WITHOUT fixed_mask constraint (fixed stations are removed from decision variables)
 # ============================================================================
 def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Problem:
     problem = jm.Problem("WQM_MIQP_sparse", sense=jm.ProblemSense.MINIMIZE)
@@ -80,16 +81,17 @@ def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Pro
     a = problem.Placeholder("a", shape=(N,), dtype=jm.DataType.FLOAT)
     neighbor_indices = problem.Placeholder("neighbor_indices", shape=(N, max_degree), dtype=jm.DataType.NATURAL)
     neighbor_mask = problem.Placeholder("neighbor_mask", shape=(N, max_degree), dtype=jm.DataType.BINARY)
+    # fixed_mask still exists but will be set to all zeros (so it does nothing)
     fixed_mask = problem.Placeholder("fixed_mask", shape=(N,), dtype=jm.DataType.BINARY)
     K_total = problem.Placeholder("K_total", ndim=0, dtype=jm.DataType.INTEGER)
 
     x = problem.BinaryVar("x", shape=(N,))
 
-    # Linear term – i is a tuple from jm.product(N)
+    # Linear term
     linear = jm.sum(jm.product(N), lambda i: a[i[0]] * x[i[0]])
     problem += linear
 
-    # Quadratic term – e is a tuple from jm.product(num_edges)
+    # Quadratic term
     if num_edges > 0:
         edges = problem.Placeholder("edges", shape=(num_edges, 2), dtype=jm.DataType.NATURAL)
         Q_vals = problem.Placeholder("Q_vals", shape=(num_edges,), dtype=jm.DataType.FLOAT)
@@ -99,10 +101,11 @@ def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Pro
         )
         problem += quad
 
-    # Budget constraint – i is a tuple from jm.product(N)
+    # Budget constraint
     problem += problem.Constraint("budget", jm.sum(jm.product(N), lambda i: x[i[0]]) == K_total)
 
-    # Connectivity constraint – i is an Element (domain=N), so use i directly
+    # Connectivity constraint (only among free stations – but fixed stations are not variables, 
+    # so this only enforces connectivity via free stations; we will check feasibility separately)
     problem += problem.Constraint(
         "connectivity",
         lambda i: x[i] <= jm.sum(
@@ -112,7 +115,7 @@ def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Pro
         domain=N
     )
 
-    # Fixed stations – i is a tuple from jm.product(N)
+    # Fixed stations constraint – now always satisfied because fixed_mask is all zeros
     problem += problem.Constraint(
         "fixed",
         jm.sum(jm.product(N), lambda i: fixed_mask[i[0]] * (1 - x[i[0]])) == 0
@@ -126,14 +129,14 @@ def solve_scip_miqp(instance_data, verbose=False):
                 "status": "SCIP not available", "feasible": False,
                 "violation_rate": 1.0}
 
-    # Extract data
     N = instance_data["N"]
-    K_total = instance_data["K"]
+    K = instance_data["K"]   # number of NEW stations to place (fixed stations already removed)
     a = np.asarray(instance_data["a"])
     Q = np.asarray(instance_data["Q"])
-    M_indices = instance_data.get("M_indices", [])
     coords = np.asarray(instance_data["coords"])
     D_MAX = instance_data.get("D_max", 8.0)
+    # has_fixed_neighbor indicates which free stations can connect to an existing station
+    has_fixed_neighbor = instance_data.get("has_fixed_neighbor", np.zeros(N, dtype=int))
 
     # Build sparse edges from dense Q (upper triangular, non-zero)
     quad_edges = []
@@ -145,51 +148,28 @@ def solve_scip_miqp(instance_data, verbose=False):
                 quad_vals.append(float(Q[i, j]))
     num_edges = len(quad_edges)
 
-    # Build neighbor graph directly from coordinates (KDTree)
-    from scipy.spatial import cKDTree
-    tree = cKDTree(coords)
-    max_degree = 0
-    neighbor_sets = {}
-    for i in range(N):
-        idxs = tree.query_ball_point(coords[i], D_MAX)
-        nbrs = [j for j in idxs if j != i]
-        neighbor_sets[i] = nbrs
-        max_degree = max(max_degree, len(nbrs))
-    if max_degree == 0:
-        max_degree = 1
+    # Build neighbor graph among free stations (already in instance_data["neigh"])
+    neigh = np.asarray(instance_data["neigh"])  # N x N, binary
+    max_degree = max(1, np.max(np.sum(neigh, axis=1))) if N > 0 else 1
 
     neighbor_indices = np.zeros((N, max_degree), dtype=np.int32)
     neighbor_mask = np.zeros((N, max_degree), dtype=np.int8)
-    for i, nbr_list in neighbor_sets.items():
-        for k, j in enumerate(nbr_list[:max_degree]):
+    for i in range(N):
+        nbrs = np.where(neigh[i] == 1)[0]
+        for k, j in enumerate(nbrs[:max_degree]):
             neighbor_indices[i, k] = j
             neighbor_mask[i, k] = 1
-
-    # Build full binary matrix for feasibility check (same graph)
-    neigh_kdtree = np.zeros((N, N), dtype=int)
-    for i in range(N):
-        for k in range(max_degree):
-            if neighbor_mask[i, k] == 1:
-                j = neighbor_indices[i, k]
-                neigh_kdtree[i, j] = 1
-
-    # Fixed mask
-    fixed_mask = np.zeros(N, dtype=np.int8)
-    for m in M_indices:
-        if 0 <= m < N:
-            fixed_mask[m] = 1
-    print(f"  [SCIP] fixed_mask (indices forced to 1): {np.where(fixed_mask == 1)[0].tolist()}")
 
     # Build JijModeling problem
     problem = build_miqp_problem_sparse(N, max_degree, num_edges)
 
-    # Prepare data for instance
+    # Prepare data – fixed_mask is all zeros (no forced selections)
     data = {
-        "K_total": int(K_total),
+        "K_total": int(K),
         "a": a.astype(float).tolist(),
         "neighbor_indices": neighbor_indices.tolist(),
         "neighbor_mask": neighbor_mask.astype(int).tolist(),
-        "fixed_mask": fixed_mask.astype(int).tolist(),
+        "fixed_mask": [0] * N,   # dummy, no fixed stations
     }
     if num_edges > 0:
         data["edges"] = [list(edge) for edge in quad_edges]
@@ -197,10 +177,8 @@ def solve_scip_miqp(instance_data, verbose=False):
 
     instance = problem.eval(data)
 
-    # Solve with SCIP (no extra parameters for now, to avoid errors)
     start = time.perf_counter()
     try:
-        # Plain solve – works with our fixed graph
         solution = OMMXPySCIPOptAdapter.solve(instance)
     except Exception as e:
         runtime = time.perf_counter() - start
@@ -210,7 +188,7 @@ def solve_scip_miqp(instance_data, verbose=False):
 
     runtime = time.perf_counter() - start
 
-    # Extract solution
+    # Decode solution
     x_sol = np.zeros(N, dtype=int)
     if hasattr(solution, "decision_variables_df"):
         df = solution.decision_variables_df
@@ -229,26 +207,19 @@ def solve_scip_miqp(instance_data, verbose=False):
                     if 0 <= idx < N:
                         x_sol[idx] = int(value)
 
-    # --- DEBUG: print selected indices ---
     selected = np.where(x_sol == 1)[0]
-    print(f"  [SCIP] Selected indices: {selected.tolist()} (total {len(selected)})")
-    # Verify fixed stations are included
-    fixed_indices = np.where(fixed_mask == 1)[0]
-    if len(fixed_indices) > 0:
-        missing = [i for i in fixed_indices if x_sol[i] != 1]
-        if missing:
-            print(f"  ⚠️ [SCIP] Fixed stations {missing} were NOT selected!")
-        else:
-            print(f"  [SCIP] All fixed stations are correctly selected.")
+    print(f"  [SCIP] Selected free indices: {selected.tolist()} (total {len(selected)})")
 
-    # Compute energy using original a and Q
+    # Compute energy using new a, Q
     energy = compute_energy(x_sol, a, Q)
 
-    # Check feasibility using the KDTree graph (not the old neigh)
+    # Feasibility check with budget and connectivity (including fixed neighbors)
     from src.jij_solvers import check_feasibility
-    feas_detail = check_feasibility(x_sol, neigh_kdtree, K_total)
+    # Pass fixed_neighbors if available
+    fixed_neighbors = instance_data.get("fixed_neighbors", None)
+    feas_detail = check_feasibility(x_sol, neigh, K, fixed_neighbors=fixed_neighbors)
     feasible = feas_detail["feasible"]
-    violation_rate = compute_violation_rate(x_sol, neigh_kdtree, K_total)
+    violation_rate = compute_violation_rate(x_sol, neigh, K)
 
     status = "optimal" if getattr(solution, "is_optimal", False) else "feasible"
 
@@ -362,32 +333,66 @@ def run_tuning(mode="test", do_tune_sa=True, do_tune_sqa=True, force_retune=Fals
         beta=beta, delta=delta, connectivity_range=connectivity_range,
         verbose=False,
     )
-    N_total = pairwise["N_total"]
-    a = np.zeros(N_total)
-    for i, coeff in pairwise["linear"].items():
-        a[i] = coeff
-    Q = np.zeros((N_total, N_total))
-    for (i, j), coeff in pairwise["quad"].items():
-        Q[i, j] = coeff
-        Q[j, i] = coeff
-    neigh = np.zeros((N_total, N_total), dtype=int)
-    for i, nbrs in pairwise["neighbors"].items():
-        for j in nbrs:
-            neigh[i, j] = 1
-    K_new = K
-    K_total = K_new + len(M_indices)
+
+    # ===== NEW: Remove fixed stations from decision space =====
+    free_indices = [i for i in range(N) if i not in M_indices]
+    M_set = set(M_indices)
+
+    # 1. New linear coefficients (a_free)
+    a_new = np.zeros(len(free_indices))
+    for new_i, orig_i in enumerate(free_indices):
+        a_new[new_i] = pairwise["linear"].get(orig_i, 0.0)
+        # Add interactions with fixed stations
+        for m in M_set:
+            if (orig_i, m) in pairwise["quad"]:
+                a_new[new_i] += pairwise["quad"][(orig_i, m)]
+            elif (m, orig_i) in pairwise["quad"]:
+                a_new[new_i] += pairwise["quad"][(m, orig_i)]
+
+    # 2. New quadratic coefficients (Q_new)
+    Q_new = np.zeros((len(free_indices), len(free_indices)))
+    for a_idx, orig_a in enumerate(free_indices):
+        for b_idx, orig_b in enumerate(free_indices):
+            if a_idx < b_idx:
+                val = pairwise["quad"].get((orig_a, orig_b), 0.0)
+                if val != 0:
+                    Q_new[a_idx, b_idx] = val
+                    Q_new[b_idx, a_idx] = val
+
+    # 3. New neighbor graph (only among free stations)
+    neigh_new = np.zeros((len(free_indices), len(free_indices)), dtype=int)
+    for i, orig_i in enumerate(free_indices):
+        for j, orig_j in enumerate(free_indices):
+            if i != j and pairwise["neighbors"][orig_i].count(orig_j) > 0:
+                neigh_new[i, j] = 1
+
+    # 4. For connectivity, store which free stations can connect to existing stations
+    fixed_neighbors = {
+        i: [m for m in M_set if pairwise["neighbors"][orig_i].count(m) > 0]
+        for i, orig_i in enumerate(free_indices)
+    }
+    has_fixed_neighbor = np.array([len(fixed_neighbors[i]) > 0 for i in range(len(free_indices))], dtype=int)
+
+    # 5. Build reduced instance_data
     instance_data = {
-        "N": N, "K": K_total,
-        "a": a,
-        "Q": Q,
-        "neigh": neigh,
-        "coords": coords,
-        "U": U,
-        "M_indices": M_indices,
+        "N": len(free_indices),          # number of decision variables (free stations)
+        "K": K,                          # number of NEW stations to place (not +|M|)
+        "a": a_new,
+        "Q": Q_new,
+        "neigh": neigh_new,
+        "coords": coords[free_indices],  # only free stations' coordinates
+        "U": U[free_indices],
+        "M_indices": [],                 # no fixed indices in decision space
         "D_max": connectivity_range,
+        "original_indices": free_indices,
+        "fixed_indices": M_indices,
+        "fixed_neighbors": fixed_neighbors,
+        "has_fixed_neighbor": has_fixed_neighbor,   # for easy connectivity check
         "L_c": L_c, "L_w": L_w,
     }
+
     print(f"  Loaded subset N={N} with |M|={len(M_indices)}")
+    print(f"  Reduced decision space: {len(free_indices)} free stations, K={K}")
     print(f"  Linear terms: {len(pairwise['linear'])}, Quadratic terms: {len(pairwise['quad'])}")
 
     qsum = compute_qsum(instance_data)
@@ -406,7 +411,6 @@ def run_tuning(mode="test", do_tune_sa=True, do_tune_sqa=True, force_retune=Fals
             selected = np.where(scip_result["solution"] == 1)[0]
         print(f"  SCIP selected indices: {selected.tolist()} (total {len(selected)})")
         optimal_energy = scip_result["energy"]
-
     else:
         print(f"  ⚠️ SCIP failed: {scip_result['status']}. Using greedy fallback.")
         greedy = solve_greedy_jij(instance_data, verbose=False)
@@ -416,6 +420,8 @@ def run_tuning(mode="test", do_tune_sa=True, do_tune_sqa=True, force_retune=Fals
 
     # Plot SCIP deployment
     if scip_result["solution"] is not None:
+        # Note: plot_jij_deployment expects M_indices in instance_data; we now have M_indices = [],
+        # but we stored the original fixed_indices separately. We'll pass a temporary dict.
         plot_jij_deployment(
             instance_data, scip_result["solution"], {},
             save_path=PLOTS_DIR / "scip_deployment.png",

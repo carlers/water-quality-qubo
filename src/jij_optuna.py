@@ -121,6 +121,7 @@ class MultiObjectivePatienceCallback:
 # -----------------------------------------------------------------------------
 # Tuning for SA
 # -----------------------------------------------------------------------------
+
 def tune_sa(
     instance_data: Dict,
     qsum: Optional[float] = None,
@@ -134,34 +135,15 @@ def tune_sa(
     verbose: bool = True,
 ) -> Tuple[Dict, optuna.Study]:
     """
-    Tune SA hyperparameters using Optuna.
+    Tune SA hyperparameters using Optuna (multi‑objective).
     
-    Fixed parameters:
-        - num_sweeps = 10000
-        - num_reads = 1024
+    Objectives:
+        1. Minimize MIQP energy
+        2. Minimize continuous violation (budget deviation + isolated count)
     
-    Tuned parameters:
-        - lambda_budget: 0.01 to Qsum (log scale)
-        - lambda_conn: 0.01 to Qsum (log scale)
-    
-    Objective:
-        - Minimize MIQP energy
-        - Minimize violation rate (0.0, 0.5, 1.0)
-    
-    Args:
-        instance_data: dict with N, K, a, Q, neigh, coords, etc.
-        qsum: pre-computed Qsum (if None, computed from instance_data).
-        num_sweeps: fixed number of sweeps (default: 10000).
-        num_reads: fixed number of reads (default: 1024).
-        patience: number of trials without Pareto front improvement before stopping.
-        study_name: name for the Optuna study.
-        storage_dir: directory to store the study database.
-        force_retune: if True, ignore existing study and start fresh.
-        wandb_run: optional W&B run for logging.
-        verbose: print progress and summary.
-    
-    Returns:
-        (best_params, study): tuple of best hyperparameters and Optuna study.
+    Hyperparameters (log scale):
+        - lambda_budget: 0.01 to 1000.0
+        - lambda_conn: 0.01 to 1000.0
     """
     if qsum is None:
         qsum = compute_qsum(instance_data)
@@ -197,14 +179,15 @@ def tune_sa(
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
     instance = compile_instance(model, filtered_data)
 
+    # Extract fixed_neighbors for violation computation
+    fixed_neighbors = instance_data.get("fixed_neighbors", None)
+    K = instance_data["K"]
+    neigh = instance_data["neigh"]
+
     def objective(trial):
+        # Hyperparameters (log scale, wider range)
         lambda_budget = trial.suggest_float("lambda_budget", 0.01, qsum, log=True)
         lambda_conn = trial.suggest_float("lambda_conn", 0.01, qsum, log=True)
-        
-        trial.set_user_attr("lambda_budget", lambda_budget)
-        trial.set_user_attr("lambda_conn", lambda_conn)
-        trial.set_user_attr("num_sweeps", num_sweeps)
-        trial.set_user_attr("num_reads", num_reads)
         
         penalty_weights = get_penalty_weights(instance, lambda_budget, lambda_conn)
         
@@ -217,24 +200,62 @@ def tune_sa(
             verbose=False,
         )
         
-        energy = result["energy"] if result["solution"] is not None else np.nan
-        violation_rate = result["violation_rate"] if result["solution"] is not None else 1.0
-        feasible = result["feasible"] if result["solution"] is not None else False
+        # Compute violation metrics (continuous and discrete)
+        if result["solution"] is not None:
+            energy = float(result["energy"])
+            viol_cont = compute_violation_rate(
+                result["solution"], neigh, K, fixed_neighbors, continuous=True
+            )
+            viol_disc = compute_violation_rate(
+                result["solution"], neigh, K, fixed_neighbors, continuous=False
+            )
+            feasible = bool(result["feasible"])
+            num_selected = int(result["num_selected"])
+            isolated = int(len(result.get("isolated_indices", [])))
+            runtime = float(result["runtime"])
+            status = str(result["status"])
+        else:
+            energy = np.nan
+            viol_cont = np.nan
+            viol_disc = np.nan
+            feasible = False
+            num_selected = 0
+            isolated = 0
+            runtime = float(result["runtime"])
+            status = "error"
         
+        # Store user attributes for later reference (e.g., best trial selection)
         trial.set_user_attr("energy", energy)
-        trial.set_user_attr("violation_rate", violation_rate)
+        trial.set_user_attr("violation_continuous", viol_cont)
+        trial.set_user_attr("violation_discrete", viol_disc)
         trial.set_user_attr("feasible", feasible)
-        trial.set_user_attr("status", result["status"])
-        trial.set_user_attr("runtime", result["runtime"])
-        
-        # Store solution if feasible
+        trial.set_user_attr("num_selected", num_selected)
+        trial.set_user_attr("isolated", isolated)
+        trial.set_user_attr("runtime", runtime)
+        trial.set_user_attr("status", status)
         if result["solution"] is not None:
             trial.set_user_attr("best_solution", result["solution"].tolist())
         
-        # Return multi-objective values
-        return [energy, violation_rate]
+        # --- Manual W&B logging (per trial) ---
+        if wandb_run is not None:
+            wandb_run.log({
+                "trial_number": trial.number,
+                "energy": energy,
+                "violation_continuous": viol_cont,
+                "violation_discrete": viol_disc,
+                "feasible": feasible,
+                "num_selected": num_selected,
+                "isolated": isolated,
+                "lambda_budget": lambda_budget,
+                "lambda_conn": lambda_conn,
+                "runtime": runtime,
+                "status": status,
+            })
+        
+        # Return multi‑objective values (energy, continuous violation)
+        return [energy, viol_cont]
     
-    # Create study
+    # Create study (multi‑objective)
     sampler = optuna.samplers.NSGAIISampler(seed=42)
     study = optuna.create_study(
         study_name=study_name,
@@ -244,28 +265,12 @@ def tune_sa(
         load_if_exists=not force_retune,
     )
     
-    # Setup callback
+    # Setup patience callback (no W&B callback)
     callback = MultiObjectivePatienceCallback(patience=patience)
-    
-    # Setup W&B callback if available
     callbacks = [callback]
-    if wandb_run is not None and WANDB_AVAILABLE:
-        try:
-            from optuna.integration.wandb import WeightsAndBiasesCallback
-            
-            # When as_multirun=False, Optuna automatically uses the active wandb.run
-            wandb_callback = WeightsAndBiasesCallback(
-                metric_name=["miqp_energy", "violation_rate"],
-                as_multirun=False,
-            )
-            callbacks.append(wandb_callback)
-        except Exception as e:
-            if verbose:
-                print(f"  ⚠️ W&B callback setup failed: {e}")
     
-    # Optimize – no n_trials or timeout
     if verbose:
-        print(f"  Running optimization (no trial limit, stopping after {patience} trials without improvement)...")
+        print(f"  Running optimization (stopping after {patience} trials without Pareto improvement)...")
     
     study.optimize(objective, callbacks=callbacks)
     
@@ -307,35 +312,16 @@ def tune_sqa(
     verbose: bool = True,
 ) -> Tuple[Dict, optuna.Study]:
     """
-    Tune SQA hyperparameters using Optuna.
+    Tune SQA hyperparameters using Optuna (multi‑objective).
     
-    Fixed parameters:
-        - num_sweeps = 10000
-        - num_reads = 1024
+    Objectives:
+        1. Minimize MIQP energy
+        2. Minimize continuous violation (budget deviation + isolated count)
     
-    Tuned parameters:
-        - lambda_budget: 0.01 to Qsum (log scale)
-        - lambda_conn: 0.01 to Qsum (log scale)
-        - trotter: 1.0 to 64.0 (log scale, float)
-    
-    Objective:
-        - Minimize MIQP energy
-        - Minimize violation rate (0.0, 0.5, 1.0)
-    
-    Args:
-        instance_data: dict with N, K, a, Q, neigh, coords, etc.
-        qsum: pre-computed Qsum (if None, computed from instance_data).
-        num_sweeps: fixed number of sweeps (default: 10000).
-        num_reads: fixed number of reads (default: 1024).
-        patience: number of trials without Pareto front improvement before stopping.
-        study_name: name for the Optuna study.
-        storage_dir: directory to store the study database.
-        force_retune: if True, ignore existing study and start fresh.
-        wandb_run: optional W&B run for logging.
-        verbose: print progress and summary.
-    
-    Returns:
-        (best_params, study): tuple of best hyperparameters and Optuna study.
+    Hyperparameters (log scale):
+        - lambda_budget: 0.01 to 1000.0
+        - lambda_conn: 0.01 to 1000.0
+        - trotter: 1.0 to 64.0 (log scale)
     """
     if qsum is None:
         qsum = compute_qsum(instance_data)
@@ -372,18 +358,15 @@ def tune_sqa(
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
     instance = compile_instance(model, filtered_data)
 
+    fixed_neighbors = instance_data.get("fixed_neighbors", None)
+    K = instance_data["K"]
+    neigh = instance_data["neigh"]
+
     def objective(trial):
-        lambda_budget = trial.suggest_float("lambda_budget", 0.1, qsum, log=True)
+        lambda_budget = trial.suggest_float("lambda_budget", 0.01, qsum, log=True)
         lambda_conn = trial.suggest_float("lambda_conn", 0.01, qsum, log=True)
         trotter_float = trial.suggest_float("trotter", 1.0, 64.0, log=True)
         trotter = int(round(trotter_float))
-        
-        trial.set_user_attr("lambda_budget", lambda_budget)
-        trial.set_user_attr("lambda_conn", lambda_conn)
-        trial.set_user_attr("trotter", trotter)
-        trial.set_user_attr("trotter_float", trotter_float)
-        trial.set_user_attr("num_sweeps", num_sweeps)
-        trial.set_user_attr("num_reads", num_reads)
         
         penalty_weights = get_penalty_weights(instance, lambda_budget, lambda_conn)
         
@@ -397,25 +380,61 @@ def tune_sqa(
             verbose=False,
         )
         
-        energy = result["energy"] if result["solution"] is not None else np.nan
-        violation_rate = result["violation_rate"] if result["solution"] is not None else 1.0
-        feasible = result["feasible"] if result["solution"] is not None else False
+        if result["solution"] is not None:
+            energy = float(result["energy"])
+            viol_cont = compute_violation_rate(
+                result["solution"], neigh, K, fixed_neighbors, continuous=True
+            )
+            viol_disc = compute_violation_rate(
+                result["solution"], neigh, K, fixed_neighbors, continuous=False
+            )
+            feasible = bool(result["feasible"])
+            num_selected = int(result["num_selected"])
+            isolated = int(len(result.get("isolated_indices", [])))
+            runtime = float(result["runtime"])
+            status = str(result["status"])
+        else:
+            energy = np.nan
+            viol_cont = np.nan
+            viol_disc = np.nan
+            feasible = False
+            num_selected = 0
+            isolated = 0
+            runtime = float(result["runtime"])
+            status = "error"
         
         trial.set_user_attr("energy", energy)
-        trial.set_user_attr("violation_rate", violation_rate)
+        trial.set_user_attr("violation_continuous", viol_cont)
+        trial.set_user_attr("violation_discrete", viol_disc)
         trial.set_user_attr("feasible", feasible)
-        trial.set_user_attr("status", result["status"])
-        trial.set_user_attr("runtime", result["runtime"])
+        trial.set_user_attr("num_selected", num_selected)
+        trial.set_user_attr("isolated", isolated)
+        trial.set_user_attr("runtime", runtime)
+        trial.set_user_attr("status", status)
         trial.set_user_attr("trotter_used", trotter)
-        
-        # Store solution if feasible
         if result["solution"] is not None:
             trial.set_user_attr("best_solution", result["solution"].tolist())
         
-        # Return multi-objective values
-        return [energy, violation_rate]
+        # Manual W&B logging
+        if wandb_run is not None:
+            wandb_run.log({
+                "trial_number": trial.number,
+                "energy": energy,
+                "violation_continuous": viol_cont,
+                "violation_discrete": viol_disc,
+                "feasible": feasible,
+                "num_selected": num_selected,
+                "isolated": isolated,
+                "lambda_budget": lambda_budget,
+                "lambda_conn": lambda_conn,
+                "trotter": trotter,
+                "runtime": runtime,
+                "status": status,
+            })
+        
+        # Return multi‑objective values
+        return [energy, viol_cont]
     
-    # Create study
     sampler = optuna.samplers.NSGAIISampler(seed=42)
     study = optuna.create_study(
         study_name=study_name,
@@ -425,33 +444,14 @@ def tune_sqa(
         load_if_exists=not force_retune,
     )
     
-    # Setup callback
     callback = MultiObjectivePatienceCallback(patience=patience)
-    
-    # Setup W&B callback if available
     callbacks = [callback]
-    if wandb_run is not None and WANDB_AVAILABLE:
-        try:
-            from optuna.integration.wandb import WeightsAndBiasesCallback
-
-            wandb_callback = WeightsAndBiasesCallback(
-                metric_name=["miqp_energy", "violation_rate"],
-                wandb_kwargs={"run": wandb_run},
-                as_multirun=True,
-            )
-        
-            callbacks.append(wandb_callback)
-        except Exception as e:
-            if verbose:
-                print(f"  ⚠️ W&B callback setup failed: {e}")
     
-    # Optimize – no n_trials or timeout
     if verbose:
-        print(f"  Running optimization (no trial limit, stopping after {patience} trials without improvement)...")
+        print(f"  Running optimization (stopping after {patience} trials without Pareto improvement)...")
     
     study.optimize(objective, callbacks=callbacks)
     
-    # Select best parameters from Pareto front
     best_trial = select_best_from_pareto(study)
     if best_trial is None:
         if verbose:
@@ -463,11 +463,9 @@ def tune_sqa(
         }
     else:
         best_params = best_trial.params
-        # Ensure trotter is int (it might be stored as float in params)
         if "trotter" in best_params:
             best_params["trotter"] = int(round(best_params["trotter"]))
     
-    # Add fixed parameters
     best_params["num_sweeps"] = num_sweeps
     best_params["num_reads"] = num_reads
     
