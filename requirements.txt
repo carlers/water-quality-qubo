@@ -8,6 +8,7 @@ seaborn>=0.12
 # Optimization & Quantum
 openjij>=0.3
 ommx-openjij-adapter
+ommx-pyscipopt-adapter
 jijmodeling>=2.0
 optuna>=3.0
 gurobipy>=10.0
