@@ -16,7 +16,6 @@ K = 5
 N = 20
 DOMAIN_SIZE = 100
 
-!wandb login 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
 
 import sys, os, subprocess, warnings, json, time
 from pathlib import Path
@@ -24,9 +23,15 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import optuna
 import wandb
-import ommx_pyscipopt_adapter
 
+
+# Install required packages for SCIP (if missing)
+try:
+    import ommx_pyscipopt_adapter
+except ImportError:
+    !pip install -q ommx ommx-pyscipopt-adapter
 
 # Now import your local modules
 from data.synthetic_data import load_master_data, generate_and_save_all
@@ -306,7 +311,7 @@ def compute_esr_mcr(miqp_mat, qubo_mat):
 # Main tuning function
 # ============================================================================
 def run_tuning(mode="test", do_tune_sa=True, do_tune_sqa=True, force_retune=False,
-               use_wandb=False, seed=42, K=5, N=20, repo_dir=None):
+               use_wandb=False, seed=42, K=5, N=20):
     """
     Execute the tuning pipeline with the given parameters.
     """
@@ -420,35 +425,38 @@ def run_tuning(mode="test", do_tune_sa=True, do_tune_sqa=True, force_retune=Fals
     # -------------------------------------------------------------------------
     # 3. W&B
     # -------------------------------------------------------------------------
+    import os
     import wandb
-    # Check if already logged in
-    try:
-        if wandb.api.api_key is None:
-            # Try to log in programmatically (will prompt if not set)
-            wandb.login()
-    except Exception:
-        pass
+    
     wandb_run = None
     if use_wandb and WANDB_AVAILABLE:
         try:
-            wandb.init(
+            # 1. Force the API key directly into the Python environment
+            os.environ["WANDB_API_KEY"] = "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"
+            
+            # 2. Log in programmatically using the key
+            wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
+            
+            # 3. Initialize the run
+            wandb_run = wandb.init(
                 project="wqm-placement-optimization",
                 config={
                     "mode": mode,
                     "seed": seed,
                     "K": K,
                     "N": N,
-                    "tune_sa": do_tune_sa,      # boolean, not a function
-                    "tune_sqa": do_tune_sqa,    # boolean
+                    "tune_sa": do_tune_sa,      
+                    "tune_sqa": do_tune_sqa,    
                     "qsum": qsum
                 },
                 name=f"tuning_{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             )
-            wandb_run = wandb
-            print("✅ W&B logging enabled.")
+            print("✅ W&B logging enabled and authenticated.")
         except Exception as e:
             print(f"  ⚠️ W&B init failed: {e}")
             wandb_run = None
+
+    optuna.logging.set_verbosity(optuna.logging.INFO)
 
 
     # -------------------------------------------------------------------------
@@ -691,6 +699,5 @@ if __name__ == "__main__":
         use_wandb=USE_WANDB,
         seed=SEED,
         K=K,
-        N=N,
-        repo_dir=REPO_DIR
+        N=N
     )
