@@ -177,8 +177,9 @@ def _get_miqp_arrays(instance_data: Dict) -> Tuple[np.ndarray, np.ndarray]:
 
 
 # -----------------------------------------------------------------------------
-# SA solver using OMMX adapter
+# SA solver
 # -----------------------------------------------------------------------------
+
 def solve_sa_jij(
     instance_data: Dict,
     penalty_weights: Dict[int, float],
@@ -187,72 +188,66 @@ def solve_sa_jij(
     return_all: bool = False,
     verbose: bool = False,
 ) -> Dict:
-    """
-    Solve using Simulated Annealing via OMMXOpenJijSAAdapter.
-    
-    Args:
-        instance_data: dict with N, K, a, Q, neigh, coords, etc.
-        penalty_weights: dict mapping constraint ID -> penalty weight.
-        num_reads: number of independent runs.
-        num_sweeps: number of sweeps per run.
-        return_all: if True, return all samples with their energies and violation rates.
-        verbose: print progress.
-    
-    Returns:
-        dict with solution, energy, runtime, feasible, violation_rate, status, all_samples.
-    """
     N = instance_data["N"]
     K = instance_data["K"]
     a = np.asarray(instance_data["a"])
     Q = np.asarray(instance_data["Q"])
     neigh = np.asarray(instance_data["neigh"])
 
-    # Compile instance
+    # Compile instance and convert to QUBO
     model = build_augmented_model()
-    # Filter instance data to only model keys
     model_keys = {"N", "K", "a", "Q", "neigh"}
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
     instance = compile_instance(model, filtered_data)
+    qubo_dict, _ = instance.to_qubo(penalty_weights=penalty_weights)
 
     start = time.perf_counter()
     try:
-        solution = OMMXOpenJijSAAdapter.solve(
-            instance,
+        sampler = oj.SASampler()
+        response = sampler.sample_qubo(
+            qubo_dict,
             num_reads=num_reads,
             num_sweeps=num_sweeps,
-            penalty_weights=penalty_weights,
+            sparse=True,
         )
         runtime = time.perf_counter() - start
+
+        # Decode best solution (same as SQA)
+        x_sol = decode_solution(response, N)
         
-        # Decode best solution
-        x_sol = decode_solution(solution, N)
-        
-        # Compute energy and feasibility
+        # Compute energy and feasibility (same as before)
         energy = compute_energy(x_sol, a, Q)
         feas_detail = check_feasibility(x_sol, neigh, K)
         feasible = feas_detail["feasible"]
         violation_rate = compute_violation_rate(x_sol, neigh, K)
         status = "optimal" if feasible else "infeasible"
-        
-        # Build all_samples if requested
+
+        # Build all_samples if requested (identical to SQA logic)
         all_samples = []
         if return_all:
-            # OMMX solution may not expose all samples easily.
-            # We'll create a single sample with the best solution.
-            all_samples.append({
-                "solution": x_sol.copy(),
-                "energy": energy,
-                "violation_rate": violation_rate,
-                "feasible": feasible,
-                "budget_ok": feas_detail["budget_ok"],
-                "connectivity_ok": feas_detail["connectivity_ok"],
-                "num_selected": feas_detail["num_selected"],
-            })
-        
+            for idx in range(response.record.shape[0]):
+                sample_arr = response.record['sample'][idx]
+                x_sample = np.zeros(N, dtype=int)
+                for var_idx, val in zip(response.indices, sample_arr):
+                    if var_idx < N:
+                        x_sample[var_idx] = int(round(val))
+                e_sample = compute_energy(x_sample, a, Q)
+                v_sample = compute_violation_rate(x_sample, neigh, K)
+                f_sample = check_feasibility(x_sample, neigh, K)
+                all_samples.append({
+                    "solution": x_sample.copy(),
+                    "energy": e_sample,
+                    "violation_rate": v_sample,
+                    "feasible": f_sample["feasible"],
+                    "budget_ok": f_sample["budget_ok"],
+                    "connectivity_ok": f_sample["connectivity_ok"],
+                    "num_selected": f_sample["num_selected"],
+                })
+
         if verbose:
             print(f"    SA: energy={energy:.6f}, runtime={runtime:.4f}s, "
                   f"feasible={feasible}, violation_rate={violation_rate:.1f}")
-        
+
         return {
             "solution": x_sol,
             "energy": energy,
@@ -266,7 +261,7 @@ def solve_sa_jij(
             "num_selected": feas_detail["num_selected"],
             "isolated_indices": feas_detail["isolated_indices"],
         }
-    
+
     except Exception as e:
         runtime = time.perf_counter() - start
         if verbose:
