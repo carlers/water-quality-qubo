@@ -24,3 +24,4 @@ qiskit-aer>=0.13.0
 packaging
 tqdm
 wandb
+kaleido
