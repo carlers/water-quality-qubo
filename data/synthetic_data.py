@@ -333,63 +333,54 @@ def build_connected_core(
     utility: Optional[np.ndarray] = None,
 ) -> List[int]:
     """
-    Build a connected core of size at least K, starting from M_indices.
-
-    Strategy:
-        - Start with M_indices (existing stations).
-        - If already >= K, return the first K (or all, but we need exactly K for budget; we'll trim).
-        - Greedily add the point within D_max that has the highest utility,
-          or if none, the nearest point (to avoid deadlock).
-        - Continue until we have K points.
+    Build a connected core by starting with all existing legacy stations (M_indices)
+    and appending exactly K new connected candidate stations.
 
     Returns:
-        List of indices (including M_indices) of size K, guaranteed to be connected.
+        List of indices containing all M_indices plus K new candidate stations,
+        guaranteed to be structurally connected within D_max.
     """
     if K <= 0:
-        return []
+        return list(set(M_indices))
+        
     rng = np.random.RandomState(seed if seed is not None else RANDOM_SEED)
     n_total = coords.shape[0]
 
-    # Start with M_indices (ensure uniqueness and valid)
-    selected = list(set(M_indices))
-    selected = [int(i) for i in selected if 0 <= i < n_total]
+    # 1. Initialize with all existing stations (ensuring uniqueness and valid typing)
+    selected = [int(i) for i in sorted(list(set(M_indices))) if 0 <= i < n_total]
     
-    # If we already have more than K, truncate (but keep connectivity, we'll pick the first K)
-    if len(selected) >= K:
-        # To maintain connectivity, we should keep a connected subset.
-        # Since M_indices are clustered, the first K are likely connected.
-        return selected[:K]
+    # Define our target total budget size: All legacy stations + K new ones
+    target_size = len(selected) + K
 
-    # Greedy expansion
-    while len(selected) < K:
+    # 2. Greedy expansion until we satisfy the target budget size
+    while len(selected) < target_size:
         # Find candidates within D_max of any selected point
         candidates = []
         for i in range(n_total):
             if i in selected:
                 continue
-            # Check distance to any selected point
+            # Check distance to any currently selected point
             min_dist = np.min(np.linalg.norm(coords[i] - coords[selected], axis=1))
             if min_dist <= D_max:
                 candidates.append(i)
+                
         if candidates:
-            # Pick the one with highest utility (if provided)
+            # Pick the candidate with the highest utility
             if utility is not None:
-                # Exclude already selected
                 cand_util = [utility[i] for i in candidates]
                 best_idx = candidates[np.argmax(cand_util)]
             else:
-                # Random among candidates
+                # Fallback: random selection if no utility profile is provided
                 best_idx = rng.choice(candidates)
         else:
-            # No candidate within D_max; pick the nearest point (relax constraint)
-            # Compute distances from all unselected points to the current cluster
+            # Distance relaxation logic if a point is completely isolated
             distances = np.min(cdist(coords, coords[selected]), axis=1)
-            # Avoid already selected
             distances[selected] = np.inf
             best_idx = int(np.argmin(distances))
-            if best_idx == np.inf:
-                raise RuntimeError("No more points available to build core; N is too small.")
+            if best_idx == np.inf or distances[best_idx] == np.inf:
+                raise RuntimeError("No more valid points available to expand core.")
             warnings.warn(f"Connected core: no candidate within D_max; picked nearest point {best_idx}")
+            
         selected.append(best_idx)
 
     return selected
