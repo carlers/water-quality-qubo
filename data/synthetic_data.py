@@ -279,40 +279,45 @@ def create_nested_subsets(
     return subsets
 
 
-def select_existing_stations_clustered(
+def select_existing_stations_spaced(
     coords: np.ndarray,
     utility: np.ndarray,
     n_existing: int,
-    max_distance: float = 10.0,
+    min_distance: float = 12.0,  # Force legacy stations to be at least 12km apart
     seed: Optional[int] = None,
 ) -> List[int]:
     """
-    Select existing stations that are spatially coherent (clustered).
+    Select existing stations that are spaced out across the domain 
+    while prioritizing high-utility zones.
     """
-    rng = np.random.RandomState(seed if seed is not None else RANDOM_SEED)
     n_total = coords.shape[0]
     if n_existing > n_total:
-        raise ValueError(f"n_existing ({n_existing}) cannot exceed n_total ({n_total}).")
+        raise ValueError(f"n_existing ({n_existing}) cannot exceed n_total.")
     if n_existing == 0:
         return []
-    anchor_idx = int(np.argmax(utility))
-    selected = [anchor_idx]
-    if n_existing == 1:
-        return selected
+
+    # 1. Start with the highest utility site on the map
+    selected = [int(np.argmax(utility))]
+    
     for _ in range(1, n_existing):
+        # Calculate distances from all points to the already selected stations
         dists = cdist(coords, coords[selected]).min(axis=1)
-        mask = (dists <= max_distance) & (~np.isin(np.arange(n_total), selected))
-        if not np.any(mask):
-            warnings.warn(f"No points within {max_distance} km. Falling back to random selection.")
-            candidates = [i for i in range(n_total) if i not in selected]
-            if not candidates:
-                break
-            new_idx = rng.choice(candidates)
-            selected.append(int(new_idx))
-            continue
-        valid_indices = np.where(mask)[0]
-        best_idx = valid_indices[np.argmax(utility[valid_indices])]
+        
+        # Mask out points that are too close to existing stations OR already selected
+        spatial_mask = (dists >= min_distance) & (~np.isin(np.arange(n_total), selected))
+        
+        valid_indices = np.where(spatial_mask)[0]
+        
+        # If we ran out of spaced-out areas, relax the distance constraint slightly
+        if len(valid_indices) == 0:
+            # Fallback: Just take the furthest available point (standard FPS)
+            best_idx = np.argmax(dists)
+        else:
+            # Pick the site with the HIGHEST utility among the valid, spaced-out sites
+            best_idx = valid_indices[np.argmax(utility[valid_indices])]
+            
         selected.append(int(best_idx))
+        
     return selected
 
 
@@ -399,7 +404,7 @@ def generate_and_save_all(
     n_master: Optional[int] = None,
     domain_size: Optional[float] = None,
     n_existing: Optional[int] = None,
-    max_existing_distance: Optional[float] = 10.0,
+    min_existing_distance: Optional[float] = 10.0,
     subset_sizes: Optional[List[int]] = None,
     D_max: float = D_MAX,
     K: int = 5,  # NEW: K for the connected core
@@ -447,8 +452,8 @@ def generate_and_save_all(
     print(f"✓ Utility: shape {utility.shape}, range [{utility.min():.3f}, {utility.max():.3f}]")
 
     # Step 4: Select existing stations M
-    existing_indices = select_existing_stations_clustered(
-        coords, utility, n_existing, max_existing_distance, seed=seed
+    existing_indices = select_existing_stations_spaced(
+        coords, utility, n_existing, min_distance=min_existing_distance, seed=seed
     )
     print(f"✓ Existing stations (M): {existing_indices}")
 
@@ -498,7 +503,7 @@ def generate_and_save_all(
             "start_idx": start_idx,
             "description": "Synthetic dataset for water quality monitoring QUBO.",
             "created_with_seed": seed,
-            "max_existing_distance": max_existing_distance,
+            "max_existing_distance": min_existing_distance,
             "D_max": D_max,
             "K": K,
             "core_indices": core_indices,
@@ -676,7 +681,7 @@ if __name__ == "__main__":
         n_master=args.n_master,
         domain_size=args.domain_size,
         n_existing=args.n_existing,
-        max_existing_distance=args.max_existing_distance,
+        min_existing_distance=args.max_existing_distance,
         subset_sizes=subset_sizes,
         D_max=args.D_max,
         K=args.K,
