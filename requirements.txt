@@ -16,9 +16,10 @@ gurobipy>=10.0
 pyomo
 
 # Quantum computing
-qiskit>=0.45
+qiskit
 qiskit-optimization
 qiskit-aer>=0.13.0
+qamomile
 
 # Utilities
 packaging
