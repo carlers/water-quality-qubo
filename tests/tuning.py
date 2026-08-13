@@ -313,7 +313,7 @@ def run_tuning(mode="test", do_tune_sa=True, do_tune_sqa=True, force_retune=Fals
     print("\n📦 Loading/Generating synthetic data...")
     data_dir = Path(f"data_seefdd{seed}")
     if not data_dir.exists():
-        generate_and_save_all(seed=seed, output_dir=str(data_dir), n_master=500, domain_size=DOMAIN_SIZE, n_existing=3, max_existing_distance=15, subset_sizes=[20, 50, 100, 200], D_max=100)
+        generate_and_save_all(seed=seed, output_dir=str(data_dir), n_master=500, domain_size=DOMAIN_SIZE, n_existing=3, min_existing_distance=15, subset_sizes=[20, 50, 100, 200], D_max=100)
     coords_master, factors_master, U_master, subsets, meta = load_master_data(str(data_dir))
     if N not in subsets:
         raise ValueError(f"N={N} not in subsets. Available: {list(subsets.keys())}")
