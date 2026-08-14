@@ -1,14 +1,15 @@
-#@title 🔬 SA TUNE v2.13 (Dual-Trigger Mathematical Convergence + Full Rich Logging)
+#@title 🔬 SA TUNE v2.14 (Self-Discovered Convergence + Fixed Inf Tracking)
 """
 ================================================================================
-SA TUNING WITH OPTUNA v2.13 – REAL DATA (MULTI-TIER)
+SA TUNING WITH OPTUNA v2.14 – REAL DATA (MULTI-TIER)
 ================================================================================
 - Single-Objective Lexicographic: Minimize Energy -> Minimize Penalty Sum.
 - Constraint: M-th sample (e.g., 20th) must have 0 violations.
 - Strategy A (Variance Collapse): Stops when Top-5 feasible log-variance σ_logλ ≤ 0.05.
-- Strategy B (Floor Saturation): Stops when Exact Energy Floor hit 10x with no pen drop.
-- Real-time terminal HUD tracks Floor Hits, Space Variance, λb, λc, and Global Best.
-- Restores full Post-Study Tie-Break Breakdown Table & W&B Table artifact syncing.
+- Strategy B (Floor Saturation): Stops when internal Top-K Energy floor hit 10x 
+  with no penalty drop. Fully independent of SCIP ground-truth.
+- Real-time terminal HUD tracks Floor Hits, Space Variance, λb, λc, and Best Energy.
+- Full Post-Study Tie-Break Breakdown Table & W&B Table artifact syncing.
 ================================================================================
 """
 
@@ -30,8 +31,8 @@ CONFIG_SA = {
     
     # ---- Mathematical Convergence Config ----
     "WARMUP_TRIALS": 15,                # Minimum trials before ANY early stopping
-    "MAX_FLOOR_HITS": 10,               # Stop if exact ground-state floor hit 10x without penalty improvement
-    "VARIANCE_TOLERANCE": 0.05,         # Stop if joint log10 standard deviation of top parameters drops below this
+    "MAX_FLOOR_HITS": 10,               # Stop if exact internal floor hit 10x without penalty improvement
+    "VARIANCE_TOLERANCE": 0.05,         # Stop if joint log10 standard deviation drops below this
     "MIN_FEASIBLE_FOR_VARIANCE": 5,     # Require at least 5 feasible trials to calculate variance
 
     # ---- Rank-Constrained Single Objective Config ----
@@ -101,7 +102,7 @@ class MathematicalConvergenceEngine:
         if trial.state != optuna.trial.TrialState.COMPLETE:
             return
 
-        # 1. Retrieve current trial attributes
+        # 1. Retrieve current trial attributes (current_e tracks Top-3 Average)
         current_e = trial.user_attrs.get("top_k_avg_energy", float('inf'))
         current_p = trial.user_attrs.get("penalty_sum", float('inf'))
         lb = trial.user_attrs.get("lambda_budget", 0.0)
@@ -137,28 +138,35 @@ class MathematicalConvergenceEngine:
         # 4. Strategy B: Floor Saturation Tracker & Status Selection
         status_str = "❌ INFEASIBLE                        "
         if is_feas:
-            rel_tol = max(1e-6, 1e-6 * abs(self.global_best_feasible_energy))
-            
-            # Found a strictly lower energy basin
-            if current_e < self.global_best_feasible_energy - rel_tol:
+            if self.global_best_feasible_energy == float('inf'):
+                # BUGFIX: Directly capture the first valid feasible energy to avoid inf corruption
                 self.global_best_feasible_energy = current_e
                 self.best_penalty_sum = current_p
                 self.floor_hits = 1
                 status_str = "🌟 NEW BEST FEASIBLE!             "
-                
-            # Hit the existing global ground-state energy floor
-            elif abs(current_e - self.global_best_feasible_energy) <= rel_tol:
-                if current_p < self.best_penalty_sum - 1e-4:
-                    self.best_penalty_sum = current_p
-                    self.floor_hits = 1  # Reset floor counter because penalty boundary was lowered
-                    status_str = "🎯 FEASIBLE MATCH (LOWER PENALTY!)"
-                else:
-                    self.floor_hits += 1
-                    status_str = "✅ FEASIBLE MATCH                 "
-            
-            # Feasible, but worse energy than current best
             else:
-                status_str = "✅ FEASIBLE                       "
+                rel_tol = max(1e-6, 1e-6 * abs(self.global_best_feasible_energy))
+                
+                # Found a strictly lower energy basin
+                if current_e < self.global_best_feasible_energy - rel_tol:
+                    self.global_best_feasible_energy = current_e
+                    self.best_penalty_sum = current_p
+                    self.floor_hits = 1
+                    status_str = "🌟 NEW BEST FEASIBLE!             "
+                    
+                # Hit the existing internal global ground-state energy floor
+                elif abs(current_e - self.global_best_feasible_energy) <= rel_tol:
+                    if current_p < self.best_penalty_sum - 1e-4:
+                        self.best_penalty_sum = current_p
+                        self.floor_hits = 1  # Reset floor counter because penalty boundary was lowered
+                        status_str = "🎯 FEASIBLE MATCH (LOWER PENALTY!)"
+                    else:
+                        self.floor_hits += 1
+                        status_str = "✅ FEASIBLE MATCH                 "
+                
+                # Feasible, but worse energy than current internal best
+                else:
+                    status_str = "✅ FEASIBLE                       "
 
         # Record tracked global best feasible energy to trial attributes
         trial.set_user_attr("global_best_feasible_energy", self.global_best_feasible_energy if self.global_best_feasible_energy != float('inf') else None)
@@ -194,7 +202,7 @@ class MathematicalConvergenceEngine:
         # 7. Evaluate Mathematical Termination Triggers (After Warmup)
         if trial.number >= self.warmup:
             if self.floor_hits >= self.max_floor_hits:
-                print(f"\n🛑 [Early Stopping: Strategy B] Exact energy floor ({self.global_best_feasible_energy:.4f}) hit {self.max_floor_hits} times with no penalty improvement. (Best Pen: {self.best_penalty_sum:.2f})")
+                print(f"\n🛑 [Early Stopping: Strategy B] Internal Top-K energy floor ({self.global_best_feasible_energy:.4f}) hit {self.max_floor_hits} times with no penalty improvement. (Best Pen: {self.best_penalty_sum:.2f})")
                 study.stop()
             elif sigma_j <= self.var_tol:
                 print(f"\n🛑 [Early Stopping: Strategy A] Parameter space variance collapsed (σ = {sigma_j:.4f} ≤ {self.var_tol}). Search space is exhausted.")
@@ -296,7 +304,7 @@ instance_files.sort(key=lambda p: int(pattern.search(p.name).group(1)))
 
 for instance_path in instance_files:
     N_true = int(pattern.search(instance_path.name).group(1))
-    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (Mathematical Convergence Engine)\n{'='*115}")
+    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (Self-Discovered Convergence)\n{'='*115}")
 
     with open(instance_path, "rb") as f: instance_data = pickle.load(f)
     a = np.asarray(instance_data["a"])
