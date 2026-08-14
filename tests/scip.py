@@ -17,7 +17,7 @@ SHOW_PLOTS = True                # Display plots in notebook
 PLOT_DPI = 150                   # Resolution for saved plots
 
 # If set to a specific integer, solve only that tier; if None, solve all
-TARGET_N = None                    # e.g., 35 to solve only N=35
+TARGET_N = None                  # e.g., 35 to solve only N=35
 
 # -----------------------------------------------------------------------------
 # IMPORTS
@@ -32,6 +32,9 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.colors as mcolors
+from matplotlib.patches import Patch
+from scipy.interpolate import griddata
 import jijmodeling as jm
 
 # OMMX SCIP adapter (must be installed)
@@ -107,9 +110,10 @@ def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Pro
     return problem
 
 
-def solve_scip_miqp(instance_data, verbose=False, time_limit=300.0):
+def solve_scip_miqp(instance_data, verbose=False):
     """
     Solve the reduced MIQP using SCIP via OMMX adapter with EXACT global optimality enforced.
+    Time limits have been removed to guarantee exact benchmarking.
     """
     if not SCIP_AVAILABLE:
         return {"solution": None, "energy": np.nan, "runtime": 0.0,
@@ -192,7 +196,7 @@ def solve_scip_miqp(instance_data, verbose=False, time_limit=300.0):
     instance = problem.eval(data)
 
     if verbose:
-        print(f"Solving with SCIP (time_limit={time_limit}s, gap=0.0)...")
+        print(f"Solving with SCIP (gap=0.0, unlimited time)...")
     start = time.perf_counter()
 
     solution = None
@@ -203,7 +207,6 @@ def solve_scip_miqp(instance_data, verbose=False, time_limit=300.0):
         model = adapter.solver_input  # Extract raw pyscipopt.Model object
 
         # Apply exact mathematical tolerances directly to SCIP
-        model.setParam('limits/time', time_limit)
         model.setParam('limits/gap', 0.0)         # Force 0.0% relative optimality gap
         model.setParam('limits/absgap', 0.0)      # Force 0.0 absolute gap
 
@@ -282,17 +285,10 @@ def solve_scip_miqp(instance_data, verbose=False, time_limit=300.0):
         "budget_ok": feas_detail.get("budget_ok", False),
         "connectivity_ok": feas_detail.get("connectivity_ok", False),
     }
-# -----------------------------------------------------------------------------
-# FUNCTION: Plot MIQP matrix (FIXED: Vectorized & Centered Colormap)
-# -----------------------------------------------------------------------------
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib.patches import Patch
 
+# -----------------------------------------------------------------------------
+# FUNCTION: Plot MIQP matrix (Vectorized & Centered Colormap)
+# -----------------------------------------------------------------------------
 def plot_miqp_matrix_full(instance_data, save_path=None, show=True, dpi=150, title_prefix="", scale_mode="off_diagonal"):
     """
     Plot the FULL original MIQP matrix with sleek 'inactive' styling for existing stations
@@ -430,13 +426,8 @@ def plot_miqp_matrix_reduced(instance_data, save_path=None, show=True, dpi=150, 
         plt.show()
     plt.close(fig)
 
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from scipy.interpolate import griddata
-
 # -----------------------------------------------------------------------------
-# FUNCTION: Plot deployment map (FIXED: Smooth Background Utility Blending)
+# FUNCTION: Plot deployment map (Smooth Background Utility Blending)
 # -----------------------------------------------------------------------------
 def plot_deployment(instance_data, scip_result, save_path=None, show=True, dpi=150):
     """Plot the deployment map with utility values smoothly blended across the master background."""
@@ -598,6 +589,7 @@ def plot_deployment(instance_data, scip_result, save_path=None, show=True, dpi=1
     if show:
         plt.show()
     plt.close(fig)
+
 # -----------------------------------------------------------------------------
 # DISCOVER INSTANCE DATA FILES
 # -----------------------------------------------------------------------------
