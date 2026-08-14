@@ -1,15 +1,17 @@
-#@title CELL 3: HEXAGONAL RESOLUTION SCALING V3 (Idempotent + tqdm)
-# =============================================================================
-# Key features:
-#   1. Idempotent: Loads cached scaling_results.pkl if available.
-#   2. Cells snap to the CENTROID of their real member points.
-#   3. Existing stations are RESERVED as representative points of their cells.
-#   4. Utility (U) is aggregated using np.mean() and normalized against total master 
-#      sites (n_sites / true_N) to conserve total master energy scale across tiers.
-#   5. Graph connectivity (D_max and landmass-aware edge generation) is deferred
-#      entirely to the QUBO Instance Builder cell.
-#   6. tqdm progress bars for transparency.
-# =============================================================================
+#@title CELL 3: NESTED RESOLUTION SCALING (Farthest Point Sampling)
+"""
+================================================================================
+NESTED RESOLUTION SCALING VIA FARTHEST POINT SAMPLING (FPS)
+================================================================================
+- Generates a dense pool of candidate points over the lake.
+- Maps each pool point to the nearest master centroid (from the full 5417 grid).
+- Uses Farthest Point Sampling (seeded with existing stations) to select exactly 
+  1000 well‑spread free candidates in a strict ordering.
+- Nested subsets: N=20 ⊂ N=50 ⊂ N=100 ⊂ N=200 ⊂ N=500 ⊂ N=1000.
+- Exact target sizes, monotonic master energy, clean spatial layout.
+================================================================================
+"""
+
 import os
 import pickle
 import time
@@ -18,235 +20,188 @@ import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 from pathlib import Path
 import shapely
+from shapely.geometry import Point
 from tqdm.notebook import tqdm
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
 CONFIG = {
-    "target_sizes": [20, 50, 100, 200, 500, 800],  # Desired candidate counts
-    "fill_frac_grid_n": 80,                         # Grid resolution for water fraction estimate
-    "N_existing": None,                             # None = use real existing; or int to override
-    "simulate_existing_override": False,            # If True, simulate stations even if real exist
-    "min_existing_dist": 12000,                     # For fallback simulation
+    "target_sizes": [20, 50, 100, 200, 500, 1000],   # Exact N for each tier
+    "pool_size_estimate": 10000,                     # Rough number of hex centroids to generate
+    "N_existing": None,                              # None = use real existing stations
 }
 
 # -----------------------------------------------------------------------------
-# LOAD MASTER DATA (from the new Cell 2)
+# LOAD MASTER DATA (from Cell 2)
 # -----------------------------------------------------------------------------
 master_path = OUTPUT_DIR / "master_real.pkl"
 if not master_path.exists():
-    raise FileNotFoundError(f"❌ Master data not found at {master_path}. Run Cell 2 first.")
-
+    master_path = LOCAL_CACHE / "master_real.pkl"
 with open(master_path, "rb") as f:
     master = pickle.load(f)
 
-coords = master["coords"]
-U = master["U"]
-factors = master["factors"]
-M_indices_real = master["M_indices"]
+coords = master["coords"]          # (5417, 2)
+U = master["U"]                    # (5417,)
 water_polygon = master["water_polygon"]
+M_indices = master["M_indices"]    # list of existing station indices
 bbox = master["metadata"]["bbox"]
 n_sites = len(coords)
-
-shapely.prepare(water_polygon)
+M_set_global = set(M_indices)
 
 print("📦 Master data loaded.")
-print(f"   Total sites (N_master): {n_sites}")
-print(f"   Real existing stations: {len(M_indices_real)}")
-print(f"   Water polygon loaded: {type(water_polygon)}")
+print(f"   Total master sites: {n_sites}")
+print(f"   Existing stations: {len(M_indices)}")
 print(f"   BBox: {bbox}")
 
 # -----------------------------------------------------------------------------
-# DETERMINE M_indices FOR THIS RUN
+# STEP 1: GENERATE A DENSE POOL OF HEX CENTROIDS OVER THE LAKE
 # -----------------------------------------------------------------------------
-if CONFIG["N_existing"] is None:
-    M_indices = M_indices_real
-    print(f"   Using real existing stations (n={len(M_indices)})")
-else:
-    if CONFIG["simulate_existing_override"]:
-        print(f"   Simulating {CONFIG['N_existing']} stations (ignoring real ones)...")
-        from scipy.spatial.distance import cdist
-        n_existing = CONFIG["N_existing"]
-        min_dist = CONFIG["min_existing_dist"]
-        selected = [int(np.argmax(U))]
-        for _ in range(1, n_existing):
-            dists = cdist(coords, coords[selected]).min(axis=1)
-            mask = (dists >= min_dist) & (~np.isin(np.arange(n_sites), selected))
-            valid = np.where(mask)[0]
-            if len(valid) == 0:
-                best = np.argmax(dists)
-            else:
-                best = valid[np.argmax(U[valid])]
-            selected.append(int(best))
-        M_indices = selected
-    else:
-        n_existing = CONFIG["N_existing"]
-        if n_existing > len(M_indices_real):
-            print(f"   ⚠️ Override N={n_existing} > real existing ({len(M_indices_real)}). Using all real.")
-            M_indices = M_indices_real
-        else:
-            sorted_real = sorted(M_indices_real, key=lambda i: U[i], reverse=True)
-            M_indices = sorted_real[:n_existing]
-            print(f"   Using top {len(M_indices)} highest-U real existing stations.")
+def generate_hex_centroids_bbox(bbox, target_n):
+    """Generate hex grid centroids covering the bounding box."""
+    xmin, ymin, xmax, ymax = bbox
+    width = xmax - xmin
+    height = ymax - ymin
+    area = width * height
+    hex_area = area / target_n
+    spacing = np.sqrt(hex_area / (np.sqrt(3) / 2.0))
+    dx = spacing
+    dy = spacing * (np.sqrt(3) / 2.0)
 
-M_set_global = set(M_indices)
+    cols = int(np.ceil(width / dx)) + 1
+    rows = int(np.ceil(height / dy)) + 1
 
-# -----------------------------------------------------------------------------
-# CHECK FOR CACHED RESULT (Idempotency)
-# -----------------------------------------------------------------------------
-cached_path = OUTPUT_DIR / "scaling_results.pkl"
-if cached_path.exists():
-    print(f"📂 Found cached scaling results at {cached_path}. Loading...")
-    with open(cached_path, "rb") as f:
-        scaling_results = pickle.load(f)
-    print(f"   ✅ Loaded {len(scaling_results)} tiers: {sorted(scaling_results.keys())}")
-else:
-    print("🔄 No cache found. Generating grids from scratch...")
-    
-    # -------------------------------------------------------------------------
-    # HELPER: GENERATE UNIFORM HEX GRID OVER BBOX
-    # -------------------------------------------------------------------------
-    def generate_hex_centroids_bbox(bbox, target_n):
-        xmin, ymin, xmax, ymax = bbox
-        width = xmax - xmin
-        height = ymax - ymin
-        area = width * height
-        hex_area = area / target_n
-        spacing = np.sqrt(hex_area / (np.sqrt(3) / 2.0))
-        dx = spacing
-        dy = spacing * (np.sqrt(3) / 2.0)
-
-        cols = int(np.ceil(width / dx)) + 1
-        rows = int(np.ceil(height / dy)) + 1
-
-        centroids = []
-        for r in range(rows):
-            y = ymin + r * dy
-            if y > ymax:
+    centroids = []
+    for r in range(rows):
+        y = ymin + r * dy
+        if y > ymax:
+            continue
+        shift = 0.5 * dx if (r % 2 == 1) else 0.0
+        for c in range(cols):
+            x = xmin + c * dx + shift
+            if x > xmax:
                 continue
-            shift = 0.5 * dx if (r % 2 == 1) else 0.0
-            for c in range(cols):
-                x = xmin + c * dx + shift
-                if x > xmax:
-                    continue
-                centroids.append([x, y])
-        return np.array(centroids)
+            centroids.append([x, y])
+    return np.array(centroids)
 
-    # -------------------------------------------------------------------------
-    # HELPER: ESTIMATE WATER FRACTION
-    # -------------------------------------------------------------------------
-    def estimate_fill_fraction(coords, bbox, grid_n=80):
-        xmin, ymin, xmax, ymax = bbox
-        xs = np.linspace(xmin, xmax, grid_n + 1)
-        ys = np.linspace(ymin, ymax, grid_n + 1)
-        H, _, _ = np.histogram2d(coords[:, 0], coords[:, 1], bins=[xs, ys])
-        occupied = np.sum(H > 0)
-        total = grid_n * grid_n
-        return float(np.clip(occupied / total, 0.03, 1.0))
+print("\n🔹 Generating dense hex pool...")
+pool_raw = generate_hex_centroids_bbox(bbox, CONFIG["pool_size_estimate"])
+print(f"   Raw pool size: {len(pool_raw):,}")
 
-    fill_frac = estimate_fill_fraction(coords, bbox, CONFIG["fill_frac_grid_n"])
-    print(f"   Estimated water-coverage fraction of bbox: {fill_frac:.3f}")
-
-    # -------------------------------------------------------------------------
-    # RESOLUTION SCALING LOOP (with tqdm)
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 90)
-    print("🚀 Running Hexagonal Resolution Scaling (Shape-Aware, Energy-Conserved)")
-    print("=" * 90)
-    print(f"{'Target N':<10} | {'Actual N':<10} | {'Mean Cell U':<12} | {'Total System Utility':<20}")
-    print("=" * 90)
-
-    scaling_results = {}
-    target_sizes = CONFIG["target_sizes"]
-    real_tree = cKDTree(coords)
-
-    for target_N in tqdm(sorted(target_sizes), desc="Generating hex grids"):
-        t0 = time.perf_counter()
-
-        # 1. Correct the hex-grid target using estimated water fraction
-        target_N_grid = int(np.ceil(target_N / fill_frac))
-        target_N_grid = min(target_N_grid, target_N * 25)
-
-        hex_coords = generate_hex_centroids_bbox(bbox, target_N_grid)
-
-        # 2. Assign REAL coordinates to nearest hex center
-        hex_tree = cKDTree(hex_coords)
-        _, assigned_hex_idx = hex_tree.query(coords)
-        unique_cells = np.unique(assigned_hex_idx)
-        true_N = len(unique_cells)
-
-        # 3. Representative-point selection per cell & Energy scaling
-        used_master_idx = set()
-        snapped_indices = np.zeros(true_N, dtype=int)
-        agg_factors = np.zeros((true_N, 8), dtype=np.float64)
-        agg_U = np.zeros(true_N, dtype=np.float64)
-
-        # Scaling factor to conserve master total energy scale
-        tier_energy_scale = n_sites / true_N
-
-        for i, cell in enumerate(unique_cells):
-            member_idx = np.where(assigned_hex_idx == cell)[0]
-            agg_factors[i] = np.nanmean(factors[member_idx], axis=0)
-            agg_U[i] = np.mean(U[member_idx]) * tier_energy_scale
-
-            station_members = [m for m in member_idx if m in M_set_global]
-            if station_members:
-                rep = int(station_members[0])
-            else:
-                centroid = coords[member_idx].mean(axis=0)
-                k_search = 8
-                rep = None
-                while rep is None:
-                    k = min(k_search, n_sites)
-                    dists, cand_idx = real_tree.query(centroid, k=k)
-                    cand_idx = np.atleast_1d(cand_idx)
-                    for c in cand_idx:
-                        if c not in used_master_idx:
-                            rep = int(c)
-                            break
-                    if rep is None:
-                        if k_search >= n_sites:
-                            rep = int(np.atleast_1d(cand_idx)[0])
-                            break
-                        k_search *= 2
-
-            used_master_idx.add(rep)
-            snapped_indices[i] = rep
-
-        coords_tier = coords[snapped_indices]
-
-        # 4. Map existing stations into this tier
-        M_tier = [i for i, orig_idx in enumerate(snapped_indices) if orig_idx in M_set_global]
-        M_orig_tier = [int(orig_idx) for orig_idx in snapped_indices if orig_idx in M_set_global]
-
-        total_utility = agg_U.sum()
-        mean_utility = agg_U.mean()
-
-        print(f"{target_N:<10} | {true_N:<10} | {mean_utility:<12.4f} | {total_utility:<20.4f}")
-
-        scaling_results[true_N] = {
-            "coords": coords_tier,
-            "U": agg_U,
-            "factors": agg_factors,
-            "M_indices": M_tier,
-            "M_orig_indices": M_orig_tier,
-            "snapped_indices": snapped_indices,
-        }
-
-    print("=" * 90)
-
-    # -------------------------------------------------------------------------
-    # SAVE CACHED RESULTS
-    # -------------------------------------------------------------------------
-    with open(cached_path, "wb") as f:
-        pickle.dump(scaling_results, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"✅ Cached scaling results to {cached_path}")
+# Filter to keep only points strictly inside the water polygon
+shapely.prepare(water_polygon)
+pool_water = []
+for pt in tqdm(pool_raw, desc="Filtering water points"):
+    if water_polygon.contains(Point(pt)):
+        pool_water.append(pt)
+pool_coords = np.array(pool_water, dtype=float)
+print(f"   Pool points inside water: {len(pool_coords):,}")
 
 # -----------------------------------------------------------------------------
-# PLOTTING (Candidate grids per tier)
+# STEP 2: MAP EACH POOL POINT TO THE NEAREST MASTER CENTROID
 # -----------------------------------------------------------------------------
-print("\n📊 Plotting resolution scaling candidate grids...")
+master_tree = cKDTree(coords)
+dist, pool_to_master = master_tree.query(pool_coords, k=1)
+pool_to_master = pool_to_master.flatten().astype(int)
+
+# Exclude pool points that map to an existing station
+free_mask = ~np.isin(pool_to_master, list(M_set_global))
+pool_coords_free = pool_coords[free_mask]
+pool_to_master_free = pool_to_master[free_mask]
+print(f"   Pool points mapped to free master indices: {len(pool_coords_free):,}")
+
+# Retrieve the master coordinates and utility for each pool point
+pool_master_coords = coords[pool_to_master_free]
+pool_U = U[pool_to_master_free]
+
+# -----------------------------------------------------------------------------
+# STEP 3: FARTHEST POINT SAMPLING (Seeded with existing stations)
+# -----------------------------------------------------------------------------
+print("\n🔹 Running Farthest Point Sampling (seeded with existing stations)...")
+
+# Seeds: coordinates of existing stations
+seed_coords = coords[list(M_set_global)]
+
+# Number of free points to select = max target size (1000)
+n_select = 1000
+
+# KDTree for seeds to compute initial distances
+seed_tree = cKDTree(seed_coords)
+# For each pool point, compute distance to the nearest seed
+min_dist = seed_tree.query(pool_coords_free, k=1)[0].flatten()
+
+selected_indices = []       # indices in pool_coords_free
+selected_coords = []        # corresponding master coordinates
+selected_master_indices = []  # master indices
+
+# We'll also keep track of all pool points and update distances
+for _ in tqdm(range(n_select), desc="FPS iterations"):
+    # Find the pool point with largest minimum distance
+    idx = np.argmax(min_dist)
+    selected_indices.append(idx)
+    selected_coords.append(pool_master_coords[idx])
+    selected_master_indices.append(pool_to_master_free[idx])
+    
+    # Update min_dist for all remaining points
+    # Compute distance from newly selected point to all others
+    new_point = pool_master_coords[idx]
+    # We could compute distances from new_point to all pool points using KDTree,
+    # but for simplicity we compute Euclidean distances directly (pool size ~6000, OK)
+    dist_to_new = np.linalg.norm(pool_master_coords - new_point, axis=1)
+    # Update min_dist = min(min_dist, dist_to_new)
+    min_dist = np.minimum(min_dist, dist_to_new)
+    
+    # Set the distance of selected point to -1 to avoid reselection
+    min_dist[idx] = -1.0
+
+# The order of selection gives the nested ordering.
+# selected_master_indices now contains exactly 1000 free master indices,
+# ordered by farthest-point sampling.
+
+print(f"   Selected {len(selected_master_indices)} free points via FPS.")
+
+# -----------------------------------------------------------------------------
+# STEP 4: BUILD NESTED TIERS FOR EACH TARGET N
+# -----------------------------------------------------------------------------
+print("\n🔹 Building nested tiers for exact target sizes...")
+
+scaling_results = {}
+
+for N in CONFIG["target_sizes"]:
+    # Take the first N free points from the FPS order
+    free_master_indices = selected_master_indices[:N]
+    free_coords = coords[free_master_indices]
+    free_U = U[free_master_indices]
+    
+    # Combine with fixed stations (existing)
+    # We'll create a combined list: first all free, then fixed stations
+    all_master_indices = list(free_master_indices) + M_indices
+    all_coords = np.vstack([free_coords, coords[M_indices]])
+    all_U = np.concatenate([free_U, U[M_indices]])
+    
+    # M_indices for this tier: indices of the fixed stations in the combined array
+    # Free indices are 0..N-1, fixed are N..N+len(M_indices)-1
+    M_tier = list(range(N, N + len(M_indices)))
+    
+    # snapped_indices: master indices corresponding to each entry in all_coords
+    snapped_indices = np.array(all_master_indices, dtype=int)
+    
+    # Store
+    scaling_results[N] = {
+        "coords": all_coords,
+        "U": all_U,
+        "M_indices": M_tier,
+        "M_orig_indices": M_indices,   # original master indices of fixed stations
+        "snapped_indices": snapped_indices,
+        "free_master_indices": free_master_indices,   # for reference
+    }
+    
+    print(f"   N={N:4d}: free={N}, fixed={len(M_indices)}, total={len(all_coords)}")
+
+# -----------------------------------------------------------------------------
+# STEP 5: PLOT THE NESTED CANDIDATE GRIDS
+# -----------------------------------------------------------------------------
+print("\n📊 Plotting nested candidate grids...")
 tiers = sorted(scaling_results.keys())
 n_tiers = len(tiers)
 cols = 2
@@ -260,19 +215,21 @@ for ax, N in zip(axes, tiers):
     coords_tier = res["coords"]
     U_tier = res["U"]
     M_tier = res["M_indices"]
-
+    
     # Faint master footprint
     ax.scatter(coords[:, 0], coords[:, 1], c="lightgray", s=4, alpha=0.35, zorder=0)
-
+    
+    # Candidates (free + fixed)
     sc = ax.scatter(coords_tier[:, 0], coords_tier[:, 1],
-                     c=U_tier, cmap="viridis", s=60,
-                     edgecolor="k", linewidth=0.3, alpha=0.9, zorder=2)
-
+                    c=U_tier, cmap="viridis", s=60,
+                    edgecolor="k", linewidth=0.3, alpha=0.9, zorder=2)
+    
+    # Existing stations (fixed)
     if len(M_tier) > 0:
         ax.scatter(coords_tier[M_tier, 0], coords_tier[M_tier, 1],
-                    c="red", marker="*", s=250, edgecolor="black",
-                    linewidth=0.5, zorder=5, label="Existing")
-
+                   c="red", marker="*", s=250, edgecolor="black",
+                   linewidth=0.5, zorder=5, label="Existing")
+    
     ax.set_title(f"N={N} | Total U={U_tier.sum():.1f}", fontsize=10, fontweight="bold")
     ax.set_xlabel("Easting (m)")
     ax.set_ylabel("Northing (m)")
@@ -286,10 +243,20 @@ cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
 sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin=min(r['U'].min() for r in scaling_results.values()), 
                                                               vmax=max(r['U'].max() for r in scaling_results.values())))
 sm.set_array([])
-fig.colorbar(sm, cax=cbar_ax, label="Scaled Utility U_i")
+fig.colorbar(sm, cax=cbar_ax, label="Utility U_i")
 
-plt.suptitle("Real Data: Hexagonal Candidate Grids (Energy-Conserved)", fontsize=14, fontweight="bold", y=1.02)
+plt.suptitle("Nested Resolution Scaling (Farthest Point Sampling)", fontsize=14, fontweight="bold", y=1.02)
 plt.tight_layout(rect=[0, 0, 0.9, 1])
 plt.show()
 
-print("✅ Candidate grid generation complete.")
+# -----------------------------------------------------------------------------
+# STEP 6: SAVE RESULTS (CACHED)
+# -----------------------------------------------------------------------------
+cached_path = OUTPUT_DIR / "scaling_results.pkl"
+if not cached_path.exists():
+    cached_path = LOCAL_CACHE / "scaling_results.pkl"
+with open(cached_path, "wb") as f:
+    pickle.dump(scaling_results, f, protocol=pickle.HIGHEST_PROTOCOL)
+print(f"✅ Cached scaling results to {cached_path}")
+
+print("\n✅ Nested resolution scaling complete.")
