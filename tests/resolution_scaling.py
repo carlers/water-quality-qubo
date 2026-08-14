@@ -1,4 +1,4 @@
-#@title 🗺️ HEXAGONAL RESOLUTION SCALING V2 (SHAPE-AWARE, DENSITY-CONTROLLED)
+#@title 🗺️ HEXAGONAL RESOLUTION SCALING V2 (SHAPE-AWARE, MEAN-UTILITY)
 # =============================================================================
 # Key features:
 #   1. Cells snap to the CENTROID of their real member points so aggregation
@@ -7,6 +7,8 @@
 #   3. D_max targets a fixed AVERAGE DEGREE per tier from k-NN spacing.
 #   4. Candidate adjacency edges are FILTERED against the water polygon mask
 #      so edges never cut across landmasses (islands or peninsulas).
+#   5. Utility (U) is aggregated using np.mean() to prevent boundary cells 
+#      from artificially sinking in value due to lower point counts.
 # =============================================================================
 import os
 import pickle
@@ -145,7 +147,7 @@ print(f"   Estimated water-coverage fraction of bbox: {fill_frac:.3f}")
 print("\n" + "=" * 100)
 print("🚀 Running Hexagonal Resolution Scaling V2 (Shape-Aware, Density-Controlled)")
 print("=" * 100)
-print(f"{'Target N':<10} | {'Actual N':<10} | {'D_max (m)':<12} | {'Avg Degree':<10} | {'Target Deg':<10} | {'Utility Mass':<12}")
+print(f"{'Target N':<10} | {'Actual N':<10} | {'D_max (m)':<12} | {'Avg Degree':<10} | {'Target Deg':<10} | {'Total Utility':<12}")
 print("=" * 100)
 
 scaling_results = {}
@@ -178,8 +180,11 @@ for target_N in sorted(target_sizes):
 
     for i, cell in enumerate(unique_cells):
         member_idx = np.where(assigned_hex_idx == cell)[0]
+        
         agg_factors[i] = np.nanmean(factors[member_idx], axis=0)
-        agg_U[i] = np.sum(U[member_idx])
+        
+        # 🟢 FIX: Use np.mean instead of np.sum to preserve edge utility
+        agg_U[i] = np.mean(U[member_idx])
 
         station_members = [m for m in member_idx if m in M_set_global]
         if station_members:
@@ -313,7 +318,7 @@ for ax in axes[n_tiers:]:
 cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
 sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin=0, vmax=1))
 sm.set_array([])
-fig.colorbar(sm, cax=cbar_ax, label="Utility U_i (mass conserved)")
+fig.colorbar(sm, cax=cbar_ax, label="Utility U_i (Mean)")
 
 plt.suptitle("Real Data: Hexagonal Resolution Scaling V2 (Shape-Aware)", fontsize=14, fontweight="bold", y=1.02)
 plt.tight_layout(rect=[0, 0, 0.9, 1])
