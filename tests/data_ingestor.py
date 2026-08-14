@@ -1,20 +1,19 @@
 #@title REAL DATA INGESTOR + UTILITY HEATMAP
 # =============================================================================
 import json
+import os
 import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 from pathlib import Path
+import shapely
+from shapely.geometry import MultiPoint, Polygon
 
 # -----------------------------------------------------------------------------
 # USER CONFIGURATION
 # -----------------------------------------------------------------------------
-DRIVE_BASE = "/content/drive/MyDrive"
-from pathlib import Path
-
-# Convert BOTH to Path objects
-DRIVE_BASE = Path("/content/drive/MyDrive")  # <-- ADD Path() here
+DRIVE_BASE = Path("/content/drive/MyDrive")
 LOCAL_CACHE = Path("./cache")
 
 GEOJSON_PATH = os.path.join(DRIVE_BASE, "water_quality_results", "LDB_centroids_clean.geojson")
@@ -31,7 +30,6 @@ print(f"✅ GeoJSON found: {GEOJSON_PATH}")
 # 8 weights for the descriptive factors (sum to 1.0)
 # Order: a1, a2, b1, b2, c1, c2, d1, d2
 WEIGHTS = np.array([0.3671, 0.1224, 0.2508, 0.0502, 0.1278, 0.0183, 0.0476, 0.0159], dtype=np.float64)
-#WEIGHTS = np.array([0.05, 0.04, 0.85, 0.02, 0.01, 0.01, 0.01, 0.01], dtype=np.float64)
 
 FACTOR_NAMES = [
     "a1_river_proximity",
@@ -43,6 +41,9 @@ FACTOR_NAMES = [
     "d1_boatramp_proximity",
     "d2_road_proximity",
 ]
+
+# Concave Hull tightness (0.0 = tightest fit around points, 1.0 = convex hull)
+HULL_RATIO = 0.15
 
 # Fallback existing station simulation (if no real ones exist)
 N_EXISTING_FALLBACK = 3
@@ -105,8 +106,6 @@ if np.any(has_existing):
     print(f"   📍 Using {len(M_indices)} real existing stations from GeoJSON.")
 else:
     print("   ⚠️  No 'has_existing_station: true' found. Falling back to simulation...")
-    # Use your synthetic `select_existing_stations_spaced` logic
-    # (I'll inline a simplified version here to avoid dependency)
     from scipy.spatial.distance import cdist
     n_existing = N_EXISTING_FALLBACK
     min_dist = MIN_EXISTING_DIST_FALLBACK
@@ -124,11 +123,30 @@ else:
     print(f"   📍 Simulated {len(M_indices)} existing stations: {M_indices}")
 
 # -----------------------------------------------------------------------------
-# PLOT: Utility Heatmap + Existing Stations
+# GENERATE CONCAVE HULL LAND/WATER MASK
+# -----------------------------------------------------------------------------
+print("🗺️ Generating Concave Hull water boundary mask...")
+multi_pt = MultiPoint(coords)
+laguna_water_polygon = shapely.concave_hull(multi_pt, ratio=HULL_RATIO, allow_holes=True)
+print("   ✅ Laguna de Bay land/water boundary mask created.")
+
+# -----------------------------------------------------------------------------
+# PLOT: Utility Heatmap + Water Boundary Mask + Existing Stations
 # -----------------------------------------------------------------------------
 fig, ax = plt.subplots(figsize=(10, 8))
+
+# Draw concave hull polygon in the background
+if isinstance(laguna_water_polygon, Polygon):
+    x, y = laguna_water_polygon.exterior.xy
+    ax.fill(x, y, alpha=0.15, fc="skyblue", ec="blue", linewidth=1.2, label="Water Polygon Mask", zorder=0)
+    
+    # Draw interior holes (e.g., landmasses like Talim Island)
+    for interior in laguna_water_polygon.interiors:
+        ix, iy = interior.xy
+        ax.fill(ix, iy, alpha=0.4, fc="bisque", ec="saddlebrown", linewidth=1.2, label="Landmass Hole", zorder=1)
+
 sc = ax.scatter(coords[:, 0], coords[:, 1], c=U, cmap="viridis",
-                s=30, alpha=0.8, edgecolor="k", linewidth=0.2, label="Candidate sites")
+                s=30, alpha=0.8, edgecolor="k", linewidth=0.2, label="Candidate sites", zorder=2)
 
 # Overlay existing stations
 ax.scatter(coords[M_indices, 0], coords[M_indices, 1],
@@ -137,9 +155,9 @@ ax.scatter(coords[M_indices, 0], coords[M_indices, 1],
 
 ax.set_xlabel("Easting (m) – EPSG:32651")
 ax.set_ylabel("Northing (m) – EPSG:32651")
-ax.set_title("Real Centroids: Utility Score (U_i) and Existing Stations", fontweight="bold")
+ax.set_title("Real Centroids: Utility Score (U_i), Water Mask, and Existing Stations", fontweight="bold")
 cbar = plt.colorbar(sc, ax=ax, label="Utility U_i (weighted average)")
-ax.legend()
+ax.legend(loc="upper right")
 ax.set_aspect("equal")
 plt.tight_layout()
 plt.show()
@@ -153,6 +171,7 @@ master_data = {
     "U": U,
     "M_indices": M_indices,
     "has_existing": has_existing,
+    "water_polygon": laguna_water_polygon,  # Included land mask polygon
     "metadata": {
         "n_sites": n_sites,
         "weights": WEIGHTS.tolist(),
@@ -161,6 +180,7 @@ master_data = {
                  coords[:, 0].max(), coords[:, 1].max()],
         "n_existing_real": int(np.sum(has_existing)),
         "n_existing_used": len(M_indices),
+        "hull_ratio": HULL_RATIO
     }
 }
 
