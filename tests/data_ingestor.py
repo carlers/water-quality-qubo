@@ -1,4 +1,10 @@
-#@title CELL 2: REAL DATA INGESTOR + MASTER MIQP BUILDER (Full Sparse)
+#@title CELL 2: REAL DATA INGESTOR + MASTER MIQP (Sequential Optimized)
+# =============================================================================
+# REVISION: Fully sequential, no multiprocessing overhead.
+# - Endpoint pre-filter: skips pairs whose endpoints are not in water.
+# - Single-pass loop combines connectivity and quadratic edges.
+# - tqdm progress bar for visibility.
+# - Saves a_master and Q_master_edges (sparse) into master_real.pkl.
 # =============================================================================
 import json
 import os
@@ -8,7 +14,10 @@ import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 from pathlib import Path
 import shapely
-from shapely.geometry import MultiPoint, Polygon, LineString   # <-- added LineString
+from shapely.geometry import MultiPoint, Polygon, LineString, Point
+from tqdm.notebook import tqdm
+import warnings
+warnings.filterwarnings('ignore')
 
 # -----------------------------------------------------------------------------
 # USER CONFIGURATION
@@ -20,10 +29,8 @@ GEOJSON_PATH = os.path.join(DRIVE_BASE, "water_quality_results", "LDB_centroids_
 OUTPUT_DIR = Path(os.path.join(DRIVE_BASE, "wqm_data"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Verify file exists
 if not os.path.exists(GEOJSON_PATH):
-    raise FileNotFoundError(f"❌ GeoJSON not found at: {GEOJSON_PATH}\n"
-                            f"Please check the filename and folder path.")
+    raise FileNotFoundError(f"❌ GeoJSON not found at: {GEOJSON_PATH}")
 
 print(f"✅ GeoJSON found: {GEOJSON_PATH}")
 
@@ -41,16 +48,10 @@ FACTOR_NAMES = [
     "d2_road_proximity",
 ]
 
-# Concave Hull tightness
 HULL_RATIO = 0.05
-
-# Fallback existing station simulation
 N_EXISTING_FALLBACK = 3
-MIN_EXISTING_DIST_FALLBACK = 12000  # meters
+MIN_EXISTING_DIST_FALLBACK = 12000
 
-# -----------------------------------------------------------------------------
-# MASTER QUBO CONFIG (mirrors Cell 4 exactly)
-# -----------------------------------------------------------------------------
 MASTER_QUBO_CONFIG = {
     "L_c": 7500.0,                # Spatial correlation length (meters)
     "L_w": 1000.0,                # Wake persistence length (meters)
@@ -97,6 +98,7 @@ print(f"   ✅ Found {np.sum(has_existing)} sites with 'has_existing_station': t
 # COMPUTE UTILITY U_i
 # -----------------------------------------------------------------------------
 def compute_utility(factors, weights):
+    """Weighted average of non-null factors, normalized to [0,1]."""
     valid_mask = ~np.isnan(factors)
     numerator = np.nansum(factors * weights, axis=1)
     denominator = np.nansum(weights * valid_mask, axis=1)
@@ -143,11 +145,11 @@ shapely.prepare(laguna_water_polygon)
 print("   ✅ Laguna de Bay land/water boundary mask created.")
 
 # -----------------------------------------------------------------------------
-# BUILD MASTER MIQP (Full N=5417) – Sparse Representation
+# BUILD MASTER MIQP – SEQUENTIAL OPTIMIZED (No multiprocessing)
 # -----------------------------------------------------------------------------
-print("\n🔧 Building Master MIQP (full grid) for global objective evaluation...")
+print("\n🔧 Building Master MIQP (full grid) with sequential optimized loop...")
 
-# ----- Helper: compute global D_max from existing stations -----
+# -- Calculate global D_max --
 master_M_coords = coords[list(M_set_global)]
 if len(master_M_coords) > 1:
     M_tree = cKDTree(master_M_coords)
@@ -155,143 +157,95 @@ if len(master_M_coords) > 1:
     max_nn_dist = np.max(dists[:, 1])
     global_D_max = max_nn_dist * MASTER_QUBO_CONFIG["D_max_buffer"]
 else:
-    print("⚠️ Less than 2 existing stations. Using default D_max.")
     global_D_max = 15000.0
 print(f"   Global D_max = {global_D_max:.2f} m")
 
-# ----- Pairwise term function (identical to Cell 4 logic) -----
-def compute_pairwise_terms_shape_aware(
-    coords: np.ndarray,
-    U: np.ndarray,
-    M_indices: list,
-    water_polygon: shapely.geometry.Polygon,
-    L_c: float,
-    L_w: float,
-    current_vector: tuple,
-    global_D_max: float,
-    beta: float = 1.0,
-    delta: float = 1.0,
-) -> dict:
+# -- Prepare flow vector --
+v_norm = np.linalg.norm(MASTER_QUBO_CONFIG["Current_vector"])
+v_unit = np.array(MASTER_QUBO_CONFIG["Current_vector"]) / v_norm
+
+# -- Get all candidate pairs (within D_max) --
+tree = cKDTree(coords)
+print("   Querying spatial pairs...")
+pairs = np.array(list(tree.query_pairs(r=global_D_max)))
+print(f"   Total candidate pairs: {len(pairs):,}")
+
+# -- Unpack config constants --
+L_c = MASTER_QUBO_CONFIG["L_c"]
+L_w = MASTER_QUBO_CONFIG["L_w"]
+beta = MASTER_QUBO_CONFIG["Beta"]
+delta = MASTER_QUBO_CONFIG["Delta"]
+L_c_2 = 2.0 * L_c
+poly = laguna_water_polygon
+
+all_valid_edges = []
+all_quad_edges = []
+
+# -- Sequential loop with pre-filter and single pass --
+for i, j in tqdm(pairs, desc="🔹 Processing geometry pairs", unit="pairs"):
+    p1 = coords[i]
+    p2 = coords[j]
     
-    N_total = coords.shape[0]
-    free_indices = [i for i in range(N_total) if i not in M_indices]
-    free_set = set(free_indices)
-    M_set = set(M_indices)
-
-    shapely.prepare(water_polygon)
-    tree = cKDTree(coords)
+    # OPTIMIZATION: If either endpoint is on land, skip LineString creation entirely
+    if not (poly.contains(Point(p1)) and poly.contains(Point(p2))):
+        continue
     
-    v_norm = np.linalg.norm(current_vector)
-    if v_norm == 0:
-        raise ValueError("current_vector cannot be zero.")
-    v_unit = np.array(current_vector) / v_norm
-
-    # Build connectivity graph (within D_max)
-    valid_edges = set()
-    pairs_dmax = tree.query_pairs(r=global_D_max)
-    for i, j in pairs_dmax:
-        p1, p2 = coords[i], coords[j]
-        edge_line = LineString([p1, p2])
-        if water_polygon.contains(edge_line):
-            valid_edges.add((i, j))
-            
-    neighbor_dict = {i: [] for i in free_indices}
-    for i, j in valid_edges:
-        if i in free_set and j in free_set:
-            neighbor_dict[i].append(j)
-            neighbor_dict[j].append(i)
-        elif i in free_set and j in M_set:
-            neighbor_dict[i].append(j)
-        elif j in free_set and i in M_set:
-            neighbor_dict[j].append(i)
-    for i in neighbor_dict:
-        neighbor_dict[i] = sorted(set(neighbor_dict[i]))
-
-    # Compute raw quadratic interactions (within 2*L_c)
-    raw_quad = {}
-    pairs_within = tree.query_pairs(r=2.0 * L_c)
-    for i, j in pairs_within:
-        p1, p2 = coords[i], coords[j]
-        edge_line = LineString([p1, p2])
-        if not water_polygon.contains(edge_line):
-            continue
-
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-        d = np.sqrt(dx * dx + dy * dy)
-        if d == 0:
-            continue
-
+    line = LineString([p1, p2])
+    if not poly.contains(line):
+        continue
+    
+    # Connectivity edge (for D_max)
+    all_valid_edges.append((i, j))
+    
+    # Quadratic interaction (within 2*L_c)
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    d = np.sqrt(dx*dx + dy*dy)
+    if d <= L_c_2 and d > 0:
         R_ij = max(0.0, 1.0 - d / L_c)
+        
         cos_theta = (dx * v_unit[0] + dy * v_unit[1]) / d
         cos_theta = np.clip(cos_theta, -1.0, 1.0)
         W_ij = (np.exp(-d / L_w) * cos_theta) if cos_theta > 0.7071 else 0.0
-
+        
         cos_theta_ji = (-dx * v_unit[0] + -dy * v_unit[1]) / d
         cos_theta_ji = np.clip(cos_theta_ji, -1.0, 1.0)
         W_ji = (np.exp(-d / L_w) * cos_theta_ji) if cos_theta_ji > 0.7071 else 0.0
-
+        
         coeff = beta * R_ij + delta * (W_ij + W_ji)
-        raw_quad[(i, j)] = coeff
-        raw_quad[(j, i)] = coeff
+        if abs(coeff) > 1e-12:
+            all_quad_edges.append((i, j, coeff))
 
-    # Build linear terms (absorb fixed stations)
-    linear = {}
-    for i in free_indices:
-        val = -U[i]
-        for m in M_indices:
-            key = (i, m) if i < m else (m, i)
-            if key in raw_quad:
-                val += raw_quad[key]
-        linear[i] = val
+print(f"   ✅ Connectivity edges: {len(all_valid_edges):,}")
+print(f"   ✅ Non-zero quadratic edges: {len(all_quad_edges):,}")
 
-    # Build free-free quadratic edges (only i<j, non-zero)
-    quad_edges = []
-    for i in free_indices:
-        for j in free_indices:
-            if i < j:
-                key = (i, j)
-                if key in raw_quad:
-                    val = raw_quad[key]
-                    if abs(val) > 1e-12:
-                        quad_edges.append((i, j, val))
+# -- Build master linear terms (absorbing fixed stations) --
+free_indices = [i for i in range(n_sites) if i not in M_set_global]
+M_indices_list = list(M_set_global)
 
-    return {
-        "linear": linear,
-        "quad_edges": quad_edges,
-        "neighbors": neighbor_dict,
-        "valid_edges": valid_edges,
-        "N_total": N_total,
-        "N_free": len(free_indices),
-        "free_indices": free_indices,
-        "M_indices": M_indices,
-    }
-
-# ----- Compute master pairwise terms -----
-master_pairwise = compute_pairwise_terms_shape_aware(
-    coords=coords,
-    U=U,
-    M_indices=M_indices,
-    water_polygon=laguna_water_polygon,
-    L_c=MASTER_QUBO_CONFIG["L_c"],
-    L_w=MASTER_QUBO_CONFIG["L_w"],
-    current_vector=MASTER_QUBO_CONFIG["Current_vector"],
-    global_D_max=global_D_max,
-    beta=MASTER_QUBO_CONFIG["Beta"],
-    delta=MASTER_QUBO_CONFIG["Delta"],
-)
-
-# Build a_master as a full-length array (default 0)
+# Initialize linear array
 a_master = np.zeros(n_sites, dtype=np.float64)
-for idx, val in master_pairwise["linear"].items():
-    a_master[idx] = val
 
-# Q_master stored as sparse edges (i, j, val) with i < j
-Q_master_edges = master_pairwise["quad_edges"]  # list of (i, j, val)
+# Base utility (negative for minimization)
+for i in free_indices:
+    a_master[i] = -U[i]
 
-print(f"   ✅ Master a_master size: {len(a_master)}")
-print(f"   ✅ Master Q_edges: {len(Q_master_edges)} non-zero pairs")
-print(f"   ✅ Master free variables: {master_pairwise['N_free']} (fixed: {len(M_indices)})")
+# Absorb interactions with fixed stations
+quad_dict = {(i, j): val for i, j, val in all_quad_edges}
+for i in tqdm(free_indices, desc="Absorbing fixed station interactions"):
+    for m in M_indices_list:
+        key = (i, m) if i < m else (m, i)
+        if key in quad_dict:
+            a_master[i] += quad_dict[key]
+
+# Filter quad_edges to only include free-free pairs (i < j, both free)
+free_set = set(free_indices)
+Q_master_edges = []
+for i, j, val in all_quad_edges:
+    if i in free_set and j in free_set:
+        Q_master_edges.append((i, j, val))
+
+print(f"   ✅ Final Q_master_edges (free-free): {len(Q_master_edges):,}")
 
 # -----------------------------------------------------------------------------
 # PLOT: Utility Heatmap + Water Boundary Mask + Existing Stations
@@ -322,7 +276,7 @@ plt.tight_layout()
 plt.show()
 
 # -----------------------------------------------------------------------------
-# SAVE MASTER DATA (NOW WITH a_master AND Q_master_edges)
+# SAVE MASTER DATA (NOW WITH SPARSE a AND Q_edges)
 # -----------------------------------------------------------------------------
 master_data = {
     "coords": coords,
@@ -331,8 +285,8 @@ master_data = {
     "M_indices": M_indices,
     "has_existing": has_existing,
     "water_polygon": laguna_water_polygon,
-    "a": a_master,                    # <-- NEW: linear coefficients for full master
-    "Q_edges": Q_master_edges,        # <-- NEW: sparse quadratic edges (i,j,val)
+    "a": a_master,                    # Full-length linear coefficients
+    "Q_edges": Q_master_edges,        # List of (i, j, val) for i<j, both free
     "metadata": {
         "n_sites": n_sites,
         "weights": WEIGHTS.tolist(),
@@ -346,6 +300,7 @@ master_data = {
         "master_L_c": MASTER_QUBO_CONFIG["L_c"],
         "master_L_w": MASTER_QUBO_CONFIG["L_w"],
         "master_edges_count": len(Q_master_edges),
+        "master_valid_edges_count": len(all_valid_edges),
     }
 }
 
