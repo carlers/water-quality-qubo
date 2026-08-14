@@ -1,10 +1,12 @@
-#@title CELL 3: NESTED RESOLUTION SCALING (Farthest Point Sampling)
+#@title CELL 3: NESTED RESOLUTION SCALING (Farthest Point Sampling – DEDUPLICATED FIX)
 """
 ================================================================================
-NESTED RESOLUTION SCALING VIA FARTHEST POINT SAMPLING (FPS)
+NESTED RESOLUTION SCALING VIA FARTHEST POINT SAMPLING (FPS) – FIXED
 ================================================================================
 - Generates a dense pool of candidate points over the lake.
 - Maps each pool point to the nearest master centroid (from the full 5417 grid).
+- CRITICAL FIX: Deduplicates mapped master indices so each master centroid
+  appears only once in the pool before FPS.
 - Uses Farthest Point Sampling (seeded with existing stations) to select exactly 
   1000 well‑spread free candidates in a strict ordering.
 - Nested subsets: N=20 ⊂ N=50 ⊂ N=100 ⊂ N=200 ⊂ N=500 ⊂ N=1000.
@@ -106,18 +108,25 @@ pool_to_master = pool_to_master.flatten().astype(int)
 
 # Exclude pool points that map to an existing station
 free_mask = ~np.isin(pool_to_master, list(M_set_global))
-pool_coords_free = pool_coords[free_mask]
 pool_to_master_free = pool_to_master[free_mask]
-print(f"   Pool points mapped to free master indices: {len(pool_coords_free):,}")
 
-# Retrieve the master coordinates and utility for each pool point
-pool_master_coords = coords[pool_to_master_free]
-pool_U = U[pool_to_master_free]
+# -----------------------------------------------------------------------------
+# CRITICAL FIX: DEDUPLICATE THE MAPPED MASTER INDICES
+# -----------------------------------------------------------------------------
+# Multiple pool points may map to the same master centroid. We must keep only
+# unique master indices to avoid duplicate variables in the QUBO.
+unique_master_indices, unique_inverse = np.unique(pool_to_master_free, return_inverse=True)
+unique_master_coords = coords[unique_master_indices]
+unique_U = U[unique_master_indices]
+
+print(f"   Pool points mapped to free master indices (raw): {len(pool_to_master_free):,}")
+print(f"   Unique free master indices after deduplication: {len(unique_master_indices):,}")
 
 # -----------------------------------------------------------------------------
 # STEP 3: FARTHEST POINT SAMPLING (Seeded with existing stations)
+#    Now runs on the DEDUPLICATED unique master coordinates.
 # -----------------------------------------------------------------------------
-print("\n🔹 Running Farthest Point Sampling (seeded with existing stations)...")
+print("\n🔹 Running Farthest Point Sampling on deduplicated master sites (seeded with existing stations)...")
 
 # Seeds: coordinates of existing stations
 seed_coords = coords[list(M_set_global)]
@@ -127,27 +136,22 @@ n_select = 1000
 
 # KDTree for seeds to compute initial distances
 seed_tree = cKDTree(seed_coords)
-# For each pool point, compute distance to the nearest seed
-min_dist = seed_tree.query(pool_coords_free, k=1)[0].flatten()
+# For each unique pool point, compute distance to the nearest seed
+min_dist = seed_tree.query(unique_master_coords, k=1)[0].flatten()
 
-selected_indices = []       # indices in pool_coords_free
-selected_coords = []        # corresponding master coordinates
-selected_master_indices = []  # master indices
+selected_indices = []          # indices in unique_master_indices
+selected_master_indices = []   # actual master grid indices
 
-# We'll also keep track of all pool points and update distances
-for _ in tqdm(range(n_select), desc="FPS iterations"):
+# We'll keep track of all points and update distances
+for _ in tqdm(range(n_select), desc="FPS iterations (unique sites)"):
     # Find the pool point with largest minimum distance
     idx = np.argmax(min_dist)
     selected_indices.append(idx)
-    selected_coords.append(pool_master_coords[idx])
-    selected_master_indices.append(pool_to_master_free[idx])
+    selected_master_indices.append(unique_master_indices[idx])
     
     # Update min_dist for all remaining points
-    # Compute distance from newly selected point to all others
-    new_point = pool_master_coords[idx]
-    # We could compute distances from new_point to all pool points using KDTree,
-    # but for simplicity we compute Euclidean distances directly (pool size ~6000, OK)
-    dist_to_new = np.linalg.norm(pool_master_coords - new_point, axis=1)
+    new_point = unique_master_coords[idx]
+    dist_to_new = np.linalg.norm(unique_master_coords - new_point, axis=1)
     # Update min_dist = min(min_dist, dist_to_new)
     min_dist = np.minimum(min_dist, dist_to_new)
     
@@ -155,10 +159,9 @@ for _ in tqdm(range(n_select), desc="FPS iterations"):
     min_dist[idx] = -1.0
 
 # The order of selection gives the nested ordering.
-# selected_master_indices now contains exactly 1000 free master indices,
+# selected_master_indices now contains exactly 1000 unique free master indices,
 # ordered by farthest-point sampling.
-
-print(f"   Selected {len(selected_master_indices)} free points via FPS.")
+print(f"   Selected {len(selected_master_indices)} unique free points via FPS.")
 
 # -----------------------------------------------------------------------------
 # STEP 4: BUILD NESTED TIERS FOR EACH TARGET N
@@ -245,7 +248,7 @@ sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin=min(r['U'].mi
 sm.set_array([])
 fig.colorbar(sm, cax=cbar_ax, label="Utility U_i")
 
-plt.suptitle("Nested Resolution Scaling (Farthest Point Sampling)", fontsize=14, fontweight="bold", y=1.02)
+plt.suptitle("Nested Resolution Scaling (Farthest Point Sampling – Deduplicated)", fontsize=14, fontweight="bold", y=1.02)
 plt.tight_layout(rect=[0, 0, 0.9, 1])
 plt.show()
 
@@ -257,6 +260,6 @@ if not cached_path.exists():
     cached_path = LOCAL_CACHE / "scaling_results.pkl"
 with open(cached_path, "wb") as f:
     pickle.dump(scaling_results, f, protocol=pickle.HIGHEST_PROTOCOL)
-print(f"✅ Cached scaling results to {cached_path}")
+print(f"✅ Cached deduplicated scaling results to {cached_path}")
 
-print("\n✅ Nested resolution scaling complete.")
+print("\n✅ Nested resolution scaling complete (deduplicated FPS).")
