@@ -1,9 +1,9 @@
-#@title CELL 4: GENERATE SPARSE QUBO + PRE‑BUILT MIQP PER TIER
+#@title CELL 4: GENERATE SPARSE QUBO + MIQP DATA (No pickling of Instance)
 # =============================================================================
 # Key features:
 #   1. Sparse storage: Q_edges (i,j,val) for i<j, neighbors as list-of-lists.
 #   2. qsum computed from only non‑zero edges – used for penalty scaling in SA.
-#   3. Pre‑built MIQP model (jijmodeling instance) saved, so Cell 5 only solves.
+#   3. Pre‑built MIQP data dict (not the Instance) – saved for instant rebuild in Cell 5.
 #   4. Single‑pass geometry, endpoint pre‑filter, tqdm progress.
 # =============================================================================
 import os
@@ -217,7 +217,7 @@ with open(scaling_path, "rb") as f:
     scaling_results = pickle.load(f)
 
 print("\n" + "=" * 100)
-print("🔗 GENERATING SPARSE QUBO + MIQP INSTANCES PER RESOLUTION TIER")
+print("🔗 GENERATING SPARSE QUBO + MIQP DATA PER RESOLUTION TIER")
 print("=" * 100)
 
 # -----------------------------------------------------------------------------
@@ -230,13 +230,8 @@ for N, res in tqdm(scaling_results.items(), desc="Tiers"):
     coords_tier = res["coords"]
     U_tier = res["U"]
     M_tier = res["M_indices"]          # indices within this tier (already compressed)
-    # The tier's M_indices refer to indices in the tier's coordinate array.
-    # But we need original indices for the pairwise computation? Actually the helper expects original indices.
-    # However, our helper expects indices matching coords array. The tier has its own coords and U.
-    # We'll use the tier's own indices directly (the helper will treat them as "original").
-    # That's fine because we only need the internal geometry of the tier.
     
-    # We'll call helper on the tier's data
+    # Call helper on the tier's data
     pair_data = compute_pairwise_terms_shape_aware(
         coords=coords_tier,
         U=U_tier,
@@ -291,12 +286,11 @@ for N, res in tqdm(scaling_results.items(), desc="Tiers"):
     # ---- Compute qsum for penalty scaling ----
     qsum = np.sum(np.abs(a_new)) + sum(abs(val) for _, _, val in Q_edges_new)
     
-    # ---- Build MIQP model ----
+    # ---- Build MIQP data dict (but NOT the Instance) ----
     K = CONFIG_QUBO["K"]
     max_degree = max(1, max((len(nbrs) for nbrs in neighbors_new), default=1))
     num_edges = len(Q_edges_new)
     
-    # Build data dict for MIQP
     neighbor_indices = np.zeros((N_free, max_degree), dtype=np.int32)
     neighbor_mask = np.zeros((N_free, max_degree), dtype=np.int8)
     for i in range(N_free):
@@ -304,13 +298,9 @@ for N, res in tqdm(scaling_results.items(), desc="Tiers"):
             neighbor_indices[i, k] = j
             neighbor_mask[i, k] = 1
     
-    # For the linear term, we need a_effective = a + diag(Q) but our Q_edges only has off-diagonal, so diag=0.
-    # We'll use a_new directly.
+    # a_effective = a (no diagonal Q)
     a_effective = a_new.copy()
-    # No diagonal Q entries, so no adjustment.
     
-    # Build problem
-    problem = build_miqp_problem_sparse(N_free, max_degree, num_edges)
     data_dict = {
         "K_total": int(K),
         "a": a_effective.tolist(),
@@ -324,9 +314,7 @@ for N, res in tqdm(scaling_results.items(), desc="Tiers"):
         data_dict["edges"] = edges_list
         data_dict["Q_vals"] = qvals_list
     
-    miqp_instance = problem.eval(data_dict)
-    
-    # ---- Assemble instance data ----
+    # ---- Assemble instance data (no miqp_instance) ----
     instance_data = {
         "N": N_free,
         "K": K,
@@ -345,8 +333,11 @@ for N, res in tqdm(scaling_results.items(), desc="Tiers"):
         "L_c": CONFIG_QUBO["L_c"],
         "L_w": CONFIG_QUBO["L_w"],
         "qsum": qsum,                   # for penalty scaling in SA
-        "miqp_instance": miqp_instance, # pre-built MIQP model (solved in Cell 5)
-        "miqp_data": data_dict,         # optional, for debugging
+        "miqp_data": data_dict,         # data to rebuild MIQP instance in Cell 5
+        "miqp_params": {                # parameters needed to build the problem
+            "max_degree": max_degree,
+            "num_edges": num_edges,
+        }
     }
     
     # Save to local cache and Drive
@@ -370,7 +361,7 @@ for N, res in tqdm(scaling_results.items(), desc="Tiers"):
     print(f"✅ N={N:<3d} (Free: {N_free:<3d}) | Avg Deg: {avg_deg:<5.1f} | Q_edges: {len(Q_edges_new):<6d} | qsum: {qsum:.2f} | {dt:.1f} ms")
 
 print("=" * 100)
-print("🚀 All QUBO + MIQP instances saved successfully.")
+print("🚀 All QUBO + MIQP data saved successfully.")
 
 # -----------------------------------------------------------------------------
 # PLOT CONNECTIVITY GRAPHS (same as before)
