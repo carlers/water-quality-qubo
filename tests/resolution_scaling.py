@@ -1,18 +1,12 @@
 #@title 🗺️ HEXAGONAL RESOLUTION SCALING V2 (SHAPE-AWARE, DENSITY-CONTROLLED)
 # =============================================================================
-# Key changes vs. the original cell:
-#   1. Cells snap to the CENTROID of their real member points (not the ideal
-#      hex-grid center), so aggregation never "bridges" across land / narrow
-#      waists in an irregular, branching shape like Laguna Bay.
-#   2. Existing stations are RESERVED as the representative point of their own
-#      cell (and globally deduplicated), so they can never be silently dropped.
-#   3. D_max is no longer an arbitrary sqrt(base_N/N) formula. It is derived
-#      per-tier from the actual k-th nearest-neighbor distance of the snapped
-#      points, targeting a fixed AVERAGE DEGREE. This keeps graph density
-#      sane and comparable across all resolutions.
-#   4. Hex target size is corrected using an occupancy-grid estimate of how
-#      much of the bounding box is actually water, so true_N lands much
-#      closer to target_N even for a highly irregular / branching footprint.
+# Key features:
+#   1. Cells snap to the CENTROID of their real member points so aggregation
+#      never "bridges" across land or waists in irregular shapes like Laguna Bay.
+#   2. Existing stations are RESERVED as representative points of their cells.
+#   3. D_max targets a fixed AVERAGE DEGREE per tier from k-NN spacing.
+#   4. Candidate adjacency edges are FILTERED against the water polygon mask
+#      so edges never cut across landmasses (islands or peninsulas).
 # =============================================================================
 import os
 import pickle
@@ -21,6 +15,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 from pathlib import Path
+import shapely
+from shapely.geometry import LineString, Point
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
@@ -30,10 +26,7 @@ CONFIG = {
     "target_sizes": [20, 50, 100, 200, 500, 800],
 
     # ---- Graph density control ----
-    "target_avg_degree": 8,       # <-- directly controls how dense the adjacency
-                                  #     graph looks; replaces the old base_D_max/
-                                  #     base_N formula. Raise for denser graphs,
-                                  #     lower for sparser ones.
+    "target_avg_degree": 8,       # Controls target adjacency graph density
     "min_dmax": 500,
     "fill_frac_grid_n": 80,
 
@@ -54,16 +47,21 @@ coords = master["coords"]
 U = master["U"]
 factors = master["factors"]
 M_indices_real = master["M_indices"]
+water_polygon = master["water_polygon"]  # Extracted land mask polygon
 bbox = master["metadata"]["bbox"]
 n_sites = len(coords)
+
+# Prepare geometry for ultra-fast spatial tests in Shapely 2.0+
+shapely.prepare(water_polygon)
 
 print("📦 Master data loaded.")
 print(f"   Total sites: {n_sites}")
 print(f"   Real existing stations: {len(M_indices_real)}")
+print(f"   Water polygon loaded: {type(water_polygon)}")
 print(f"   BBox: {bbox}")
 
 # -----------------------------------------------------------------------------
-# DETERMINE M_indices FOR THIS RUN (unchanged logic)
+# DETERMINE M_indices FOR THIS RUN
 # -----------------------------------------------------------------------------
 if CONFIG["N_existing"] is None:
     M_indices = M_indices_real
@@ -130,14 +128,6 @@ def generate_hex_centroids_bbox(bbox, target_n):
 # HELPER: ESTIMATE WHAT FRACTION OF THE BBOX IS ACTUALLY WATER
 # -----------------------------------------------------------------------------
 def estimate_fill_fraction(coords, bbox, grid_n=80):
-    """
-    Occupancy-grid estimate of how much of the bounding box the real,
-    irregular/branching footprint actually covers. Used to correct the hex
-    grid's target size so true_N lands close to the requested target_N even
-    when the shape (e.g. a bay with a narrow waist) is far from a rectangle.
-    A convex hull would over-estimate this for concave shapes, so we use a
-    direct occupancy count instead.
-    """
     xmin, ymin, xmax, ymax = bbox
     xs = np.linspace(xmin, xmax, grid_n + 1)
     ys = np.linspace(ymin, ymax, grid_n + 1)
@@ -168,24 +158,19 @@ real_tree = cKDTree(coords)
 for target_N in sorted(target_sizes):
     t0 = time.perf_counter()
 
-    # 1. Correct the hex-grid target using the estimated water fraction, so
-    #    the number of OCCUPIED cells (true_N) lands close to target_N.
+    # 1. Correct the hex-grid target using estimated water fraction
     target_N_grid = int(np.ceil(target_N / fill_frac))
-    target_N_grid = min(target_N_grid, target_N * 25)  # sanity cap
+    target_N_grid = min(target_N_grid, target_N * 25)
 
     hex_coords = generate_hex_centroids_bbox(bbox, target_N_grid)
 
-    # 2. Assign each REAL coordinate to its nearest hex center
+    # 2. Assign REAL coordinates to nearest hex center
     hex_tree = cKDTree(hex_coords)
     _, assigned_hex_idx = hex_tree.query(coords)
     unique_cells = np.unique(assigned_hex_idx)
     true_N = len(unique_cells)
 
-    # 3. Representative-point selection per cell:
-    #    - if the cell contains a real existing station, that station IS the
-    #      representative (reserved + deduped globally)
-    #    - otherwise, snap to the nearest UNUSED real coordinate to the
-    #      cell's actual member centroid (not the empty hex center)
+    # 3. Representative-point selection per cell
     used_master_idx = set()
     snapped_indices = np.zeros(true_N, dtype=int)
     agg_factors = np.zeros((true_N, 8), dtype=np.float64)
@@ -213,7 +198,7 @@ for target_N in sorted(target_sizes):
                         break
                 if rep is None:
                     if k_search >= n_sites:
-                        rep = int(np.atleast_1d(cand_idx)[0])  # give up on dedup
+                        rep = int(np.atleast_1d(cand_idx)[0])
                         break
                     k_search *= 2
 
@@ -226,19 +211,28 @@ for target_N in sorted(target_sizes):
     M_tier = [i for i, orig_idx in enumerate(snapped_indices) if orig_idx in M_set_global]
     M_orig_tier = [int(orig_idx) for orig_idx in snapped_indices if orig_idx in M_set_global]
 
-    # 5. Data-driven D_max: target a fixed AVERAGE DEGREE using the actual
-    #    k-th nearest-neighbor distance of the snapped points, instead of an
-    #    arbitrary sqrt(base_N/N) formula unrelated to real spacing.
+    # 5. Data-driven D_max targeting fixed average degree
     tier_tree = cKDTree(coords_tier)
     k = min(target_avg_degree, true_N - 1)
     if k >= 1:
-        knn_dists, _ = tier_tree.query(coords_tier, k=k + 1)  # includes self at col 0
+        knn_dists, _ = tier_tree.query(coords_tier, k=k + 1)
         scaled_dmax = max(min_dmax, float(np.median(knn_dists[:, -1])))
     else:
         scaled_dmax = min_dmax
 
-    # 6. Build adjacency at that D_max
-    pairs = tier_tree.query_pairs(r=scaled_dmax)
+    # 6. Build adjacency & FILTER candidate edges crossing land
+    candidate_pairs = tier_tree.query_pairs(r=scaled_dmax)
+    valid_pairs = set()
+
+    for i, j in candidate_pairs:
+        p1 = coords_tier[i]
+        p2 = coords_tier[j]
+        edge_line = LineString([p1, p2])
+        # Keep edge ONLY if line stays completely inside water polygon
+        if water_polygon.contains(edge_line):
+            valid_pairs.add((i, j))
+
+    pairs = valid_pairs
     num_edges = len(pairs)
     avg_degree = (2.0 * num_edges) / true_N if true_N > 0 else 0
 
@@ -268,103 +262,7 @@ for target_N in sorted(target_sizes):
 print("=" * 100)
 
 # -----------------------------------------------------------------------------
-# GENERATE QUBO INSTANCES PER TIER (unchanged from original)
-# -----------------------------------------------------------------------------
-try:
-    from src.model import compute_pairwise_terms
-    from src.utils import compute_energy  # optional
-    print("\n✅ Imported QUBO builder functions.")
-except ImportError:
-    print("\n⚠️  Could not import compute_pairwise_terms. Skipping QUBO generation.")
-    compute_pairwise_terms = None
-
-if compute_pairwise_terms is not None:
-    print("\n🔗 Generating QUBO instances for each tier...")
-    for N, res in scaling_results.items():
-        pairwise = compute_pairwise_terms(
-            coords=res["coords"],
-            U=res["U"],
-            M_indices=res["M_indices"],
-            L_c=CONFIG["L_c"],
-            L_w=CONFIG["L_w"],
-            current_vector=CONFIG["Current_vector"],
-            beta=CONFIG["Beta"],
-            delta=CONFIG["Delta"],
-            connectivity_range=res["dmax"],
-            verbose=False,
-        )
-        N_total = pairwise["N_total"]
-        a = np.zeros(N_total)
-        for i, coeff in pairwise["linear"].items():
-            a[i] = coeff
-        Q = np.zeros((N_total, N_total))
-        for (i, j), coeff in pairwise["quad"].items():
-            Q[i, j] = coeff
-            Q[j, i] = coeff
-        neigh = np.zeros((N_total, N_total), dtype=int)
-        for i, nbrs in pairwise["neighbors"].items():
-            for j in nbrs:
-                neigh[i, j] = 1
-
-        free_indices = [i for i in range(N_total) if i not in res["M_indices"]]
-        M_set = set(res["M_indices"])
-        a_new = np.zeros(len(free_indices))
-        for new_i, orig_i in enumerate(free_indices):
-            a_new[new_i] = pairwise["linear"].get(orig_i, 0.0)
-            for m in M_set:
-                if (orig_i, m) in pairwise["quad"]:
-                    a_new[new_i] += pairwise["quad"][(orig_i, m)]
-                elif (m, orig_i) in pairwise["quad"]:
-                    a_new[new_i] += pairwise["quad"][(m, orig_i)]
-
-        Q_new = np.zeros((len(free_indices), len(free_indices)))
-        for a_idx, orig_a in enumerate(free_indices):
-            for b_idx, orig_b in enumerate(free_indices):
-                if a_idx < b_idx:
-                    val = pairwise["quad"].get((orig_a, orig_b), 0.0)
-                    if val != 0:
-                        Q_new[a_idx, b_idx] = val
-                        Q_new[b_idx, a_idx] = val
-
-        neigh_new = np.zeros((len(free_indices), len(free_indices)), dtype=int)
-        for i, orig_i in enumerate(free_indices):
-            for j, orig_j in enumerate(free_indices):
-                if i != j and pairwise["neighbors"][orig_i].count(orig_j) > 0:
-                    neigh_new[i, j] = 1
-
-        fixed_neighbors = {
-            i: [m for m in M_set if pairwise["neighbors"][orig_i].count(m) > 0]
-            for i, orig_i in enumerate(free_indices)
-        }
-        has_fixed_neighbor = np.array([len(fixed_neighbors[i]) > 0 for i in range(len(free_indices))], dtype=int)
-
-        instance_data = {
-            "N": len(free_indices),
-            "K": CONFIG["K"],
-            "a": a_new,
-            "Q": Q_new,
-            "neigh": neigh_new,
-            "coords": res["coords"][free_indices],
-            "U": res["U"][free_indices],
-            "M_indices": [],
-            "D_max": res["dmax"],
-            "original_indices": free_indices,
-            "fixed_indices": res["M_indices"],
-            "fixed_neighbors": fixed_neighbors,
-            "has_fixed_neighbor": has_fixed_neighbor,
-            "original_coords": res["coords"],
-            "original_U": res["U"],
-            "L_c": CONFIG["L_c"],
-            "L_w": CONFIG["L_w"],
-        }
-
-        instance_path = OUTPUT_DIR / f"instance_data_N{N}.pkl"
-        with open(instance_path, "wb") as f:
-            pickle.dump(instance_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"   ✅ Saved QUBO instance for N={N} to {instance_path}")
-# -----------------------------------------------------------------------------
-# DYNAMIC PLOTTING (all tiers) — real-data footprint shown faintly underneath
-# so you can visually confirm the tiers follow the true shape
+# DYNAMIC PLOTTING (all tiers) — water-only edges
 # -----------------------------------------------------------------------------
 print("\n📊 Plotting resolution scaling results...")
 tiers = sorted(scaling_results.keys())
@@ -386,12 +284,13 @@ for ax, N in zip(axes, tiers):
     # Faint real-data footprint for shape reference
     ax.scatter(coords[:, 0], coords[:, 1], c="lightgray", s=4, alpha=0.35, zorder=0)
 
+    # Plot water-only edges
     for i, j in edges:
         ax.plot([coords_tier[i, 0], coords_tier[j, 0]],
                  [coords_tier[i, 1], coords_tier[j, 1]],
                  color="gray", alpha=0.15, linewidth=0.5, zorder=1)
 
-    # MODIFIED: Removed dynamic size array. Set s=60 for uniform blob sizes.
+    # Uniform size blobs colored by utility U
     sc = ax.scatter(coords_tier[:, 0], coords_tier[:, 1],
                      c=U_tier, cmap="viridis", s=60,
                      edgecolor="k", linewidth=0.3, alpha=0.9, zorder=2)
