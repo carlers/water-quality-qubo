@@ -1,14 +1,12 @@
-#@title 🗺️ HEXAGONAL RESOLUTION SCALING V2 (SHAPE-AWARE, MEAN-UTILITY)
+#@title 🗺️ HEXAGONAL RESOLUTION SCALING V2 (Master-Energy Conserved)
 # =============================================================================
 # Key features:
-#   1. Cells snap to the CENTROID of their real member points so aggregation
-#      never "bridges" across land or waists in irregular shapes like Laguna Bay.
+#   1. Cells snap to the CENTROID of their real member points.
 #   2. Existing stations are RESERVED as representative points of their cells.
-#   3. D_max targets a fixed AVERAGE DEGREE per tier from k-NN spacing.
-#   4. Candidate adjacency edges are FILTERED against the water polygon mask
-#      so edges never cut across landmasses (islands or peninsulas).
-#   5. Utility (U) is aggregated using np.mean() to prevent boundary cells 
-#      from artificially sinking in value due to lower point counts.
+#   3. Utility (U) is aggregated using np.mean() and normalized against total master 
+#      sites (n_sites / true_N) to conserve total master energy scale across tiers.
+#   4. Graph connectivity (D_max and landmass-aware edge generation) is deferred
+#      entirely to the QUBO Instance Builder cell.
 # =============================================================================
 import os
 import pickle
@@ -18,7 +16,6 @@ import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 from pathlib import Path
 import shapely
-from shapely.geometry import LineString, Point
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
@@ -27,9 +24,7 @@ CONFIG = {
     # ---- Resolution tiers ----
     "target_sizes": [20, 50, 100, 200, 500, 800],
 
-    # ---- Graph density control ----
-    "target_avg_degree": 8,       # Controls target adjacency graph density
-    "min_dmax": 500,
+    # ---- Grid fill control ----
     "fill_frac_grid_n": 80,
 
     # ---- Existing stations ----
@@ -57,7 +52,7 @@ n_sites = len(coords)
 shapely.prepare(water_polygon)
 
 print("📦 Master data loaded.")
-print(f"   Total sites: {n_sites}")
+print(f"   Total sites (N_master): {n_sites}")
 print(f"   Real existing stations: {len(M_indices_real)}")
 print(f"   Water polygon loaded: {type(water_polygon)}")
 print(f"   BBox: {bbox}")
@@ -88,7 +83,7 @@ else:
     else:
         n_existing = CONFIG["N_existing"]
         if n_existing > len(M_indices_real):
-            print(f"   ⚠️  Override N={n_existing} > real existing ({len(M_indices_real)}). Using all real.")
+            print(f"   ⚠️ Override N={n_existing} > real existing ({len(M_indices_real)}). Using all real.")
             M_indices = M_indices_real
         else:
             sorted_real = sorted(M_indices_real, key=lambda i: U[i], reverse=True)
@@ -144,17 +139,14 @@ print(f"   Estimated water-coverage fraction of bbox: {fill_frac:.3f}")
 # -----------------------------------------------------------------------------
 # RESOLUTION SCALING LOOP
 # -----------------------------------------------------------------------------
-print("\n" + "=" * 100)
-print("🚀 Running Hexagonal Resolution Scaling V2 (Shape-Aware, Density-Controlled)")
-print("=" * 100)
-print(f"{'Target N':<10} | {'Actual N':<10} | {'D_max (m)':<12} | {'Avg Degree':<10} | {'Target Deg':<10} | {'Total Utility':<12}")
-print("=" * 100)
+print("\n" + "=" * 90)
+print("🚀 Running Hexagonal Resolution Scaling (Shape-Aware, Energy-Conserved)")
+print("=" * 90)
+print(f"{'Target N':<10} | {'Actual N':<10} | {'Mean Cell U':<12} | {'Total System Utility':<20}")
+print("=" * 90)
 
 scaling_results = {}
 target_sizes = CONFIG["target_sizes"]
-target_avg_degree = CONFIG["target_avg_degree"]
-min_dmax = CONFIG["min_dmax"]
-
 real_tree = cKDTree(coords)
 
 for target_N in sorted(target_sizes):
@@ -172,19 +164,22 @@ for target_N in sorted(target_sizes):
     unique_cells = np.unique(assigned_hex_idx)
     true_N = len(unique_cells)
 
-    # 3. Representative-point selection per cell
+    # 3. Representative-point selection per cell & Energy scaling
     used_master_idx = set()
     snapped_indices = np.zeros(true_N, dtype=int)
     agg_factors = np.zeros((true_N, 8), dtype=np.float64)
     agg_U = np.zeros(true_N, dtype=np.float64)
+
+    # Scaling factor to conserve master total energy scale across discretization tiers
+    tier_energy_scale = n_sites / true_N
 
     for i, cell in enumerate(unique_cells):
         member_idx = np.where(assigned_hex_idx == cell)[0]
         
         agg_factors[i] = np.nanmean(factors[member_idx], axis=0)
         
-        # 🟢 FIX: Use np.mean instead of np.sum to preserve edge utility
-        agg_U[i] = np.mean(U[member_idx])
+        # 🟢 Area-weighted scaling: preserves total energy scale relative to master (N=5417)
+        agg_U[i] = np.mean(U[member_idx]) * tier_energy_scale
 
         station_members = [m for m in member_idx if m in M_set_global]
         if station_members:
@@ -216,60 +211,26 @@ for target_N in sorted(target_sizes):
     M_tier = [i for i, orig_idx in enumerate(snapped_indices) if orig_idx in M_set_global]
     M_orig_tier = [int(orig_idx) for orig_idx in snapped_indices if orig_idx in M_set_global]
 
-    # 5. Data-driven D_max targeting fixed average degree
-    tier_tree = cKDTree(coords_tier)
-    k = min(target_avg_degree, true_N - 1)
-    if k >= 1:
-        knn_dists, _ = tier_tree.query(coords_tier, k=k + 1)
-        scaled_dmax = max(min_dmax, float(np.median(knn_dists[:, -1])))
-    else:
-        scaled_dmax = min_dmax
-
-    # 6. Build adjacency & FILTER candidate edges crossing land
-    candidate_pairs = tier_tree.query_pairs(r=scaled_dmax)
-    valid_pairs = set()
-
-    for i, j in candidate_pairs:
-        p1 = coords_tier[i]
-        p2 = coords_tier[j]
-        edge_line = LineString([p1, p2])
-        # Keep edge ONLY if line stays completely inside water polygon
-        if water_polygon.contains(edge_line):
-            valid_pairs.add((i, j))
-
-    pairs = valid_pairs
-    num_edges = len(pairs)
-    avg_degree = (2.0 * num_edges) / true_N if true_N > 0 else 0
-
-    adj_matrix = np.zeros((true_N, true_N), dtype=int)
-    for i, j in pairs:
-        adj_matrix[i, j] = 1
-        adj_matrix[j, i] = 1
-
     total_utility = agg_U.sum()
+    mean_utility = agg_U.mean()
 
-    print(f"{target_N:<10} | {true_N:<10} | {scaled_dmax:<12.2f} | {avg_degree:<10.2f} | "
-          f"{target_avg_degree:<10} | {total_utility:<12.4f}")
+    print(f"{target_N:<10} | {true_N:<10} | {mean_utility:<12.4f} | {total_utility:<20.4f}")
 
     scaling_results[true_N] = {
         "coords": coords_tier,
         "U": agg_U,
         "factors": agg_factors,
-        "adj_matrix": adj_matrix,
-        "dmax": scaled_dmax,
-        "edges": pairs,
-        "avg_degree": avg_degree,
         "M_indices": M_tier,
         "M_orig_indices": M_orig_tier,
         "snapped_indices": snapped_indices,
     }
 
-print("=" * 100)
+print("=" * 90)
 
 # -----------------------------------------------------------------------------
-# DYNAMIC PLOTTING (all tiers) — water-only edges
+# PLOTTING (Candidate grids per tier)
 # -----------------------------------------------------------------------------
-print("\n📊 Plotting resolution scaling results...")
+print("\n📊 Plotting resolution scaling candidate grids...")
 tiers = sorted(scaling_results.keys())
 n_tiers = len(tiers)
 cols = 2
@@ -282,20 +243,12 @@ for ax, N in zip(axes, tiers):
     res = scaling_results[N]
     coords_tier = res["coords"]
     U_tier = res["U"]
-    edges = res["edges"]
-    dmax = res["dmax"]
     M_tier = res["M_indices"]
 
-    # Faint real-data footprint for shape reference
+    # Faint master footprint for shape reference
     ax.scatter(coords[:, 0], coords[:, 1], c="lightgray", s=4, alpha=0.35, zorder=0)
 
-    # Plot water-only edges
-    for i, j in edges:
-        ax.plot([coords_tier[i, 0], coords_tier[j, 0]],
-                 [coords_tier[i, 1], coords_tier[j, 1]],
-                 color="gray", alpha=0.15, linewidth=0.5, zorder=1)
-
-    # Uniform size blobs colored by utility U
+    # Uniform size blobs colored by energy-scaled utility U
     sc = ax.scatter(coords_tier[:, 0], coords_tier[:, 1],
                      c=U_tier, cmap="viridis", s=60,
                      edgecolor="k", linewidth=0.3, alpha=0.9, zorder=2)
@@ -305,8 +258,7 @@ for ax, N in zip(axes, tiers):
                     c="red", marker="*", s=250, edgecolor="black",
                     linewidth=0.5, zorder=5, label="Existing")
 
-    ax.set_title(f"N={N} | Dmax={dmax:.0f}m | Avg Deg={res['avg_degree']:.1f}",
-                 fontsize=10, fontweight="bold")
+    ax.set_title(f"N={N} | Total U={U_tier.sum():.1f}", fontsize=10, fontweight="bold")
     ax.set_xlabel("Easting (m)")
     ax.set_ylabel("Northing (m)")
     ax.set_aspect("equal")
@@ -316,12 +268,13 @@ for ax in axes[n_tiers:]:
     ax.axis("off")
 
 cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin=0, vmax=1))
+sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin=min(r['U'].min() for r in scaling_results.values()), 
+                                                              vmax=max(r['U'].max() for r in scaling_results.values())))
 sm.set_array([])
-fig.colorbar(sm, cax=cbar_ax, label="Utility U_i (Mean)")
+fig.colorbar(sm, cax=cbar_ax, label="Scaled Utility U_i")
 
-plt.suptitle("Real Data: Hexagonal Resolution Scaling V2 (Shape-Aware)", fontsize=14, fontweight="bold", y=1.02)
+plt.suptitle("Real Data: Hexagonal Candidate Grids (Energy-Conserved)", fontsize=14, fontweight="bold", y=1.02)
 plt.tight_layout(rect=[0, 0, 0.9, 1])
 plt.show()
 
-print("✅ Done.")
+print("✅ Candidate grid generation complete.")
