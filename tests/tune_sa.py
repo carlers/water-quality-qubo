@@ -1,12 +1,13 @@
-#@title 🔬 SA TUNE (Single-Objective, Rank-Constrained, Rich Logging)
+#@title 🔬 SA TUNE v2.10 (Single-Objective, Live Heartbeat, Dual Winner Breakdown)
 """
 ================================================================================
-SA TUNING WITH OPTUNA – REAL DATA (MULTI-TIER)
+SA TUNING WITH OPTUNA v2.10 – REAL DATA (MULTI-TIER)
 ================================================================================
 - Single-Objective: Minimize Top-K Average Energy.
 - Constraint: M-th sample (e.g., 20th) must have 0 violations.
+- Real-time custom heartbeat logger for terminal output.
 - Dual Winner Selection: Primary (absolute best energy) & QAOA Candidate (lowest penalties within 0.5% gap).
-- Rich terminal logging and W&B integration.
+- Rich terminal summary tables & expanded W&B diagnostics.
 ================================================================================
 """
 
@@ -24,7 +25,7 @@ CONFIG_SA = {
     # ---- Rank-Constrained Single Objective Config ----
     "FEASIBILITY_RANK_THRESHOLD": 20, # M-th sample used for constraint boundary
     "TOP_K_ENERGY": 3,                # Average top K energies for the objective
-    "ENERGY_TOLERANCE_PCT": 0.5,      # 0.5% tolerance for finding QAOA Honorable Mention
+    "ENERGY_TOLERANCE_PCT": 0.5,      # 0.5% tolerance for finding QAOA Candidate
 
     "LAMBDA_LOWER": 0.0001,
     
@@ -75,7 +76,8 @@ except ImportError:
     print("⚠️ Ensure src modules are in your sys.path before running.")
 
 warnings.filterwarnings('ignore')
-optuna.logging.set_verbosity(optuna.logging.INFO)
+# Silence Optuna's default info logs to make room for our custom heartbeat logger
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 LOCAL_CACHE = Path("/content/wqm_data")
 GDRIVE_BASE = Path("/content/drive/MyDrive/wqm_data")
@@ -108,7 +110,7 @@ def compute_decoupled_violations(x, neigh, K, fixed_neighbors=None):
     return budget_dev, float(isolated_count)
 
 # -----------------------------------------------------------------------------
-# CALLBACKS
+# PATIENCE CALLBACK
 # -----------------------------------------------------------------------------
 class ConstrainedSingleObjectivePatience:
     def __init__(self, patience: int, warmup: int):
@@ -121,9 +123,9 @@ class ConstrainedSingleObjectivePatience:
         if trial.state != optuna.trial.TrialState.COMPLETE:
             return
 
-        # Check if trial is strictly feasible according to constraints
+        # Ignore infeasible trials for patience counting
         if trial.user_attrs.get("Mth_budget_dev", 1) > 0 or trial.user_attrs.get("Mth_isolated_count", 1) > 0:
-            return # Ignore infeasible trials for patience counting
+            return
 
         current_val = trial.value
         if current_val < self.best_feasible_energy:
@@ -138,39 +140,57 @@ class ConstrainedSingleObjectivePatience:
             study.stop()
 
 # -----------------------------------------------------------------------------
-# OBJECTIVE
+# OBJECTIVE FUNCTION
 # -----------------------------------------------------------------------------
-def make_objective(instance_data, neigh, K, fixed_neighbors, LAMBDA_LOWER, LAMBDA_UPPER, wandb_run=None, wandb_table=None):
+def make_objective(instance_data, neigh, K, fixed_neighbors, LAMBDA_LOWER, LAMBDA_UPPER, tracker, wandb_run=None, wandb_table=None):
     model = build_augmented_model()
     model_keys = {"N", "K", "a", "Q", "neigh"}
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
     instance = compile_instance(model, filtered_data)
 
     def objective(trial):
+        start_time = time.time()
         lambda_budget = trial.suggest_float("lambda_budget", LAMBDA_LOWER, LAMBDA_UPPER, log=True)
         lambda_conn = trial.suggest_float("lambda_conn", LAMBDA_LOWER, LAMBDA_UPPER, log=True)
+        penalty_sum = lambda_budget + lambda_conn
+
+        # Store hyperparameters explicitly in user_attrs
+        trial.set_user_attr("lambda_budget", lambda_budget)
+        trial.set_user_attr("lambda_conn", lambda_conn)
+        trial.set_user_attr("penalty_sum", penalty_sum)
 
         penalty_weights = get_penalty_weights(instance, lambda_budget, lambda_conn)
 
         result = solve_sa_jij(instance_data, penalty_weights, num_reads=NUM_READS, num_sweeps=NUM_SWEEPS, return_all=True)
         all_samples = result.get("all_samples", [])
+        runtime_sec = time.time() - start_time
+        trial.set_user_attr("runtime_sec", runtime_sec)
 
         if not all_samples:
             trial.set_user_attr("Mth_budget_dev", 1e9)
             trial.set_user_attr("Mth_isolated_count", 1e9)
+            trial.set_user_attr("feasibility_rate", 0.0)
             return 1e9
 
-        # Compute violations
+        # Compute violations for all 1024 samples
+        b_devs, i_cnts = [], []
         for s in all_samples:
             b_dev, i_cnt = compute_decoupled_violations(s["solution"], neigh, K, fixed_neighbors)
             s["budget_dev"] = b_dev
             s["isolated_count"] = i_cnt
             s["total_violation"] = b_dev + i_cnt
+            b_devs.append(b_dev)
+            i_cnts.append(i_cnt)
+
+        avg_budget_dev_all = float(np.mean(b_devs))
+        avg_isolated_count_all = float(np.mean(i_cnts))
+        trial.set_user_attr("avg_budget_dev_all", avg_budget_dev_all)
+        trial.set_user_attr("avg_isolated_count_all", avg_isolated_count_all)
 
         # Sort by total violation, then energy
         all_samples.sort(key=lambda x: (x["total_violation"], x["energy"]))
 
-        # M-th Sample logic
+        # M-th Sample logic (Constraint Boundary)
         m_idx = min(FEASIBILITY_RANK_THRESHOLD - 1, len(all_samples) - 1)
         m_sample = all_samples[m_idx]
         m_budget = m_sample["budget_dev"]
@@ -178,38 +198,79 @@ def make_objective(instance_data, neigh, K, fixed_neighbors, LAMBDA_LOWER, LAMBD
         trial.set_user_attr("Mth_budget_dev", m_budget)
         trial.set_user_attr("Mth_isolated_count", m_isolated)
 
-        # Track total feasibility rate
+        # Feasibility stats
         feasible_samples = [s for s in all_samples if s["total_violation"] == 0]
         feas_rate = len(feasible_samples) / len(all_samples)
         trial.set_user_attr("feasibility_rate", feas_rate)
 
-        # Calculate Objective: Top-K Average Energy
+        # Single best energy found in this trial
+        if feasible_samples:
+            best_single_energy = float(min(s["energy"] for s in feasible_samples))
+        else:
+            best_single_energy = float(min(s["energy"] for s in all_samples))
+        trial.set_user_attr("best_single_energy", best_single_energy)
+
+        # Calculate Objective: Top-K Average Energy & Standard Deviation
         if m_budget == 0 and m_isolated == 0:
-            # We have >= M perfectly feasible samples. Average top K feasible.
             feasible_samples.sort(key=lambda x: x["energy"])
             top_k_samples = feasible_samples[:min(TOP_K_ENERGY, len(feasible_samples))]
+            is_feasible_trial = True
         else:
-            # Not enough feasible samples. Average top K closest to feasible.
             top_k_samples = all_samples[:min(TOP_K_ENERGY, len(all_samples))]
+            is_feasible_trial = False
 
-        top_k_avg_energy = float(np.mean([s["energy"] for s in top_k_samples]))
+        top_k_energies = [s["energy"] for s in top_k_samples]
+        top_k_avg_energy = float(np.mean(top_k_energies))
+        top_k_std_dev = float(np.std(top_k_energies)) if len(top_k_energies) > 1 else 0.0
+
         trial.set_user_attr("top_k_avg_energy", top_k_avg_energy)
-        trial.set_user_attr("penalty_sum", lambda_budget + lambda_conn)
+        trial.set_user_attr("top_k_energy_std_dev", top_k_std_dev)
 
+        # --- REAL-TIME TERMINAL HEARTBEAT LOGGING ---
+        if is_feasible_trial:
+            if top_k_avg_energy < tracker["best_feasible_energy"]:
+                tracker["best_feasible_energy"] = top_k_avg_energy
+                tracker["best_penalty_sum"] = penalty_sum
+                status_str = "🌟 NEW BEST FEASIBLE!"
+            elif abs(top_k_avg_energy - tracker["best_feasible_energy"]) < 1e-9:
+                if penalty_sum < tracker["best_penalty_sum"]:
+                    tracker["best_penalty_sum"] = penalty_sum
+                    status_str = "🎯 FEASIBLE MATCH (LOWER PENALTY!)"
+                else:
+                    status_str = "✅ FEASIBLE MATCH"
+            else:
+                status_str = "✅ FEASIBLE"
+            
+            print(f"[Trial {trial.number:3d}] {status_str:<32} | Top-3 Avg: {top_k_avg_energy:10.4f} (std: {top_k_std_dev:.4f}) | "
+                  f"Feas: {feas_rate:6.1%} | Pen Sum: {penalty_sum:8.2f} (λb={lambda_budget:.2f}, λc={lambda_conn:.2f}) | {runtime_sec:.2f}s")
+        else:
+            print(f"[Trial {trial.number:3d}] ❌ INFEASIBLE                        | M-th Viol: Budg={m_budget:2.0f}, Isol={m_isolated:2.0f} | "
+                  f"Feas: {feas_rate:6.1%} | Pen Sum: {penalty_sum:8.2f} (λb={lambda_budget:.2f}, λc={lambda_conn:.2f}) | {runtime_sec:.2f}s")
+
+        # --- W&B LOGGING ---
         if wandb_run:
             log_dict = {
                 "trial": trial.number,
                 "top_k_avg_energy": top_k_avg_energy,
+                "top_k_energy_std_dev": top_k_std_dev,
+                "best_single_energy": best_single_energy,
                 "feasibility_rate": feas_rate,
+                "avg_budget_dev_all": avg_budget_dev_all,
+                "avg_isolated_count_all": avg_isolated_count_all,
                 "Mth_budget_dev": m_budget,
                 "Mth_isolated_count": m_isolated,
                 "lambda_budget": lambda_budget,
                 "lambda_conn": lambda_conn,
-                "penalty_sum": lambda_budget + lambda_conn
+                "penalty_sum": penalty_sum,
+                "global_best_feasible_energy": tracker["best_feasible_energy"] if tracker["best_feasible_energy"] != float('inf') else None,
+                "runtime_sec": runtime_sec,
             }
             wandb_run.log(log_dict)
             if wandb_table:
-                wandb_table.add_data(trial.number, top_k_avg_energy, feas_rate, m_budget, m_isolated, lambda_budget, lambda_conn, lambda_budget + lambda_conn)
+                wandb_table.add_data(
+                    trial.number, top_k_avg_energy, top_k_std_dev, feas_rate, 
+                    m_budget, m_isolated, lambda_budget, lambda_conn, penalty_sum, runtime_sec
+                )
 
         return top_k_avg_energy
 
@@ -219,24 +280,40 @@ def constraint_func(trial):
     return [trial.user_attrs.get("Mth_budget_dev", 1e9), trial.user_attrs.get("Mth_isolated_count", 1e9)]
 
 # -----------------------------------------------------------------------------
-# MAIN LOOP
+# MAIN EXECUTION LOOP
 # -----------------------------------------------------------------------------
 pattern = re.compile(r"instance_data_N(\d+)\.pkl")
-instance_files = [p for p in LOCAL_CACHE.glob("instance_data_N*.pkl") if pattern.match(p.name)]
+
+# Search in Drive first, fallback to Local Cache
+instance_files = [p for p in GDRIVE_BASE.glob("instance_data_N*.pkl") if pattern.match(p.name)]
+if not instance_files:
+    instance_files = [p for p in LOCAL_CACHE.glob("instance_data_N*.pkl") if pattern.match(p.name)]
+
+if not instance_files:
+    print(f"❌ ERROR: No instance data files found in {GDRIVE_BASE} or {LOCAL_CACHE}!")
+    print("  Make sure you ran the QUBO instance generation cell first.")
+    sys.exit(1)
+
 if TARGET_N:
     instance_files = [p for p in instance_files if int(pattern.search(p.name).group(1)) == TARGET_N]
+
+if not instance_files:
+    print(f"❌ ERROR: Found instances, but none matched TARGET_N = {TARGET_N}")
+    sys.exit(1)
+
 instance_files.sort(key=lambda p: int(pattern.search(p.name).group(1)))
+print(f"✅ Found {len(instance_files)} instance(s) to process.")
 
 for instance_path in instance_files:
     N_true = int(pattern.search(instance_path.name).group(1))
-    print(f"\n{'='*80}\n🔬 Tuning SA for tier N={N_true}\n{'='*80}")
+    print(f"\n{'='*110}\n🔬 Tuning SA for tier N={N_true}\n{'='*110}")
 
     with open(instance_path, "rb") as f:
         instance_data = pickle.load(f)
     
     qsum = compute_qsum(instance_data)
     LAMBDA_UPPER = qsum
-    print(f"  qsum = {qsum:.4f}  →  Lambda upper bound = {LAMBDA_UPPER:.4f}")
+    print(f"  qsum = {qsum:.4f}  →  Lambda upper bound = {LAMBDA_UPPER:.4f}\n")
 
     study_name = f"sa_tuning_N{N_true}_{RUN_ID}"
     local_db = LOCAL_CACHE / f"{study_name}.db"
@@ -254,15 +331,21 @@ for instance_path in instance_files:
             name=f"{study_name}_{datetime.now().strftime('%H%M%S')}"
         )
         if LOG_WANDB_TABLE:
-            wandb_table = wandb.Table(columns=["trial", "top_k_avg_energy", "feas_rate", "Mth_budg", "Mth_isol", "lam_b", "lam_c", "pen_sum"])
+            wandb_table = wandb.Table(columns=["trial", "top_k_avg_energy", "top_k_std", "feas_rate", "Mth_budg", "Mth_isol", "lam_b", "lam_c", "pen_sum", "runtime_sec"])
 
-    objective = make_objective(instance_data, instance_data["neigh"], instance_data["K"], instance_data.get("fixed_neighbors"), LAMBDA_LOWER, LAMBDA_UPPER, wandb_run, wandb_table)
+    # Global tracking object for real-time terminal output
+    tracker = {
+        "best_feasible_energy": float('inf'),
+        "best_penalty_sum": float('inf')
+    }
+
+    objective = make_objective(instance_data, instance_data["neigh"], instance_data["K"], instance_data.get("fixed_neighbors"), LAMBDA_LOWER, LAMBDA_UPPER, tracker, wandb_run, wandb_table)
     sampler = optuna.samplers.TPESampler(seed=42, n_startup_trials=WARMUP_TRIALS, constraints_func=constraint_func)
     study = optuna.create_study(study_name=study_name, storage=f"sqlite:///{local_db}", sampler=sampler, direction="minimize")
 
     study.optimize(objective, callbacks=[ConstrainedSingleObjectivePatience(PATIENCE, WARMUP_TRIALS)])
 
-    # --- RESULTS EXTRACTION ---
+    # --- RESULTS EXTRACTION & DUAL WINNER SELECTION ---
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     feasible = [t for t in completed if t.user_attrs.get("Mth_budget_dev", 1) == 0 and t.user_attrs.get("Mth_isolated_count", 1) == 0]
 
@@ -271,42 +354,55 @@ for instance_path in instance_files:
         if wandb_run: wandb_run.finish()
         continue
 
-    # Sort feasible by objective (Top-3 Avg Energy)
-    feasible.sort(key=lambda t: t.value)
+    # 1. Primary Winner (SA/SQA Ground State):
+    # Primary sort: Lowest Top-3 Avg Energy. Secondary sort: Lowest Penalty Sum.
+    feasible.sort(key=lambda t: (t.user_attrs["top_k_avg_energy"], t.user_attrs["penalty_sum"]))
     primary_winner = feasible[0]
-    best_energy = primary_winner.value
+    best_energy = primary_winner.user_attrs["top_k_avg_energy"]
 
-    # Find QAOA Candidate (Lowest penalty within X% gap)
+    # 2. QAOA Candidate (Honorable Mention):
+    # Find all feasible trials within 0.5% energy window of absolute best energy
     tolerance_margin = abs(best_energy) * (ENERGY_TOLERANCE_PCT / 100.0)
-    cutoff = best_energy + tolerance_margin # Assuming energies are negative/minimization
-    
-    bracket = [t for t in feasible if t.value <= cutoff]
-    bracket.sort(key=lambda t: t.user_attrs["penalty_sum"])
+    cutoff_energy = best_energy + tolerance_margin # Minimization: values below cutoff are inside bracket
+
+    bracket = [t for t in feasible if t.user_attrs["top_k_avg_energy"] <= cutoff_energy]
+    # Primary sort: Lowest Penalty Sum. Secondary sort: Lowest Energy.
+    bracket.sort(key=lambda t: (t.user_attrs["penalty_sum"], t.user_attrs["top_k_avg_energy"]))
     qaoa_candidate = bracket[0]
 
-    # --- TERMINAL REPORT ---
-    print(f"\n{'='*95}")
-    print(f"🏆 TIE-BREAK BREAKDOWN (Top Feasible Trials within {ENERGY_TOLERANCE_PCT}% of Best Energy)")
-    print(f"{'='*95}")
-    print(f"{'Trial':<6} | {'Top-3 Energy':<14} | {'Penalty Sum':<12} | {'Feas %':<8} | {'λ_budget':<10} | {'λ_conn':<10} | {'Notes'}")
-    print("-" * 95)
+    # --- RICH TERMINAL SUMMARY REPORT ---
+    print(f"\n{'='*115}")
+    print(f"🏆 TIE-BREAK BREAKDOWN (Feasible Trials within {ENERGY_TOLERANCE_PCT}% of Best Energy: {best_energy:.4f})")
+    print(f"{'='*115}")
+    print(f"{'Trial':<6} | {'Top-3 Energy':<14} | {'Std Dev':<8} | {'Penalty Sum':<12} | {'Feas %':<8} | {'λ_budget':<10} | {'λ_conn':<10} | {'Notes'}")
+    print("-" * 115)
     
-    for t in sorted(bracket, key=lambda x: x.value):
-        note = ""
-        if t.number == primary_winner.number: note += "🥇 SA WINNER "
-        if t.number == qaoa_candidate.number and qaoa_candidate.number != primary_winner.number: note += "🥈 QAOA CANDIDATE "
+    # Print bracket sorted by energy primary, penalty secondary
+    for t in sorted(bracket, key=lambda x: (x.user_attrs["top_k_avg_energy"], x.user_attrs["penalty_sum"])):
+        notes = []
+        if t.number == primary_winner.number:
+            notes.append("🥇 SA/SQA WINNER")
+        if t.number == qaoa_candidate.number:
+            if qaoa_candidate.number == primary_winner.number:
+                notes.append("🥈 QAOA CANDIDATE (SAME)")
+            else:
+                notes.append("🥈 QAOA CANDIDATE")
         
-        print(f"#{t.number:<5} | {t.value:<14.4f} | {t.user_attrs['penalty_sum']:<12.2f} | "
-              f"{t.user_attrs['feasibility_rate']:<8.2%} | {t.user_attrs['lambda_budget']:<10.2f} | "
-              f"{t.user_attrs['lambda_conn']:<10.2f} | {note}")
-    print(f"{'='*95}\n")
+        note_str = " | ".join(notes)
+        print(f"#{t.number:<5} | {t.user_attrs['top_k_avg_energy']:<14.4f} | {t.user_attrs['top_k_energy_std_dev']:<8.4f} | "
+              f"{t.user_attrs['penalty_sum']:<12.2f} | {t.user_attrs['feasibility_rate']:<8.2%} | "
+              f"{t.user_attrs['lambda_budget']:<10.2f} | {t.user_attrs['lambda_conn']:<10.2f} | {note_str}")
+    print(f"{'='*115}\n")
 
-    # Save Best Params (Defaults to Primary Winner for SA benchmarking)
+    # Save Primary Winner Params
     best_params = primary_winner.params.copy()
     with open(RUN_DIR / f"best_sa_N{N_true}.json", "w") as f:
         json.dump(best_params, f, indent=2, cls=NumpyEncoder)
     
     if wandb_run:
         wandb_run.summary["primary_winner_trial"] = primary_winner.number
+        wandb_run.summary["primary_winner_energy"] = primary_winner.user_attrs["top_k_avg_energy"]
+        wandb_run.summary["primary_winner_penalty_sum"] = primary_winner.user_attrs["penalty_sum"]
         wandb_run.summary["qaoa_candidate_trial"] = qaoa_candidate.number
+        wandb_run.summary["qaoa_candidate_penalty_sum"] = qaoa_candidate.user_attrs["penalty_sum"]
         wandb_run.finish()
