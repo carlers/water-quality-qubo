@@ -1,14 +1,10 @@
-#@title 🧩 GENERATE SHAPE-AWARE QUBO INSTANCES PER TIER (Cell 3)
+#@title CELL 4: GENERATE SPARSE QUBO + PRE‑BUILT MIQP PER TIER
 # =============================================================================
 # Key features:
-#   1. Resolution-Invariant D_max: Computed dynamically from the max nearest-
-#      neighbor distance of EXISTING baseline stations on the master grid.
-#   2. Graph Ownership: Constructs candidate adjacency edges strictly filtered 
-#      by Shapely Line-of-Sight against the water polygon to block land hops.
-#   3. Line-of-Sight Interactions: Redundancy (R_ij) and Wake (W_ij) penalties 
-#      are zeroed out if the spatial correlation line crosses land.
-#   4. Clean Free/Fixed Decoupling: Correctly absorbs interactions with 
-#      existing stations into linear terms (a_i) for free decision variables.
+#   1. Sparse storage: Q_edges (i,j,val) for i<j, neighbors as list-of-lists.
+#   2. qsum computed from only non‑zero edges – used for penalty scaling in SA.
+#   3. Pre‑built MIQP model (jijmodeling instance) saved, so Cell 5 only solves.
+#   4. Single‑pass geometry, endpoint pre‑filter, tqdm progress.
 # =============================================================================
 import os
 import pickle
@@ -17,8 +13,10 @@ import numpy as np
 from pathlib import Path
 from scipy.spatial import cKDTree
 import shapely
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 import matplotlib.pyplot as plt
+import jijmodeling as jm
+from tqdm.notebook import tqdm
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
@@ -33,26 +31,40 @@ CONFIG_QUBO = {
     "D_max_buffer": 1.15,         # Multiplier for max existing NN distance
 }
 
-# -----------------------------------------------------------------------------
-# 1. CALCULATE GLOBAL RESOLUTION-INVARIANT D_MAX
-# -----------------------------------------------------------------------------
-# Extract coordinates of existing stations from the global master set
-master_M_coords = coords[list(M_set_global)]
+LOCAL_CACHE = Path("/content/wqm_data")
+OUTPUT_DIR = Path("/content/drive/MyDrive/wqm_data")
+LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
 
+# -----------------------------------------------------------------------------
+# LOAD MASTER DATA (for global D_max and polygon)
+# -----------------------------------------------------------------------------
+master_path = OUTPUT_DIR / "master_real.pkl"
+if not master_path.exists():
+    master_path = LOCAL_CACHE / "master_real.pkl"
+with open(master_path, "rb") as f:
+    master = pickle.load(f)
+
+coords_master = master["coords"]
+U_master = master["U"]
+M_indices_master = master["M_indices"]
+water_polygon = master["water_polygon"]
+M_set_global = set(M_indices_master)
+
+# Compute global D_max from master existing stations
+master_M_coords = coords_master[list(M_set_global)]
 if len(master_M_coords) > 1:
     M_tree = cKDTree(master_M_coords)
-    # Query nearest neighbors (k=2 because the closest to itself is distance 0)
     dists, _ = M_tree.query(master_M_coords, k=2)
     max_nn_dist = np.max(dists[:, 1])
     global_D_max = max_nn_dist * CONFIG_QUBO["D_max_buffer"]
 else:
-    print("⚠️ Less than 2 existing stations found. Falling back to default D_max.")
     global_D_max = 15000.0
+print(f"🌍 Global D_max = {global_D_max:.2f} m")
 
-print(f"🌍 Global D_max calculated: {global_D_max:.2f} m (based on existing stations)")
+shapely.prepare(water_polygon)
 
 # -----------------------------------------------------------------------------
-# PAIRWISE TERM CALCULATION (SHAPE-AWARE & GRAPH BUILDER)
+# PAIRWISE TERM CALCULATION (SPARSE)
 # -----------------------------------------------------------------------------
 def compute_pairwise_terms_shape_aware(
     coords: np.ndarray,
@@ -66,64 +78,61 @@ def compute_pairwise_terms_shape_aware(
     beta: float = 1.0,
     delta: float = 1.0,
 ) -> dict:
-    
+    """
+    Returns:
+      - linear: dict {orig_idx: coeff}
+      - quad_edges: list of (orig_i, orig_j, coeff) with orig_i < orig_j
+      - neighbors: dict {orig_idx: list_of_neighbor_orig_indices} (free+fixed)
+      - valid_edges: set of (orig_i, orig_j) for connectivity plotting
+    """
     N_total = coords.shape[0]
     free_indices = [i for i in range(N_total) if i not in M_indices]
-    N_free = len(free_indices)
     free_set = set(free_indices)
     M_set = set(M_indices)
 
-    shapely.prepare(water_polygon)
     tree = cKDTree(coords)
-    
     v_norm = np.linalg.norm(current_vector)
-    if v_norm == 0:
-        raise ValueError("current_vector cannot be zero.")
     v_unit = np.array(current_vector) / v_norm
 
-    # ------------------------------------------------------------------------
-    # A. Build Connectivity Graph (Within D_max)
-    # ------------------------------------------------------------------------
+    # ---- Build connectivity graph (within D_max) ----
     valid_edges = set()
     pairs_dmax = tree.query_pairs(r=global_D_max)
-
     for i, j in pairs_dmax:
         p1, p2 = coords[i], coords[j]
-        edge_line = LineString([p1, p2])
-        # Only keep edge if it completely stays within water polygon
-        if water_polygon.contains(edge_line):
+        # endpoint pre‑filter
+        if not (water_polygon.contains(Point(p1)) and water_polygon.contains(Point(p2))):
+            continue
+        if water_polygon.contains(LineString([p1, p2])):
             valid_edges.add((i, j))
-            
-    neighbor_dict = {i: [] for i in free_indices}
+
+    # Build neighbors dict for free vertices only (including fixed neighbors)
+    neighbors = {i: [] for i in free_indices}
     for i, j in valid_edges:
         if i in free_set and j in free_set:
-            neighbor_dict[i].append(j)
-            neighbor_dict[j].append(i)
+            neighbors[i].append(j)
+            neighbors[j].append(i)
         elif i in free_set and j in M_set:
-            neighbor_dict[i].append(j)
+            neighbors[i].append(j)
         elif j in free_set and i in M_set:
-            neighbor_dict[j].append(i)
+            neighbors[j].append(i)
+    # Remove duplicates and sort
+    for i in neighbors:
+        neighbors[i] = sorted(set(neighbors[i]))
 
-    for i in neighbor_dict:
-        neighbor_dict[i] = sorted(set(neighbor_dict[i]))
-
-    # ------------------------------------------------------------------------
-    # B. Compute Pairwise Quadratic Interactions (Within 2 * L_c)
-    # ------------------------------------------------------------------------
+    # ---- Compute quadratic interactions (within 2*L_c) ----
     raw_quad = {}
     pairs_within = tree.query_pairs(r=2.0 * L_c)
-
     for i, j in pairs_within:
         p1, p2 = coords[i], coords[j]
-        edge_line = LineString([p1, p2])
-
-        # GEOMETRIC FILTER: If line crosses land, ignore spatial interaction
-        if not water_polygon.contains(edge_line):
+        if not (water_polygon.contains(Point(p1)) and water_polygon.contains(Point(p2))):
+            continue
+        line = LineString([p1, p2])
+        if not water_polygon.contains(line):
             continue
 
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
-        d = np.sqrt(dx * dx + dy * dy)
+        d = np.sqrt(dx*dx + dy*dy)
         if d == 0:
             continue
 
@@ -137,59 +146,101 @@ def compute_pairwise_terms_shape_aware(
         W_ji = (np.exp(-d / L_w) * cos_theta_ji) if cos_theta_ji > 0.7071 else 0.0
 
         coeff = beta * R_ij + delta * (W_ij + W_ji)
-        raw_quad[(i, j)] = coeff
-        raw_quad[(j, i)] = coeff
+        if abs(coeff) > 1e-12:
+            raw_quad[(i, j)] = coeff
+            raw_quad[(j, i)] = coeff   # keep symmetric dict for easier absorption
 
-    # ------------------------------------------------------------------------
-    # C. Build Linear Terms (Including Absorbed Fixed Station Effects)
-    # ------------------------------------------------------------------------
+    # ---- Build linear terms (absorb fixed stations) ----
     linear = {}
     for i in free_indices:
-        val = -U[i]  
+        val = -U[i]
         for m in M_indices:
             key = (i, m) if i < m else (m, i)
             if key in raw_quad:
                 val += raw_quad[key]
         linear[i] = val
 
-    # ------------------------------------------------------------------------
-    # D. Build Free-Free Quadratic Coupling Terms
-    # ------------------------------------------------------------------------
-    quad = {}
+    # ---- Build free‑free quadratic edges (i < j) ----
+    quad_edges = []
     for i in free_indices:
         for j in free_indices:
             if i < j:
                 key = (i, j)
                 if key in raw_quad:
-                    quad[key] = raw_quad[key]
+                    val = raw_quad[key]
+                    if abs(val) > 1e-12:
+                        quad_edges.append((i, j, val))
 
     return {
         "linear": linear,
-        "quad": quad,
-        "neighbors": neighbor_dict,
+        "quad_edges": quad_edges,
+        "neighbors": neighbors,
         "valid_edges": valid_edges,
-        "N_total": N_total,
-        "N_free": N_free,
-        "free_indices": free_indices,
-        "M_indices": M_indices,
     }
 
 # -----------------------------------------------------------------------------
-# 2. BUILD & SAVE QUBO INSTANCES PER TIER
+# MIQP MODEL BUILDER (same as Cell 5, now used here)
 # -----------------------------------------------------------------------------
+def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Problem:
+    problem = jm.Problem("WQM_MIQP_sparse", sense=jm.ProblemSense.MINIMIZE)
+    a = problem.Placeholder("a", shape=(N,), dtype=jm.DataType.FLOAT)
+    neighbor_indices = problem.Placeholder("neighbor_indices", shape=(N, max_degree), dtype=jm.DataType.NATURAL)
+    neighbor_mask = problem.Placeholder("neighbor_mask", shape=(N, max_degree), dtype=jm.DataType.BINARY)
+    fixed_neighbors = problem.Placeholder("fixed_neighbors", shape=(N,), dtype=jm.DataType.FLOAT)
+    K_total = problem.Placeholder("K_total", ndim=0, dtype=jm.DataType.INTEGER)
+    x = problem.BinaryVar("x", shape=(N,))
+    linear = jm.sum(jm.product(N), lambda i: a[i[0]] * x[i[0]])
+    problem += linear
+    if num_edges > 0:
+        edges = problem.Placeholder("edges", shape=(num_edges, 2), dtype=jm.DataType.NATURAL)
+        Q_vals = problem.Placeholder("Q_vals", shape=(num_edges,), dtype=jm.DataType.FLOAT)
+        quad = jm.sum(jm.product(num_edges), lambda e: Q_vals[e[0]] * x[edges[e[0], 0]] * x[edges[e[0], 1]])
+        problem += quad
+    problem += problem.Constraint("budget", jm.sum(jm.product(N), lambda i: x[i[0]]) == K_total)
+    problem += problem.Constraint(
+        "connectivity",
+        lambda i: x[i] <= fixed_neighbors[i] + jm.sum(
+            jm.product(max_degree),
+            lambda k: neighbor_mask[i, k[0]] * x[neighbor_indices[i, k[0]]]
+        ),
+        domain=N
+    )
+    return problem
+
+# -----------------------------------------------------------------------------
+# LOAD SCALING RESULTS (from Cell 3)
+# -----------------------------------------------------------------------------
+scaling_path = OUTPUT_DIR / "scaling_results.pkl"
+if not scaling_path.exists():
+    scaling_path = LOCAL_CACHE / "scaling_results.pkl"
+with open(scaling_path, "rb") as f:
+    scaling_results = pickle.load(f)
+
 print("\n" + "=" * 100)
-print("🔗 GENERATING SHAPE-AWARE QUBO INSTANCES PER RESOLUTION TIER")
+print("🔗 GENERATING SPARSE QUBO + MIQP INSTANCES PER RESOLUTION TIER")
 print("=" * 100)
 
-qubo_results = {}
+# -----------------------------------------------------------------------------
+# MAIN LOOP OVER TIERS
+# -----------------------------------------------------------------------------
+qubo_results = {}  # for plotting edges
 
-for N, res in scaling_results.items():
+for N, res in tqdm(scaling_results.items(), desc="Tiers"):
     t0 = time.perf_counter()
-
-    pairwise = compute_pairwise_terms_shape_aware(
-        coords=res["coords"],
-        U=res["U"],
-        M_indices=res["M_indices"],
+    coords_tier = res["coords"]
+    U_tier = res["U"]
+    M_tier = res["M_indices"]          # indices within this tier (already compressed)
+    # The tier's M_indices refer to indices in the tier's coordinate array.
+    # But we need original indices for the pairwise computation? Actually the helper expects original indices.
+    # However, our helper expects indices matching coords array. The tier has its own coords and U.
+    # We'll use the tier's own indices directly (the helper will treat them as "original").
+    # That's fine because we only need the internal geometry of the tier.
+    
+    # We'll call helper on the tier's data
+    pair_data = compute_pairwise_terms_shape_aware(
+        coords=coords_tier,
+        U=U_tier,
+        M_indices=M_tier,
         water_polygon=water_polygon,
         L_c=CONFIG_QUBO["L_c"],
         L_w=CONFIG_QUBO["L_w"],
@@ -198,87 +249,131 @@ for N, res in scaling_results.items():
         beta=CONFIG_QUBO["Beta"],
         delta=CONFIG_QUBO["Delta"],
     )
-
-    free_indices = pairwise["free_indices"]
-    N_free = len(free_indices)
-    M_set = set(res["M_indices"])
-
-    a_new = np.zeros(N_free, dtype=np.float64)
-    for new_i, orig_i in enumerate(free_indices):
-        a_new[new_i] = pairwise["linear"].get(orig_i, 0.0)
-
-    Q_new = np.zeros((N_free, N_free), dtype=np.float64)
-    for a_idx, orig_a in enumerate(free_indices):
-        for b_idx, orig_b in enumerate(free_indices):
-            if a_idx < b_idx:
-                val = pairwise["quad"].get((orig_a, orig_b), 0.0)
-                if val != 0.0:
-                    Q_new[a_idx, b_idx] = val
-                    Q_new[b_idx, a_idx] = val
-
-    neigh_new = np.zeros((N_free, N_free), dtype=int)
-    for i, orig_i in enumerate(free_indices):
-        for j, orig_j in enumerate(free_indices):
-            if i != j and orig_j in pairwise["neighbors"][orig_i]:
-                neigh_new[i, j] = 1
-
-    fixed_neighbors = {
-        i: [m for m in M_set if m in pairwise["neighbors"][orig_i]]
-        for i, orig_i in enumerate(free_indices)
+    
+    linear = pair_data["linear"]
+    quad_edges_raw = pair_data["quad_edges"]      # list (orig_i, orig_j, val)
+    neighbors_dict = pair_data["neighbors"]        # dict orig_i -> list of orig_j
+    valid_edges = pair_data["valid_edges"]         # set of (orig_i, orig_j)
+    
+    # ---- Compress to free variables only ----
+    free_indices_orig = list(neighbors_dict.keys())  # these are the free vertices
+    free_set = set(free_indices_orig)
+    N_free = len(free_indices_orig)
+    orig_to_comp = {orig: idx for idx, orig in enumerate(free_indices_orig)}
+    
+    # a_new
+    a_new = np.array([linear.get(orig, 0.0) for orig in free_indices_orig], dtype=float)
+    
+    # Q_edges_new (compressed)
+    Q_edges_new = []
+    for i, j, val in quad_edges_raw:
+        if i in free_set and j in free_set:
+            Q_edges_new.append((orig_to_comp[i], orig_to_comp[j], val))
+    
+    # neighbors_new (compressed, free-free only)
+    neighbors_new = [[] for _ in range(N_free)]
+    for orig_i, nbrs in neighbors_dict.items():
+        ci = orig_to_comp[orig_i]
+        for orig_j in nbrs:
+            if orig_j in free_set:
+                neighbors_new[ci].append(orig_to_comp[orig_j])
+    # Sort and remove duplicates
+    for i in range(N_free):
+        neighbors_new[i] = sorted(set(neighbors_new[i]))
+    
+    # fixed_neighbors (boolean: 1 if any fixed neighbor)
+    fixed_neighbors_arr = np.zeros(N_free, dtype=int)
+    M_set_tier = set(M_tier)
+    for ci, orig_i in enumerate(free_indices_orig):
+        if any(nbr in M_set_tier for nbr in neighbors_dict[orig_i]):
+            fixed_neighbors_arr[ci] = 1
+    
+    # ---- Compute qsum for penalty scaling ----
+    qsum = np.sum(np.abs(a_new)) + sum(abs(val) for _, _, val in Q_edges_new)
+    
+    # ---- Build MIQP model ----
+    K = CONFIG_QUBO["K"]
+    max_degree = max(1, max((len(nbrs) for nbrs in neighbors_new), default=1))
+    num_edges = len(Q_edges_new)
+    
+    # Build data dict for MIQP
+    neighbor_indices = np.zeros((N_free, max_degree), dtype=np.int32)
+    neighbor_mask = np.zeros((N_free, max_degree), dtype=np.int8)
+    for i in range(N_free):
+        for k, j in enumerate(neighbors_new[i][:max_degree]):
+            neighbor_indices[i, k] = j
+            neighbor_mask[i, k] = 1
+    
+    # For the linear term, we need a_effective = a + diag(Q) but our Q_edges only has off-diagonal, so diag=0.
+    # We'll use a_new directly.
+    a_effective = a_new.copy()
+    # No diagonal Q entries, so no adjustment.
+    
+    # Build problem
+    problem = build_miqp_problem_sparse(N_free, max_degree, num_edges)
+    data_dict = {
+        "K_total": int(K),
+        "a": a_effective.tolist(),
+        "neighbor_indices": neighbor_indices.tolist(),
+        "neighbor_mask": neighbor_mask.astype(int).tolist(),
+        "fixed_neighbors": fixed_neighbors_arr.tolist(),
     }
-    has_fixed_neighbor = np.array([len(fixed_neighbors[i]) > 0 for i in range(N_free)], dtype=int)
-
+    if num_edges > 0:
+        edges_list = [[i, j] for i, j, _ in Q_edges_new]
+        qvals_list = [float(v) for _, _, v in Q_edges_new]
+        data_dict["edges"] = edges_list
+        data_dict["Q_vals"] = qvals_list
+    
+    miqp_instance = problem.eval(data_dict)
+    
+    # ---- Assemble instance data ----
     instance_data = {
         "N": N_free,
-        "K": CONFIG_QUBO["K"],
-        "a": a_new,
-        "Q": Q_new,
-        "neigh": neigh_new,
-        "coords": res["coords"][free_indices],
-        "U": res["U"][free_indices],
-        "M_indices": [], 
-        "D_max": global_D_max,
-        "original_indices": free_indices,
-        "fixed_indices": res["M_indices"],
-        "fixed_neighbors": fixed_neighbors,
-        "has_fixed_neighbor": has_fixed_neighbor,
-        "original_coords": res["coords"],
-        "original_U": res["U"],
+        "K": K,
+        "a": a_new,                     # linear coefficients (not including diag)
+        "Q_edges": Q_edges_new,         # list of (i,j,val)
+        "neighbors": neighbors_new,     # list of lists
+        "fixed_neighbors": fixed_neighbors_arr,  # boolean array
+        "coords": coords_tier[free_indices_orig],
+        "U": U_tier[free_indices_orig],
+        "original_coords": coords_tier,
+        "original_U": U_tier,
+        "original_indices": free_indices_orig,
+        "fixed_indices": M_tier,
         "snapped_indices": res["snapped_indices"],
+        "D_max": global_D_max,
         "L_c": CONFIG_QUBO["L_c"],
         "L_w": CONFIG_QUBO["L_w"],
+        "qsum": qsum,                   # for penalty scaling in SA
+        "miqp_instance": miqp_instance, # pre-built MIQP model (solved in Cell 5)
+        "miqp_data": data_dict,         # optional, for debugging
     }
     
-    qubo_results[N] = {
-        "edges": pairwise["valid_edges"],
-        "coords": res["coords"],
-        "M_indices": res["M_indices"]
-    }
-
-    LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
-    save_filename = f"instance_data_N{N}.pkl"
-    local_save_path = LOCAL_CACHE / save_filename
-    
-    with open(local_save_path, "wb") as f:
+    # Save to local cache and Drive
+    save_name = f"instance_data_N{N}.pkl"
+    local_path = LOCAL_CACHE / save_name
+    drive_path = OUTPUT_DIR / save_name
+    with open(local_path, "wb") as f:
         pickle.dump(instance_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    if "OUTPUT_DIR" in globals():
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        drive_save_path = OUTPUT_DIR / save_filename
-        with open(drive_save_path, "wb") as f:
-            pickle.dump(instance_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    dt = (time.perf_counter() - t0) * 1000
-    n_nonzero_q = np.count_nonzero(Q_new) // 2
-    avg_degree = np.sum(neigh_new) / N_free if N_free > 0 else 0
+    with open(drive_path, "wb") as f:
+        pickle.dump(instance_data, f, protocol=pickle.HIGHEST_PROTOCOL)
     
-    print(f"✅ Tier N={N:<3d} (Free: {N_free:<3d}) | Avg Deg: {avg_degree:<5.1f} | Non-zero Q: {n_nonzero_q:<5d} | Saved in {dt:.1f} ms")
+    # Store edges for plotting
+    qubo_results[N] = {
+        "edges": valid_edges,
+        "coords": coords_tier,
+        "M_indices": M_tier,
+    }
+    
+    dt = (time.perf_counter() - t0) * 1000
+    avg_deg = np.mean([len(nbrs) for nbrs in neighbors_new]) if N_free > 0 else 0
+    print(f"✅ N={N:<3d} (Free: {N_free:<3d}) | Avg Deg: {avg_deg:<5.1f} | Q_edges: {len(Q_edges_new):<6d} | qsum: {qsum:.2f} | {dt:.1f} ms")
 
 print("=" * 100)
-print("🚀 All QUBO instances compiled and saved successfully.")
+print("🚀 All QUBO + MIQP instances saved successfully.")
 
 # -----------------------------------------------------------------------------
-# 3. PLOTTING LANDMASS-AWARE CONNECTIVITY GRAPHS
+# PLOT CONNECTIVITY GRAPHS (same as before)
 # -----------------------------------------------------------------------------
 print("\n📊 Plotting landmass-aware graph edges per tier...")
 tiers = sorted(qubo_results.keys())
@@ -295,23 +390,23 @@ for ax, N in zip(axes, tiers):
     M_tier = qubo_results[N]["M_indices"]
 
     # Master map backdrop
-    ax.scatter(coords[:, 0], coords[:, 1], c="lightgray", s=4, alpha=0.35, zorder=0)
+    ax.scatter(coords_master[:, 0], coords_master[:, 1], c="lightgray", s=4, alpha=0.35, zorder=0)
 
-    # Plot water-only validated edges
+    # Plot water-valid edges
     for i, j in edges:
         ax.plot([tier_coords[i, 0], tier_coords[j, 0]],
                 [tier_coords[i, 1], tier_coords[j, 1]],
                 color="steelblue", alpha=0.3, linewidth=0.6, zorder=1)
 
-    # Plot Nodes
+    # Nodes
     ax.scatter(tier_coords[:, 0], tier_coords[:, 1], c="black", s=15, alpha=0.8, zorder=2)
 
-    # Plot fixed stations
+    # Fixed stations
     if len(M_tier) > 0:
         ax.scatter(tier_coords[M_tier, 0], tier_coords[M_tier, 1],
                    c="red", marker="*", s=200, edgecolor="black", linewidth=0.5, zorder=3)
 
-    ax.set_title(f"Graph N={N} | Global D_max={global_D_max:.0f}m", fontsize=10, fontweight="bold")
+    ax.set_title(f"Graph N={N} | D_max={global_D_max:.0f}m", fontsize=10, fontweight="bold")
     ax.set_aspect("equal")
     ax.axis("off")
 
