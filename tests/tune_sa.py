@@ -1,18 +1,14 @@
-#@title 🔬 CELL 6: SA TUNE v4.0 (Fixed, Enhanced, All Tiers)
+#@title 🔬 CELL 6: SA TUNE v4.1 (No External Solver, Fully Inlined)
 """
 ================================================================================
-SA TUNING WITH OPTUNA v4.0 – REAL DATA (MULTI-TIER, VECTORIZED, FULL DIAGNOSTICS)
+SA TUNING WITH OPTUNA v4.1 – REAL DATA (MULTI-TIER, FULLY INLINED)
 ================================================================================
-- Fully self-contained: all solver logic inlined.
-- Sparse → dense adapter (Q_edges → Q, neighbors → neigh) for vectorized math.
-- Pre-compiled JijModeling instance per tier (no rebuild per trial) – includes fixed_neighbors.
-- Vectorized compute_energy and check_feasibility (no Python loops).
-- Tunes ALL discovered N tiers (20, 50, 100, 200, 500, 1000).
-- Preserves MathematicalConvergenceEngine (dual‑trigger) & W&B logging.
-- Per‑trial timing breakdown: QUBO build, SA sampling, post‑processing.
-- Master energy computed using snapped_indices.
-- Deployment and QUBO matrix plots saved per tier for the winner.
-- Saves tuned parameters (lambda_budget, lambda_conn, master_energy, selected indices, etc.) as JSON per tier.
+- All solver logic is inside the objective function.
+- The best solution vector (x_best) is stored as a trial attribute.
+- No separate solve_sa_jij function – simplifies and avoids re‑runs.
+- Includes fixed_neighbors fix, timing breakdown, master energy, selected indices.
+- Generates deployment and QUBO matrix plots for the winner.
+- Saves tuned parameters (lambda, master energy, selected indices, etc.) per tier.
 ================================================================================
 """
 
@@ -28,7 +24,6 @@ from src.jij_model import build_augmented_model, compile_instance, get_penalty_w
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.colors as mcolors
-from matplotlib.patches import Patch
 from scipy.interpolate import griddata
 
 warnings.filterwarnings('ignore')
@@ -112,29 +107,20 @@ def compute_energy_sparse(x: np.ndarray, a: np.ndarray, Q_edges: list) -> float:
 def compute_master_energy_from_solution(x_sol, snapped_indices, fixed_indices):
     """Map local free solution to master grid and compute master energy."""
     x_master = np.zeros(len(a_master), dtype=int)
-    # Free variables
     for idx, val in enumerate(x_sol):
         if val == 1:
             master_idx = snapped_indices[idx]
             if 0 <= master_idx < len(a_master):
                 x_master[master_idx] = 1
-    # Fixed stations (existing)
     for f_idx in fixed_indices:
-        # Find its master index in snapped_indices (free indices come first, then fixed)
-        # The fixed_indices list contains original master indices, but we need the position in snapped_indices.
-        # Actually, snapped_indices is ordered as [free_vars, fixed_stations].
-        # We can simply set x_master[f_idx] = 1 because f_idx is the original master index.
-        # But careful: fixed_indices is the list of master indices (original).
-        # So we just set them directly.
         if 0 <= f_idx < len(a_master):
             x_master[f_idx] = 1
     energy = compute_energy_sparse(x_master, a_master, Q_master_edges)
     return energy
 
 # -----------------------------------------------------------------------------
-# VECTORIZED SOLVER HELPERS (Inlined)
+# VECTORIZED HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
-
 def compute_energy_vectorized(x: np.ndarray, a: np.ndarray, Q: np.ndarray) -> float:
     x = np.asarray(x, dtype=float)
     linear = np.dot(a, x)
@@ -195,92 +181,6 @@ def decode_solution(solution_obj, N: int) -> np.ndarray:
                 x_sol[idx] = int(round(val))
         return x_sol
     raise TypeError(f"Unsupported solution type: {type(solution_obj)}")
-
-# -----------------------------------------------------------------------------
-# SOLVE SA (inlined, with precompiled instance)
-# -----------------------------------------------------------------------------
-def solve_sa_jij_inlined(
-    precompiled_instance,
-    penalty_weights: dict,
-    N: int,
-    a: np.ndarray,
-    Q: np.ndarray,
-    neigh: np.ndarray,
-    fixed_neighbors: np.ndarray = None,
-    num_reads: int = 1024,
-    num_sweeps: int = 1000,
-    return_all: bool = False,
-    verbose: bool = False,
-) -> dict:
-    start = time.perf_counter()
-    try:
-        qubo_dict, _ = precompiled_instance.to_qubo(penalty_weights=penalty_weights)
-        sampler = oj.SASampler()
-        response = sampler.sample_qubo(
-            qubo_dict,
-            num_reads=num_reads,
-            num_sweeps=num_sweeps,
-            sparse=True,
-        )
-        runtime = time.perf_counter() - start
-
-        x_sol = decode_solution(response, N)
-        energy = compute_energy_vectorized(x_sol, a, Q)
-        feas_detail = check_feasibility_vectorized(x_sol, neigh, K=instance_data["K"], fixed_neighbors=fixed_neighbors)
-        feasible = feas_detail["feasible"]
-        violation_rate = float(not feas_detail["budget_ok"]) * 0.5 + float(not feas_detail["connectivity_ok"]) * 0.5
-
-        all_samples = []
-        if return_all and hasattr(response, "record"):
-            for idx in range(response.record.shape[0]):
-                sample_arr = response.record['sample'][idx]
-                x_sample = np.zeros(N, dtype=int)
-                for var_idx, val in zip(response.indices, sample_arr):
-                    if var_idx < N:
-                        x_sample[var_idx] = int(round(val))
-                e_sample = compute_energy_vectorized(x_sample, a, Q)
-                f_sample = check_feasibility_vectorized(x_sample, neigh, K=instance_data["K"], fixed_neighbors=fixed_neighbors)
-                v_sample = float(not f_sample["budget_ok"]) * 0.5 + float(not f_sample["connectivity_ok"]) * 0.5
-                all_samples.append({
-                    "solution": x_sample.copy(),
-                    "energy": e_sample,
-                    "violation_rate": v_sample,
-                    "feasible": f_sample["feasible"],
-                    "budget_ok": f_sample["budget_ok"],
-                    "connectivity_ok": f_sample["connectivity_ok"],
-                    "num_selected": f_sample["num_selected"],
-                })
-
-        return {
-            "solution": x_sol,
-            "energy": energy,
-            "runtime": runtime,
-            "feasible": feasible,
-            "violation_rate": violation_rate,
-            "status": "feasible" if feasible else "infeasible",
-            "all_samples": all_samples if return_all else None,
-            "budget_ok": feas_detail["budget_ok"],
-            "connectivity_ok": feas_detail["connectivity_ok"],
-            "num_selected": feas_detail["num_selected"],
-            "isolated_indices": feas_detail["isolated_indices"],
-        }
-    except Exception as e:
-        runtime = time.perf_counter() - start
-        if verbose:
-            print(f"    SA error: {e}")
-        return {
-            "solution": None,
-            "energy": np.nan,
-            "runtime": runtime,
-            "feasible": False,
-            "violation_rate": 1.0,
-            "status": f"error: {e}",
-            "all_samples": None,
-            "budget_ok": False,
-            "connectivity_ok": False,
-            "num_selected": 0,
-            "isolated_indices": [],
-        }
 
 # -----------------------------------------------------------------------------
 # ADAPTER: Sparse → Dense (Q and neigh)
@@ -387,13 +287,12 @@ class MathematicalConvergenceEngine:
 
         floor_str = f"{self.floor_hits:2d}/{self.max_floor_hits:<2d}"
         pen_breakdown_str = f"{current_p:7.2f} (λb={lb:.2f}, λc={lc:.2f})"
-        # Print timing breakdown from user attrs
         qb_time = trial.user_attrs.get("qubo_build_time", 0.0)
         sa_time = trial.user_attrs.get("sa_sampling_time", 0.0)
         pp_time = trial.user_attrs.get("postprocess_time", 0.0)
         total_time = trial.user_attrs.get("runtime_sec", 0.0)
-        # Selected indices (free)
         sel_indices = trial.user_attrs.get("selected_free_indices", "")
+
         if is_feas:
             print(f"[Trial {trial.number:3d}] {status_str:<32} | Top-3 Avg: {current_e:10.4f} (std:{std_dev:6.4f}) | "
                   f"Feas: {feas_rate:6.1%} | Pen Sum: {pen_breakdown_str} | Floor: {floor_str} | Var σ: {sigma_str:<5} | "
@@ -434,7 +333,7 @@ class MathematicalConvergenceEngine:
                 study.stop()
 
 # -----------------------------------------------------------------------------
-# OBJECTIVE FACTORY (with timing breakdown)
+# OBJECTIVE FUNCTION (fully inlined, stores solution)
 # -----------------------------------------------------------------------------
 def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, snapped_indices, fixed_indices_orig, LAMBDA_LOWER, LAMBDA_UPPER):
     def objective(trial):
@@ -466,7 +365,6 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
 
         # 3. Post-processing (decode, compute energy, violation, master energy)
         all_samples = []
-        # Decode all samples
         for idx in range(response.record.shape[0]):
             sample_arr = response.record['sample'][idx]
             x_sample = np.zeros(N, dtype=int)
@@ -499,6 +397,7 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
         feas_rate = len(feasible_samples) / len(all_samples) if all_samples else 0.0
         trial.set_user_attr("feasibility_rate", feas_rate)
 
+        # Top-K energy
         if feasible_samples:
             feasible_samples.sort(key=lambda s: s["energy"])
             top_k_samples = feasible_samples[:min(TOP_K_ENERGY, len(feasible_samples))]
@@ -514,16 +413,18 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
         trial.set_user_attr("top_k_avg_energy", top_k_avg)
         trial.set_user_attr("top_k_energy_std_dev", top_k_std)
 
-        # Master energy
-        best_sample = all_samples[0]  # best by violation then energy
+        # Best solution (rank 0) – store for later plotting
+        best_sample = all_samples[0]
         x_best = best_sample["solution"]
+        trial.set_user_attr("winner_solution", x_best.tolist())   # store solution vector
+
+        # Master energy
         master_energy = compute_master_energy_from_solution(x_best, snapped_indices, fixed_indices_orig)
         trial.set_user_attr("master_energy", master_energy)
 
         # Selected indices (free)
         sel_free = np.where(x_best == 1)[0].tolist()
         trial.set_user_attr("selected_free_indices", str(sel_free))
-        # Also store master indices if needed
         sel_master = [snapped_indices[i] for i in sel_free if i < len(snapped_indices)]
         trial.set_user_attr("selected_master_indices", str(sel_master))
 
@@ -540,13 +441,10 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
 # PLOTTING FUNCTIONS (Deployment and QUBO Matrix)
 # -----------------------------------------------------------------------------
 def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150):
-    """Plot deployment map with existing and new stations."""
     coords_full = np.asarray(instance_data["original_coords"])
-    U_full = np.asarray(instance_data["original_U"]) if instance_data.get("original_U") is not None else None
     D_MAX = instance_data["D_max"]
     fixed_indices = list(instance_data.get("fixed_indices", []))
     free_indices = list(instance_data.get("original_indices", []))
-    snapped_indices = instance_data.get("snapped_indices", None)
     N_free = len(free_indices)
     N_total = len(coords_full)
 
@@ -638,22 +536,16 @@ def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150)
     plt.close(fig)
 
 def plot_qubo_matrix(precompiled_instance, penalty_weights, N, save_path=None, show=True, dpi=150, title_prefix=""):
-    """Plot the full QUBO matrix (with penalties) from the precompiled instance."""
     qubo_dict, offset = precompiled_instance.to_qubo(penalty_weights=penalty_weights)
-    # Build dense matrix
     Q_mat = np.zeros((N, N), dtype=float)
     for (i, j), val in qubo_dict.items():
-        # i and j can be tuples? Usually they are ints for binary variables.
         if isinstance(i, tuple): i = i[0]
         if isinstance(j, tuple): j = j[0]
         Q_mat[i, j] = val
-    # Make symmetric (QUBO dict may have only i<=j)
     Q_mat = Q_mat + Q_mat.T - np.diag(np.diag(Q_mat))
-    # Add offset to diagonal? offset is constant, not needed for visualization.
-
-    fig, ax = plt.subplots(figsize=(8, 7))
     max_abs = np.max(np.abs(Q_mat)) if np.max(np.abs(Q_mat)) > 0 else 1.0
     norm = mcolors.Normalize(vmin=-max_abs, vmax=max_abs)
+    fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(Q_mat, cmap='RdBu_r', aspect='auto', norm=norm)
     ax.set_title(f"{title_prefix}QUBO Matrix (with penalties) N={N}", fontsize=12, fontweight='bold')
     ax.set_xlabel("Variable Index")
@@ -712,7 +604,7 @@ for instance_path in instance_files:
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
     precompiled_instance = compile_instance(model, filtered_data)
 
-    LAMBDA_UPPER = qsum  # as per your request, no multiplier
+    LAMBDA_UPPER = qsum  # as requested, no multiplier
 
     study_name = f"sa_tuning_N{N_true}_{RUN_ID}"
     local_db = LOCAL_CACHE / f"{study_name}.db"
@@ -783,6 +675,7 @@ for instance_path in instance_files:
     winner_feas_rate = winner.user_attrs["feasibility_rate"]
     winner_sel_free = winner.user_attrs.get("selected_free_indices", "")
     winner_sel_master = winner.user_attrs.get("selected_master_indices", "")
+    winner_solution = winner.user_attrs.get("winner_solution", None)
 
     # Print tie-break table
     print(f"\n{'='*115}")
@@ -824,33 +717,18 @@ for instance_path in instance_files:
         wandb_run.summary["winning_penalty_sum"] = winner_penalty_sum
 
     # Generate deployment and QUBO matrix plots for the winner
-    # We need the solution vector for the winner
-    # Retrieve from winner's trial user attrs? We didn't store the actual solution vector.
-    # We need to recompute the solution from the winner's parameters.
-    # We can re-run the solver for the winner with the tuned penalties.
-    winner_penalty_weights = get_penalty_weights(precompiled_instance, winner_lb, winner_lc)
-    result_winner = solve_sa_jij_inlined(
-        precompiled_instance=precompiled_instance,
-        penalty_weights=winner_penalty_weights,
-        N=N,
-        a=a,
-        Q=Q,
-        neigh=neigh,
-        fixed_neighbors=fixed_neighbors,
-        num_reads=NUM_READS,
-        num_sweeps=NUM_SWEEPS,
-        return_all=False,
-        verbose=False,
-    )
-    x_winner = result_winner["solution"]
+    if winner_solution is not None:
+        x_winner = np.asarray(winner_solution, dtype=int)
+        # Deployment plot
+        deploy_save_path = RUN_DIR / f"deployment_SA_N{N_true}_K{K}.png"
+        plot_deployment(instance_data, x_winner, save_path=deploy_save_path, show=False, dpi=150)
 
-    # Save deployment plot
-    deploy_save_path = RUN_DIR / f"deployment_SA_N{N_true}_K{K}.png"
-    plot_deployment(instance_data, x_winner, save_path=deploy_save_path, show=False, dpi=150)
-
-    # Save QUBO matrix plot
-    qubo_save_path = RUN_DIR / f"qubo_matrix_SA_N{N_true}_K{K}.png"
-    plot_qubo_matrix(precompiled_instance, winner_penalty_weights, N, save_path=qubo_save_path, show=False, dpi=150, title_prefix=f"SA Tuned N={N_true} | ")
+        # QUBO matrix plot (use winner's lambdas)
+        winner_penalty_weights = get_penalty_weights(precompiled_instance, winner_lb, winner_lc)
+        qubo_save_path = RUN_DIR / f"qubo_matrix_SA_N{N_true}_K{K}.png"
+        plot_qubo_matrix(precompiled_instance, winner_penalty_weights, N, save_path=qubo_save_path, show=False, dpi=150, title_prefix=f"SA Tuned N={N_true} | ")
+    else:
+        print(f"⚠️ No solution vector stored for winner of N={N_true}. Skipping plots.")
 
     # Save tuned parameters to JSON
     tuned_params = {
