@@ -1,12 +1,13 @@
-#@title 🔬 CELL 6: SA TUNE v4.4 (Inlined JijModeling, Fixed Master Energy, Continuous Violations)
+#@title 🔬 CELL 6: SA TUNE v4.5 (Inlined JijModeling, Fresh Compilation per Trial)
 """
 ================================================================================
-SA TUNING WITH OPTUNA v4.4 – INLINED JIJMODELING + FIXED MASTER ENERGY
+SA TUNING WITH OPTUNA v4.5 – INLINED JIJMODELING + FIXED MASTER ENERGY
 ================================================================================
 - Inlined JijModeling functions (no external src.jij_model import).
 - Connectivity constraint includes fixed_neighbors.
 - Master energy uses snapped_indices and N_free to map fixed stations.
 - Budget and isolation violations are logged as magnitudes, not binary.
+- **FIXED**: Compiles a fresh JijModeling instance every trial to avoid mutation.
 - Plots appear (show=True) in the notebook.
 - All timing breakdowns preserved.
 ================================================================================
@@ -396,9 +397,15 @@ class MathematicalConvergenceEngine:
                 study.stop()
 
 # -----------------------------------------------------------------------------
-# OBJECTIVE FUNCTION (with fixed master energy & K_total)
+# OBJECTIVE FUNCTION (with fresh compilation per trial)
 # -----------------------------------------------------------------------------
-def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, snapped_indices, LAMBDA_LOWER, LAMBDA_UPPER):
+def make_objective(instance_data, N, K, a, Q, neigh, fixed_neighbors, snapped_indices, LAMBDA_LOWER, LAMBDA_UPPER):
+    # Build the model once; it will be compiled fresh each trial
+    model = build_augmented_model()
+    # Filter the static data for placeholders (N, K, a, Q, neigh, fixed_neighbors)
+    model_keys = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
+    filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
+
     def objective(trial):
         start_time = time.perf_counter()
         lambda_budget = trial.suggest_float("lambda_budget", LAMBDA_LOWER, LAMBDA_UPPER, log=True)
@@ -408,10 +415,13 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
         trial.set_user_attr("lambda_conn", lambda_conn)
         trial.set_user_attr("penalty_sum", penalty_sum)
 
+        # ---- Compile a fresh instance for this trial ----
+        instance = compile_instance(model, filtered_data)
+
         # 1. QUBO build time
         t0 = time.perf_counter()
-        penalty_weights = get_penalty_weights(precompiled_instance, lambda_budget, lambda_conn)
-        qubo_dict, _ = precompiled_instance.to_qubo(penalty_weights=penalty_weights)
+        penalty_weights = get_penalty_weights(instance, lambda_budget, lambda_conn)
+        qubo_dict, _ = instance.to_qubo(penalty_weights=penalty_weights)
         t1 = time.perf_counter()
         qubo_build_time = t1 - t0
 
@@ -484,7 +494,6 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
 
         # Log winner violations (optional but helpful)
         winner_budget_dev = abs(int(np.sum(x_best)) - K)
-        # winner_iso_count from the already computed check_feasibility_vectorized for best sample:
         winner_iso_count = len(best_sample["isolated_indices"])
         trial.set_user_attr("winner_budget_dev", winner_budget_dev)
         trial.set_user_attr("winner_iso_count", winner_iso_count)
@@ -613,8 +622,8 @@ def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150)
         plt.show()
     plt.close(fig)
 
-def plot_qubo_matrix(precompiled_instance, penalty_weights, N, save_path=None, show=True, dpi=150, title_prefix=""):
-    qubo_dict, offset = precompiled_instance.to_qubo(penalty_weights=penalty_weights)
+def plot_qubo_matrix(instance, penalty_weights, N, save_path=None, show=True, dpi=150, title_prefix=""):
+    qubo_dict, offset = instance.to_qubo(penalty_weights=penalty_weights)
     Q_mat = np.zeros((N, N), dtype=float)
     
     def extract_idx(key):
@@ -672,7 +681,7 @@ tuned_params_all = {}
 
 for instance_path in instance_files:
     N_true = int(pattern.search(instance_path.name).group(1))
-    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (All Tiers, Vectorized, Continuous Violations)\n{'='*115}")
+    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (Fresh Compilation per Trial, Continuous Violations)\n{'='*115}")
 
     with open(instance_path, "rb") as f:
         instance_data = pickle.load(f)
@@ -689,13 +698,6 @@ for instance_path in instance_files:
     # Compute qsum
     qsum = np.sum(np.abs(a)) + np.sum(np.abs(np.triu(Q, 1)))
     print(f"📏 qsum for N={N_true}: {qsum:.4f}")
-
-    # Precompile instance WITH fixed_neighbors and using K_total
-    model = build_augmented_model()
-    # Model keys: N, K, a, Q, neigh, fixed_neighbors
-    model_keys = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
-    filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
-    precompiled_instance = compile_instance(model, filtered_data)
 
     LAMBDA_UPPER = qsum
 
@@ -725,7 +727,7 @@ for instance_path in instance_files:
         return [trial.user_attrs.get("Mth_budget_dev", 1e9), trial.user_attrs.get("Mth_isolated_count", 1e9)]
 
     objective = make_objective(
-        precompiled_instance=precompiled_instance,
+        instance_data=instance_data,
         N=N,
         K=K,
         a=a,
@@ -815,10 +817,15 @@ for instance_path in instance_files:
         deploy_save_path = RUN_DIR / f"deployment_SA_N{N_true}_K{K}.png"
         plot_deployment(instance_data, x_winner, save_path=deploy_save_path, show=True, dpi=150)
 
-        # QUBO matrix plot (show=True)
-        winner_penalty_weights = get_penalty_weights(precompiled_instance, winner_lb, winner_lc)
+        # QUBO matrix plot (show=True) – re‑compile instance for plotting
+        # (we don't have the instance here, but we can create a fresh one)
+        model_plot = build_augmented_model()
+        model_keys_plot = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
+        filtered_data_plot = {k: v for k, v in instance_data.items() if k in model_keys_plot}
+        instance_plot = compile_instance(model_plot, filtered_data_plot)
+        winner_penalty_weights = get_penalty_weights(instance_plot, winner_lb, winner_lc)
         qubo_save_path = RUN_DIR / f"qubo_matrix_SA_N{N_true}_K{K}.png"
-        plot_qubo_matrix(precompiled_instance, winner_penalty_weights, N, save_path=qubo_save_path, show=True, dpi=150, title_prefix=f"SA Tuned N={N_true} | ")
+        plot_qubo_matrix(instance_plot, winner_penalty_weights, N, save_path=qubo_save_path, show=True, dpi=150, title_prefix=f"SA Tuned N={N_true} | ")
     else:
         print(f"⚠️ No solution vector stored for winner of N={N_true}. Skipping plots.")
 
