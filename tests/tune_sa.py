@@ -538,15 +538,29 @@ def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150)
 def plot_qubo_matrix(precompiled_instance, penalty_weights, N, save_path=None, show=True, dpi=150, title_prefix=""):
     qubo_dict, offset = precompiled_instance.to_qubo(penalty_weights=penalty_weights)
     Q_mat = np.zeros((N, N), dtype=float)
-    for (i, j), val in qubo_dict.items():
-        # Ensure we extract integer indices; if they are tuples like ('x', idx), take the second element
-        if isinstance(i, tuple):
-            i = i[1] if len(i) > 1 else i[0]
-        if isinstance(j, tuple):
-            j = j[1] if len(j) > 1 else j[0]
+    
+    for (key_i, key_j), val in qubo_dict.items():
+        # Extract integer indices from possibly nested tuples
+        def extract_idx(key):
+            if isinstance(key, tuple):
+                # If key is like ('x', idx), take idx; if it's like (('x', idx),) or (idx,), handle
+                if len(key) == 2 and isinstance(key[0], str) and key[0] == 'x':
+                    return key[1]
+                else:
+                    # Fallback: assume the first element that is not a string is the index
+                    for elem in key:
+                        if not isinstance(elem, str):
+                            return elem
+                    return key[0]  # last resort
+            else:
+                return key
+        
+        i = extract_idx(key_i)
+        j = extract_idx(key_j)
         # Only keep entries for the original free variables (0..N-1)
-        if i < N and j < N:
+        if isinstance(i, int) and isinstance(j, int) and i < N and j < N:
             Q_mat[i, j] = val
+    
     # Symmetrize (QUBO dict may only contain i<=j)
     Q_mat = Q_mat + Q_mat.T - np.diag(np.diag(Q_mat))
     max_abs = np.max(np.abs(Q_mat)) if np.max(np.abs(Q_mat)) > 0 else 1.0
@@ -727,12 +741,12 @@ for instance_path in instance_files:
         x_winner = np.asarray(winner_solution, dtype=int)
         # Deployment plot
         deploy_save_path = RUN_DIR / f"deployment_SA_N{N_true}_K{K}.png"
-        plot_deployment(instance_data, x_winner, save_path=deploy_save_path, show=False, dpi=150)
+        plot_deployment(instance_data, x_winner, save_path=deploy_save_path, show=True, dpi=150)
 
         # QUBO matrix plot (use winner's lambdas)
         winner_penalty_weights = get_penalty_weights(precompiled_instance, winner_lb, winner_lc)
         qubo_save_path = RUN_DIR / f"qubo_matrix_SA_N{N_true}_K{K}.png"
-        plot_qubo_matrix(precompiled_instance, winner_penalty_weights, N, save_path=qubo_save_path, show=False, dpi=150, title_prefix=f"SA Tuned N={N_true} | ")
+        plot_qubo_matrix(precompiled_instance, winner_penalty_weights, N, save_path=qubo_save_path, show=True, dpi=150, title_prefix=f"SA Tuned N={N_true} | ")
     else:
         print(f"⚠️ No solution vector stored for winner of N={N_true}. Skipping plots.")
 
@@ -751,7 +765,6 @@ for instance_path in instance_files:
         "winner_trial_number": int(winner.number),
         "num_trials": len(completed),
         "num_feasible_trials": len(feasible),
-        "early_stopped": study.should_stop,
     }
     tuned_params_all[N_true] = tuned_params
 
