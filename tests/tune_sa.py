@@ -539,15 +539,21 @@ def plot_qubo_matrix(precompiled_instance, penalty_weights, N, save_path=None, s
     qubo_dict, offset = precompiled_instance.to_qubo(penalty_weights=penalty_weights)
     Q_mat = np.zeros((N, N), dtype=float)
     for (i, j), val in qubo_dict.items():
-        if isinstance(i, tuple): i = i[0]
-        if isinstance(j, tuple): j = j[0]
-        Q_mat[i, j] = val
+        # Ensure we extract integer indices; if they are tuples like ('x', idx), take the second element
+        if isinstance(i, tuple):
+            i = i[1] if len(i) > 1 else i[0]
+        if isinstance(j, tuple):
+            j = j[1] if len(j) > 1 else j[0]
+        # Only keep entries for the original free variables (0..N-1)
+        if i < N and j < N:
+            Q_mat[i, j] = val
+    # Symmetrize (QUBO dict may only contain i<=j)
     Q_mat = Q_mat + Q_mat.T - np.diag(np.diag(Q_mat))
     max_abs = np.max(np.abs(Q_mat)) if np.max(np.abs(Q_mat)) > 0 else 1.0
     norm = mcolors.Normalize(vmin=-max_abs, vmax=max_abs)
     fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(Q_mat, cmap='RdBu_r', aspect='auto', norm=norm)
-    ax.set_title(f"{title_prefix}QUBO Matrix (with penalties) N={N}", fontsize=12, fontweight='bold')
+    ax.set_title(f"{title_prefix}QUBO Matrix (free variables) N={N}", fontsize=12, fontweight='bold')
     ax.set_xlabel("Variable Index")
     ax.set_ylabel("Variable Index")
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
