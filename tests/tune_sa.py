@@ -1,12 +1,12 @@
-#@title 🔬 CELL 6: SA TUNE v4.3 (Inlined JijModeling, Fixed Master Energy, Fixed Connectivity)
+#@title 🔬 CELL 6: SA TUNE v4.4 (Inlined JijModeling, Fixed Master Energy, Continuous Violations)
 """
 ================================================================================
-SA TUNING WITH OPTUNA v4.3 – INLINED JIJMODELING + FIXED MASTER ENERGY
+SA TUNING WITH OPTUNA v4.4 – INLINED JIJMODELING + FIXED MASTER ENERGY
 ================================================================================
 - Inlined JijModeling functions (no external src.jij_model import).
 - Connectivity constraint includes fixed_neighbors.
 - Master energy uses snapped_indices and N_free to map fixed stations.
-- Fixed budget constraint: uses "K_total" in JijModeling data.
+- Budget and isolation violations are logged as magnitudes, not binary.
 - Plots appear (show=True) in the notebook.
 - All timing breakdowns preserved.
 ================================================================================
@@ -110,13 +110,25 @@ def build_augmented_model() -> jm.Problem:
     return problem
 
 def get_penalty_weights(instance, lambda_budget: float, lambda_conn: float) -> dict:
-    """Map OMMX constraint IDs to penalty weights."""
+    """Map constraint names to penalty weights, using constraint IDs.
+    Raises ValueError if budget or connectivity constraints are missing.
+    """
     penalty_weights = {}
+    # Debug: print available constraints (can be removed after verification)
+    # print(f"🔍 Available constraints in instance:")
+    # for c in instance.constraints:
+    #     print(f"   ID: {c.id}, Name: '{c.name}'")
+    # Assign weights
     for c in instance.constraints:
         if c.name == "budget":
             penalty_weights[c.id] = lambda_budget
         elif c.name == "connectivity":
             penalty_weights[c.id] = lambda_conn
+    # Check that both were found
+    if "budget" not in [c.name for c in instance.constraints]:
+        raise ValueError("Budget constraint not found in instance!")
+    if "connectivity" not in [c.name for c in instance.constraints]:
+        raise ValueError("Connectivity constraint not found in instance!")
     return penalty_weights
 
 def compile_instance(problem: jm.Problem, instance_data: dict):
@@ -433,13 +445,16 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
                 "budget_ok": f_sample["budget_ok"],
                 "connectivity_ok": f_sample["connectivity_ok"],
                 "num_selected": f_sample["num_selected"],
+                "isolated_indices": f_sample["isolated_indices"],
             })
 
         all_samples.sort(key=lambda s: (s["violation_rate"], s["energy"]))
         m_idx = min(FEASIBILITY_RANK_THRESHOLD - 1, len(all_samples) - 1)
         m_sample = all_samples[m_idx]
-        m_budget = float(not m_sample["budget_ok"])
-        m_isolated = float(not m_sample["connectivity_ok"])
+
+        # --- FIX: use actual magnitudes, not binary ---
+        m_budget = float(abs(m_sample["num_selected"] - K))
+        m_isolated = float(len(m_sample["isolated_indices"]))
         trial.set_user_attr("Mth_budget_dev", m_budget)
         trial.set_user_attr("Mth_isolated_count", m_isolated)
 
@@ -466,6 +481,13 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
         best_sample = all_samples[0]
         x_best = best_sample["solution"]
         trial.set_user_attr("winner_solution", x_best.tolist())
+
+        # Log winner violations (optional but helpful)
+        winner_budget_dev = abs(int(np.sum(x_best)) - K)
+        # winner_iso_count from the already computed check_feasibility_vectorized for best sample:
+        winner_iso_count = len(best_sample["isolated_indices"])
+        trial.set_user_attr("winner_budget_dev", winner_budget_dev)
+        trial.set_user_attr("winner_iso_count", winner_iso_count)
 
         # Master energy – using corrected function
         master_energy = compute_master_energy_from_solution(x_best, snapped_indices, N)
@@ -650,7 +672,7 @@ tuned_params_all = {}
 
 for instance_path in instance_files:
     N_true = int(pattern.search(instance_path.name).group(1))
-    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (All Tiers, Vectorized)\n{'='*115}")
+    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (All Tiers, Vectorized, Continuous Violations)\n{'='*115}")
 
     with open(instance_path, "rb") as f:
         instance_data = pickle.load(f)
@@ -698,6 +720,7 @@ for instance_path in instance_files:
         wandb_run=wandb_run,
     )
 
+    # Constraints function: pass the actual magnitudes
     def constraint_func(trial):
         return [trial.user_attrs.get("Mth_budget_dev", 1e9), trial.user_attrs.get("Mth_isolated_count", 1e9)]
 
