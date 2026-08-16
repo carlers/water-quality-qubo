@@ -622,9 +622,8 @@ for instance_path in instance_files:
     # Precompile instance WITH fixed_neighbors and using K_total
     model = build_augmented_model()
     # Model keys: we need to pass K_total, not K
-    model_keys = {"N", "a", "Q", "neigh", "fixed_neighbors"}
+    model_keys = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
-    filtered_data["K_total"] = K   # <-- FIX: use K_total as expected by the model
     precompiled_instance = compile_instance(model, filtered_data)
 
     LAMBDA_UPPER = qsum
