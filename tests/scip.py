@@ -1,12 +1,12 @@
-#@title 🎯 CELL 5: MIQP SOLVE WITH SCIP (Sparse, Pure Solver Timing)
+#@title 🎯 CELL 5: MIQP SOLVE WITH SCIP (Sparse, Pure Solver Timing) – FIXED
 """
 ================================================================================
-MIQP SOLVE WITH SCIP – REAL DATA (MULTI-TIER)
+MIQP SOLVE WITH SCIP – REAL DATA (MULTI-TIER) – FIXED
 ================================================================================
 - Loads sparse instance data from Cell 4.
 - Rebuilds MIQP instance instantly (excluded from timer).
 - Times ONLY SCIP optimize().
-- Computes tier energy and master (global) energy using sparse helpers.
+- Computes tier energy and master (global) energy using snapped_indices.
 - Falls back to greedy if SCIP fails.
 ================================================================================
 """
@@ -88,7 +88,6 @@ def check_feasibility_sparse(x, neighbors, K, fixed_neighbors=None):
         has_free = any(x[j] for j in neighbors[i])
         has_fixed = False
         if not has_free and fixed_neighbors is not None:
-            # fixed_neighbors can be array of bool or int
             if isinstance(fixed_neighbors, (list, np.ndarray)):
                 has_fixed = bool(fixed_neighbors[i])
             elif isinstance(fixed_neighbors, dict):
@@ -229,7 +228,7 @@ def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Pro
     return problem
 
 # -----------------------------------------------------------------------------
-# SCIP SOLVER WRAPPER (sparse)
+# SCIP SOLVER WRAPPER (sparse) – with ROUNDING FIX
 # -----------------------------------------------------------------------------
 def solve_scip_sparse(instance_data, verbose=False):
     if not SCIP_AVAILABLE:
@@ -281,13 +280,16 @@ def solve_scip_sparse(instance_data, verbose=False):
                 "status": "SCIP error: solution is None", "feasible": False,
                 "violation_rate": 1.0}
 
-    # Extract binary solution
+    # -------------------------------------------------------------------------
+    # CRITICAL FIX 1: Proper rounding of floating-point SCIP solutions
+    # -------------------------------------------------------------------------
     x_sol = np.zeros(N, dtype=int)
     if hasattr(solution, "decision_variables_df"):
         df = solution.decision_variables_df
         x_df = df[df["name"] == "x"]
         for _, row in x_df.iterrows():
-            if row["value"] == 1:
+            # Use > 0.5 to catch 0.9999999, then convert to int
+            if row["value"] > 0.5:
                 subs = row["subscripts"]
                 idx = subs[0] if isinstance(subs, (tuple, list)) and len(subs) > 0 else int(subs)
                 if 0 <= idx < N:
@@ -298,7 +300,8 @@ def solve_scip_sparse(instance_data, verbose=False):
                 if isinstance(var_id, tuple) and var_id[0] == "x":
                     idx = var_id[1]
                     if 0 <= idx < N:
-                        x_sol[idx] = int(value)
+                        # Round floating point values before casting
+                        x_sol[idx] = int(round(value))
 
     # Compute tier energy using sparse helper
     tier_energy = compute_energy_sparse(x_sol, a, Q_edges)
@@ -323,12 +326,14 @@ def solve_scip_sparse(instance_data, verbose=False):
 # PLOTTING FUNCTIONS (adapted for sparse data)
 # -----------------------------------------------------------------------------
 def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
-    """Plot deployment map with existing and new stations."""
+    """Plot deployment map with existing and new stations, using snapped_indices."""
     coords_full = np.asarray(instance_data["original_coords"])
     U_full = np.asarray(instance_data["original_U"]) if instance_data.get("original_U") is not None else None
     D_MAX = instance_data["D_max"]
     fixed_indices = list(instance_data.get("fixed_indices", []))
     free_indices = list(instance_data.get("original_indices", []))
+    snapped_indices = instance_data.get("snapped_indices", None)
+    
     N_free = len(free_indices)
     N_total = len(coords_full)
 
@@ -338,6 +343,7 @@ def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
     else:
         x_sol = np.asarray(x_sol)
 
+    # Map local free indices to original master indices
     selected_free_orig = [free_indices[i] for i in np.where(x_sol == 1)[0] if i < len(free_indices)]
     selected_new = [i for i in selected_free_orig if i not in fixed_indices]
     selected_m = fixed_indices
@@ -446,7 +452,9 @@ def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
     plt.close(fig)
 
 def plot_miqp_matrix_reduced(instance_data, save_path=None, show=True, dpi=150, title_prefix=""):
-    """Plot reduced MIQP matrix (reconstructed from sparse data)."""
+    """
+    Plot reduced MIQP matrix with off‑diagonal scaling to make quadratic terms visible.
+    """
     N = instance_data["N"]
     a = np.asarray(instance_data["a"])
     Q_edges = instance_data["Q_edges"]
@@ -463,14 +471,25 @@ def plot_miqp_matrix_reduced(instance_data, save_path=None, show=True, dpi=150, 
         mat[j, i] = val
 
     fig, ax = plt.subplots(figsize=(7, 5.5))
-    max_abs = np.max(np.abs(mat)) if np.max(np.abs(mat)) > 0 else 1.0
-    norm = mcolors.Normalize(vmin=-max_abs, vmax=max_abs)
+    
+    off_diag_mask = ~np.eye(N, dtype=bool)
+    off_diag_vals = mat[off_diag_mask]
+    max_off = np.max(np.abs(off_diag_vals)) if len(off_diag_vals) > 0 else 0.0
+    
+    if max_off > 0:
+        norm = mcolors.Normalize(vmin=-max_off, vmax=max_off)
+        cbar_label = "Coefficient Value (Off‑diagonal scaled)"
+    else:
+        max_abs = np.max(np.abs(mat)) if np.max(np.abs(mat)) > 0 else 1.0
+        norm = mcolors.Normalize(vmin=-max_abs, vmax=max_abs)
+        cbar_label = "Coefficient Value (Full scale)"
+
     im = ax.imshow(mat, cmap='RdBu_r', aspect='auto', norm=norm)
     ax.set_title(f"{title_prefix}Reduced MIQP Matrix (N={N})", fontsize=12, fontweight='bold', pad=12)
     ax.set_xlabel("Variable Index", fontsize=10)
     ax.set_ylabel("Variable Index", fontsize=10)
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Coefficient Value", fontsize=9)
+    cbar.set_label(cbar_label, fontsize=9)
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
@@ -523,6 +542,7 @@ for instance_path in instance_files:
     K = instance_data["K"]
     dmax = instance_data.get("D_max", 0.0)
     fixed_count = len(instance_data["fixed_indices"])
+    snapped_indices = instance_data.get("snapped_indices", None)
 
     scip_filename = f"scip_result_N{N_true}_K{K}_Dmax{int(dmax)}_M{fixed_count}.pkl"
     scip_local = LOCAL_CACHE / scip_filename
@@ -589,21 +609,44 @@ for instance_path in instance_files:
             pickle.dump(scip_result, f)
         print(f"✅ SCIP result saved for N={N_true}.")
 
-    # ---- COMPUTE MASTER ENERGY (always compute fresh) ----
+    # ---- COMPUTE MASTER ENERGY (using snapped_indices) ----
     master_energy_val = np.nan
-    if scip_result.get("solution") is not None:
+    if scip_result.get("solution") is not None and snapped_indices is not None:
         x_sol = np.asarray(scip_result["solution"], dtype=int)
         free_indices = instance_data["original_indices"]
         fixed_indices = instance_data["fixed_indices"]
-
-        # Map to master grid
+        
+        # Build master assignment using snapped_indices
+        x_master = np.zeros(len(a_master), dtype=int)
+        N_free = len(free_indices)
+        
+        # Free variables: x_sol corresponds to the first N_free entries of snapped_indices
+        for idx, val in enumerate(x_sol):
+            if val == 1:
+                master_idx = snapped_indices[idx]
+                if 0 <= master_idx < len(a_master):
+                    x_master[master_idx] = 1
+        
+        # Fixed stations: the last len(fixed_indices) entries of snapped_indices
+        for k, f_idx in enumerate(fixed_indices):
+            # The fixed station's position in snapped_indices is N_free + k
+            master_idx = snapped_indices[N_free + k]
+            if 0 <= master_idx < len(a_master):
+                x_master[master_idx] = 1
+        
+        master_energy_val = compute_energy_sparse(x_master, a_master, Q_master_edges)
+    elif scip_result.get("solution") is not None:
+        # Fallback (should not happen if Cell 4 was run correctly)
+        print("  ⚠️ snapped_indices not found; falling back to free_indices mapping (may be incorrect).")
+        x_sol = np.asarray(scip_result["solution"], dtype=int)
+        free_indices = instance_data["original_indices"]
+        fixed_indices = instance_data["fixed_indices"]
         x_master = np.zeros(len(a_master), dtype=int)
         for idx, val in enumerate(x_sol):
             if val == 1 and idx < len(free_indices):
                 x_master[free_indices[idx]] = 1
         for f_idx in fixed_indices:
             x_master[f_idx] = 1
-
         master_energy_val = compute_energy_sparse(x_master, a_master, Q_master_edges)
 
     scip_result["master_energy"] = master_energy_val
@@ -650,7 +693,7 @@ for instance_path in instance_files:
 # SUMMARY TABLE
 # -----------------------------------------------------------------------------
 print("\n" + "=" * 105)
-print("📊 SUMMARY OF ALL SOLVED TIERS (WITH MASTER GRID ENERGY)")
+print("📊 SUMMARY OF ALL SOLVED TIERS (WITH MASTER GRID ENERGY – FIXED)")
 print("=" * 105)
 print(f"{'N_true':<8} | {'N_free':<8} | {'K':<4} | {'D_max (m)':<10} | {'Tier Energy':<13} | {'Master Energy':<14} | {'Runtime(s)':<11} | {'Feasible':<9} | {'Status':<12}")
 print("-" * 105)
@@ -659,4 +702,4 @@ for res in all_results:
     print(f"{res['N_true']:<8} | {res['N_free']:<8} | {res['K']:<4} | {res['D_max']:<10.1f} | {res['energy']:<13.6f} | {m_energy_str:<14} | {res['runtime']:<11.4f} | {str(res['feasible']):<9} | {res['status']:<12}")
 print("=" * 105)
 
-print("\n✅ All SCIP solves complete.")
+print("\n✅ All SCIP solves complete (fixed version).")
