@@ -1,12 +1,14 @@
-#@title 🔬 CELL 6: SA TUNE v4.2 (Fixed Master Energy, K_total, plots show=True)
+#@title 🔬 CELL 6: SA TUNE v4.3 (Inlined JijModeling, Fixed Master Energy, Fixed Connectivity)
 """
 ================================================================================
-SA TUNING WITH OPTUNA v4.2 – FIXED MASTER ENERGY & BUDGET CONSTRAINT
+SA TUNING WITH OPTUNA v4.3 – INLINED JIJMODELING + FIXED MASTER ENERGY
 ================================================================================
-- Fixed master energy: uses fixed_indices_orig (original master indices).
-- Fixed budget constraint: uses "K_total" instead of "K" in JijModeling data.
-- Plots now appear (show=True) in the notebook.
-- All other features: timing breakdown, selected indices, QUBO matrix, deployment.
+- Inlined JijModeling functions (no external src.jij_model import).
+- Connectivity constraint includes fixed_neighbors.
+- Master energy uses snapped_indices and N_free to map fixed stations.
+- Fixed budget constraint: uses "K_total" in JijModeling data.
+- Plots appear (show=True) in the notebook.
+- All timing breakdowns preserved.
 ================================================================================
 """
 
@@ -18,7 +20,6 @@ import optuna
 import wandb
 import openjij as oj
 import jijmodeling as jm
-from src.jij_model import build_augmented_model, compile_instance, get_penalty_weights
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.colors as mcolors
@@ -79,6 +80,52 @@ LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------------------------
+# INLINED JijModeling FUNCTIONS (formerly src.jij_model)
+# -----------------------------------------------------------------------------
+def build_augmented_model() -> jm.Problem:
+    """Build the JijModeling Problem with budget + connectivity (includes fixed_neighbors)."""
+    problem = jm.Problem("WQM_Augmented", sense=jm.ProblemSense.MINIMIZE)
+
+    N_ph = problem.Length("N")
+    K_ph = problem.Length("K")
+    a_ph = problem.Float("a", shape=(N_ph,))
+    Q_ph = problem.Float("Q", shape=(N_ph, N_ph))
+    neigh_ph = problem.Binary("neigh", shape=(N_ph, N_ph))
+    fixed_neighbors_ph = problem.Float("fixed_neighbors", shape=(N_ph,))
+    x = problem.BinaryVar("x", shape=(N_ph,))
+
+    obj_linear = jm.sum(N_ph, lambda i: a_ph[i] * x[i])
+    obj_quad = jm.sum(
+        jm.product(N_ph, N_ph).filter(lambda i, j: i < j),
+        lambda i, j: Q_ph[i, j] * x[i] * x[j]
+    )
+    problem += obj_linear + obj_quad
+
+    problem += problem.Constraint("budget", jm.sum(N_ph, lambda i: x[i]) == K_ph)
+    problem += problem.Constraint(
+        "connectivity",
+        lambda i: x[i] <= fixed_neighbors_ph[i] + jm.sum(N_ph, lambda j: neigh_ph[i, j] * x[j]),
+        domain=N_ph
+    )
+    return problem
+
+def get_penalty_weights(instance, lambda_budget: float, lambda_conn: float) -> dict:
+    """Map OMMX constraint IDs to penalty weights."""
+    penalty_weights = {}
+    for c in instance.constraints:
+        if c.name == "budget":
+            penalty_weights[c.id] = lambda_budget
+        elif c.name == "connectivity":
+            penalty_weights[c.id] = lambda_conn
+    return penalty_weights
+
+def compile_instance(problem: jm.Problem, instance_data: dict):
+    """Compile the JijModeling problem with given data."""
+    placeholder_names = {p.name for p in problem.placeholders.values()}
+    filtered = {k: v for k, v in instance_data.items() if k in placeholder_names}
+    return problem.eval(filtered)
+
+# -----------------------------------------------------------------------------
 # LOAD MASTER DATA (for master energy computation)
 # -----------------------------------------------------------------------------
 master_path = GDRIVE_BASE / "master_real.pkl"
@@ -102,21 +149,25 @@ def compute_energy_sparse(x: np.ndarray, a: np.ndarray, Q_edges: list) -> float:
             energy += val
     return float(energy)
 
-def compute_master_energy_from_solution(x_sol, snapped_indices, fixed_indices_orig):
-    """Map local free solution to master grid using original master indices for fixed stations."""
+def compute_master_energy_from_solution(x_sol, snapped_indices, N_free):
+    """
+    Map local free solution + fixed stations (implicitly) to master grid using snapped_indices.
+    snapped_indices: array of master indices for all variables: [free_1..free_N, fixed_1..fixed_M]
+    N_free: number of free variables (length of x_sol)
+    """
     x_master = np.zeros(len(a_master), dtype=int)
-    # Free variables: use snapped_indices to map local index -> master index
+    # Free variables
     for idx, val in enumerate(x_sol):
         if val == 1:
             master_idx = snapped_indices[idx]
-            if 0 <= master_idx < len(a_master):
+            if master_idx < len(a_master):
                 x_master[master_idx] = 1
-    # Fixed stations: fixed_indices_orig are already master grid indices
-    for f_idx in fixed_indices_orig:
-        if 0 <= f_idx < len(a_master):
-            x_master[f_idx] = 1
-    energy = compute_energy_sparse(x_master, a_master, Q_master_edges)
-    return energy
+    # Fixed stations: indices from N_free to end
+    for k in range(N_free, len(snapped_indices)):
+        master_idx = snapped_indices[k]
+        if master_idx < len(a_master):
+            x_master[master_idx] = 1
+    return compute_energy_sparse(x_master, a_master, Q_master_edges)
 
 # -----------------------------------------------------------------------------
 # VECTORIZED HELPER FUNCTIONS
@@ -335,7 +386,7 @@ class MathematicalConvergenceEngine:
 # -----------------------------------------------------------------------------
 # OBJECTIVE FUNCTION (with fixed master energy & K_total)
 # -----------------------------------------------------------------------------
-def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, snapped_indices, fixed_indices_orig, LAMBDA_LOWER, LAMBDA_UPPER):
+def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, snapped_indices, LAMBDA_LOWER, LAMBDA_UPPER):
     def objective(trial):
         start_time = time.perf_counter()
         lambda_budget = trial.suggest_float("lambda_budget", LAMBDA_LOWER, LAMBDA_UPPER, log=True)
@@ -416,8 +467,8 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
         x_best = best_sample["solution"]
         trial.set_user_attr("winner_solution", x_best.tolist())
 
-        # Master energy – use fixed_indices_orig (original master indices)
-        master_energy = compute_master_energy_from_solution(x_best, snapped_indices, fixed_indices_orig)
+        # Master energy – using corrected function
+        master_energy = compute_master_energy_from_solution(x_best, snapped_indices, N)
         trial.set_user_attr("master_energy", master_energy)
 
         # Selected indices
@@ -514,11 +565,11 @@ def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150)
     selected_new_str = ', '.join(map(str, selected_new[:10])) + ('...' if len(selected_new) > 10 else '') if selected_new else 'None'
     selected_m_str = ', '.join(map(str, selected_m[:10])) + ('...' if len(selected_m) > 10 else '') if selected_m else 'None'
 
-    # Compute master energy correctly for info text
+    # Compute master energy correctly
     master_energy_info = compute_master_energy_from_solution(
-        x_sol, 
-        instance_data.get("snapped_indices"), 
-        instance_data.get("fixed_indices_orig", instance_data.get("fixed_indices", []))
+        x_sol,
+        instance_data.get("snapped_indices"),
+        N_free
     )
     info_text = (
         f"SA TUNED SOLUTION\n"
@@ -612,8 +663,6 @@ for instance_path in instance_files:
     neigh = np.asarray(instance_data["neigh"], dtype=int)
     fixed_neighbors = instance_data.get("fixed_neighbors", None)
     snapped_indices = instance_data.get("snapped_indices", None)
-    # IMPORTANT: Use "fixed_indices_orig" if present, else fallback to "fixed_indices"
-    fixed_indices_orig = instance_data.get("fixed_indices_orig", instance_data.get("fixed_indices", []))
 
     # Compute qsum
     qsum = np.sum(np.abs(a)) + np.sum(np.abs(np.triu(Q, 1)))
@@ -621,7 +670,7 @@ for instance_path in instance_files:
 
     # Precompile instance WITH fixed_neighbors and using K_total
     model = build_augmented_model()
-    # Model keys: we need to pass K_total, not K
+    # Model keys: N, K, a, Q, neigh, fixed_neighbors
     model_keys = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
     precompiled_instance = compile_instance(model, filtered_data)
@@ -661,7 +710,6 @@ for instance_path in instance_files:
         neigh=neigh,
         fixed_neighbors=fixed_neighbors,
         snapped_indices=snapped_indices,
-        fixed_indices_orig=fixed_indices_orig,
         LAMBDA_LOWER=LAMBDA_LOWER,
         LAMBDA_UPPER=LAMBDA_UPPER,
     )
