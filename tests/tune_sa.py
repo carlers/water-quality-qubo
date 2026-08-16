@@ -1,14 +1,12 @@
-#@title 🔬 CELL 6: SA TUNE v4.1 (No External Solver, Fully Inlined)
+#@title 🔬 CELL 6: SA TUNE v4.2 (Fixed Master Energy, K_total, plots show=True)
 """
 ================================================================================
-SA TUNING WITH OPTUNA v4.1 – REAL DATA (MULTI-TIER, FULLY INLINED)
+SA TUNING WITH OPTUNA v4.2 – FIXED MASTER ENERGY & BUDGET CONSTRAINT
 ================================================================================
-- All solver logic is inside the objective function.
-- The best solution vector (x_best) is stored as a trial attribute.
-- No separate solve_sa_jij function – simplifies and avoids re‑runs.
-- Includes fixed_neighbors fix, timing breakdown, master energy, selected indices.
-- Generates deployment and QUBO matrix plots for the winner.
-- Saves tuned parameters (lambda, master energy, selected indices, etc.) per tier.
+- Fixed master energy: uses fixed_indices_orig (original master indices).
+- Fixed budget constraint: uses "K_total" instead of "K" in JijModeling data.
+- Plots now appear (show=True) in the notebook.
+- All other features: timing breakdown, selected indices, QUBO matrix, deployment.
 ================================================================================
 """
 
@@ -104,15 +102,17 @@ def compute_energy_sparse(x: np.ndarray, a: np.ndarray, Q_edges: list) -> float:
             energy += val
     return float(energy)
 
-def compute_master_energy_from_solution(x_sol, snapped_indices, fixed_indices):
-    """Map local free solution to master grid and compute master energy."""
+def compute_master_energy_from_solution(x_sol, snapped_indices, fixed_indices_orig):
+    """Map local free solution to master grid using original master indices for fixed stations."""
     x_master = np.zeros(len(a_master), dtype=int)
+    # Free variables: use snapped_indices to map local index -> master index
     for idx, val in enumerate(x_sol):
         if val == 1:
             master_idx = snapped_indices[idx]
             if 0 <= master_idx < len(a_master):
                 x_master[master_idx] = 1
-    for f_idx in fixed_indices:
+    # Fixed stations: fixed_indices_orig are already master grid indices
+    for f_idx in fixed_indices_orig:
         if 0 <= f_idx < len(a_master):
             x_master[f_idx] = 1
     energy = compute_energy_sparse(x_master, a_master, Q_master_edges)
@@ -333,7 +333,7 @@ class MathematicalConvergenceEngine:
                 study.stop()
 
 # -----------------------------------------------------------------------------
-# OBJECTIVE FUNCTION (fully inlined, stores solution)
+# OBJECTIVE FUNCTION (with fixed master energy & K_total)
 # -----------------------------------------------------------------------------
 def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, snapped_indices, fixed_indices_orig, LAMBDA_LOWER, LAMBDA_UPPER):
     def objective(trial):
@@ -363,7 +363,7 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
         t2 = time.perf_counter()
         sa_sampling_time = t2 - t1
 
-        # 3. Post-processing (decode, compute energy, violation, master energy)
+        # 3. Post-processing
         all_samples = []
         for idx in range(response.record.shape[0]):
             sample_arr = response.record['sample'][idx]
@@ -384,7 +384,6 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
                 "num_selected": f_sample["num_selected"],
             })
 
-        # Rank by violation then energy
         all_samples.sort(key=lambda s: (s["violation_rate"], s["energy"]))
         m_idx = min(FEASIBILITY_RANK_THRESHOLD - 1, len(all_samples) - 1)
         m_sample = all_samples[m_idx]
@@ -397,7 +396,6 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
         feas_rate = len(feasible_samples) / len(all_samples) if all_samples else 0.0
         trial.set_user_attr("feasibility_rate", feas_rate)
 
-        # Top-K energy
         if feasible_samples:
             feasible_samples.sort(key=lambda s: s["energy"])
             top_k_samples = feasible_samples[:min(TOP_K_ENERGY, len(feasible_samples))]
@@ -413,16 +411,16 @@ def make_objective(precompiled_instance, N, K, a, Q, neigh, fixed_neighbors, sna
         trial.set_user_attr("top_k_avg_energy", top_k_avg)
         trial.set_user_attr("top_k_energy_std_dev", top_k_std)
 
-        # Best solution (rank 0) – store for later plotting
+        # Best solution
         best_sample = all_samples[0]
         x_best = best_sample["solution"]
-        trial.set_user_attr("winner_solution", x_best.tolist())   # store solution vector
+        trial.set_user_attr("winner_solution", x_best.tolist())
 
-        # Master energy
+        # Master energy – use fixed_indices_orig (original master indices)
         master_energy = compute_master_energy_from_solution(x_best, snapped_indices, fixed_indices_orig)
         trial.set_user_attr("master_energy", master_energy)
 
-        # Selected indices (free)
+        # Selected indices
         sel_free = np.where(x_best == 1)[0].tolist()
         trial.set_user_attr("selected_free_indices", str(sel_free))
         sel_master = [snapped_indices[i] for i in sel_free if i < len(snapped_indices)]
@@ -515,12 +513,19 @@ def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150)
 
     selected_new_str = ', '.join(map(str, selected_new[:10])) + ('...' if len(selected_new) > 10 else '') if selected_new else 'None'
     selected_m_str = ', '.join(map(str, selected_m[:10])) + ('...' if len(selected_m) > 10 else '') if selected_m else 'None'
+
+    # Compute master energy correctly for info text
+    master_energy_info = compute_master_energy_from_solution(
+        x_sol, 
+        instance_data.get("snapped_indices"), 
+        instance_data.get("fixed_indices_orig", instance_data.get("fixed_indices", []))
+    )
     info_text = (
         f"SA TUNED SOLUTION\n"
         f"---------------------------\n"
         f"Feasible: {check_feasibility_vectorized(x_sol, instance_data['neigh'], instance_data['K'], instance_data['fixed_neighbors'])['feasible']}\n"
         f"Energy: {compute_energy_vectorized(x_sol, instance_data['a'], instance_data['Q']):.4f}\n"
-        f"Master Energy: {compute_master_energy_from_solution(x_sol, instance_data['snapped_indices'], instance_data['fixed_indices']):.4f}\n"
+        f"Master Energy: {master_energy_info:.4f}\n"
         f"New: {len(selected_new)}, Existing: {len(selected_m)}\n"
         f"Selected new indices: {selected_new_str}\n"
         f"Selected existing: {selected_m_str}"
@@ -539,29 +544,24 @@ def plot_qubo_matrix(precompiled_instance, penalty_weights, N, save_path=None, s
     qubo_dict, offset = precompiled_instance.to_qubo(penalty_weights=penalty_weights)
     Q_mat = np.zeros((N, N), dtype=float)
     
-    for (key_i, key_j), val in qubo_dict.items():
-        # Extract integer indices from possibly nested tuples
-        def extract_idx(key):
-            if isinstance(key, tuple):
-                # If key is like ('x', idx), take idx; if it's like (('x', idx),) or (idx,), handle
-                if len(key) == 2 and isinstance(key[0], str) and key[0] == 'x':
-                    return key[1]
-                else:
-                    # Fallback: assume the first element that is not a string is the index
-                    for elem in key:
-                        if not isinstance(elem, str):
-                            return elem
-                    return key[0]  # last resort
+    def extract_idx(key):
+        if isinstance(key, tuple):
+            if len(key) == 2 and isinstance(key[0], str) and key[0] == 'x':
+                return key[1]
             else:
-                return key
-        
+                for elem in key:
+                    if not isinstance(elem, str):
+                        return elem
+                return key[0]
+        else:
+            return key
+    
+    for (key_i, key_j), val in qubo_dict.items():
         i = extract_idx(key_i)
         j = extract_idx(key_j)
-        # Only keep entries for the original free variables (0..N-1)
         if isinstance(i, int) and isinstance(j, int) and i < N and j < N:
             Q_mat[i, j] = val
     
-    # Symmetrize (QUBO dict may only contain i<=j)
     Q_mat = Q_mat + Q_mat.T - np.diag(np.diag(Q_mat))
     max_abs = np.max(np.abs(Q_mat)) if np.max(np.abs(Q_mat)) > 0 else 1.0
     norm = mcolors.Normalize(vmin=-max_abs, vmax=max_abs)
@@ -612,19 +612,22 @@ for instance_path in instance_files:
     neigh = np.asarray(instance_data["neigh"], dtype=int)
     fixed_neighbors = instance_data.get("fixed_neighbors", None)
     snapped_indices = instance_data.get("snapped_indices", None)
-    fixed_indices_orig = instance_data.get("fixed_indices", [])
+    # IMPORTANT: Use "fixed_indices_orig" if present, else fallback to "fixed_indices"
+    fixed_indices_orig = instance_data.get("fixed_indices_orig", instance_data.get("fixed_indices", []))
 
     # Compute qsum
     qsum = np.sum(np.abs(a)) + np.sum(np.abs(np.triu(Q, 1)))
     print(f"📏 qsum for N={N_true}: {qsum:.4f}")
 
-    # Precompile instance WITH fixed_neighbors
+    # Precompile instance WITH fixed_neighbors and using K_total
     model = build_augmented_model()
-    model_keys = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
+    # Model keys: we need to pass K_total, not K
+    model_keys = {"N", "a", "Q", "neigh", "fixed_neighbors"}
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
+    filtered_data["K_total"] = K   # <-- FIX: use K_total as expected by the model
     precompiled_instance = compile_instance(model, filtered_data)
 
-    LAMBDA_UPPER = qsum  # as requested, no multiplier
+    LAMBDA_UPPER = qsum
 
     study_name = f"sa_tuning_N{N_true}_{RUN_ID}"
     local_db = LOCAL_CACHE / f"{study_name}.db"
@@ -669,7 +672,6 @@ for instance_path in instance_files:
 
     study.optimize(objective, callbacks=[convergence_cb])
 
-    # Post-study: select winner (best feasible trial)
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     feasible = [t for t in completed if t.user_attrs.get("Mth_budget_dev", 1) == 0 and t.user_attrs.get("Mth_isolated_count", 1) == 0]
 
@@ -736,14 +738,14 @@ for instance_path in instance_files:
         wandb_run.summary["global_best_feasible_energy"] = best_e
         wandb_run.summary["winning_penalty_sum"] = winner_penalty_sum
 
-    # Generate deployment and QUBO matrix plots for the winner
+    # Generate plots if solution exists
     if winner_solution is not None:
         x_winner = np.asarray(winner_solution, dtype=int)
-        # Deployment plot
+        # Deployment plot (show=True)
         deploy_save_path = RUN_DIR / f"deployment_SA_N{N_true}_K{K}.png"
         plot_deployment(instance_data, x_winner, save_path=deploy_save_path, show=True, dpi=150)
 
-        # QUBO matrix plot (use winner's lambdas)
+        # QUBO matrix plot (show=True)
         winner_penalty_weights = get_penalty_weights(precompiled_instance, winner_lb, winner_lc)
         qubo_save_path = RUN_DIR / f"qubo_matrix_SA_N{N_true}_K{K}.png"
         plot_qubo_matrix(precompiled_instance, winner_penalty_weights, N, save_path=qubo_save_path, show=True, dpi=150, title_prefix=f"SA Tuned N={N_true} | ")
