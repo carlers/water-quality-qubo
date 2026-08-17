@@ -1,9 +1,11 @@
-#@title CELL 4: GENERATE SPARSE QUBO + MIQP DATA (Resumable, Fast Plotting)
+#@title CELL 4: GENERATE SPARSE QUBO + MIQP DATA (Resumable, Config‑Aware, Fast Plotting)
 """
 ================================================================================
-REVISION: Resumable – loads per‑tier instance_data_N{N}.pkl if available.
+REVISION: Resumable – loads per‑tier instance_data_N{N}_{config_hash}.pkl if available.
 - Uses FORCE_RECOMPUTE_QUBO flag from Cell 1.
 - Dual storage: local and Drive.
+- Config hash in filename invalidates on QUBO parameter changes.
+- Backward‑compatible: falls back to unhashed filenames if hashed missing.
 - Stores both valid_edges (D_max) and valid_edges_lc (2*L_c) for plotting.
 - Connectivity plots use LineCollection for speed and plot only L_c edges.
 ================================================================================
@@ -22,16 +24,21 @@ import jijmodeling as jm
 from tqdm.notebook import tqdm
 import shutil
 import warnings
+import hashlib
+import json
+
 warnings.filterwarnings('ignore')
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION (reuse from Cell 2)
+# LOAD CONFIG AND HASH (from Cell 2)
 # -----------------------------------------------------------------------------
 try:
-    CONFIG_QUBO = MASTER_QUBO_CONFIG
+    # These are already defined in Cell 2
+    MASTER_QUBO_CONFIG
+    config_hash
 except NameError:
-    print("⚠️ MASTER_QUBO_CONFIG not found; using default config.")
-    CONFIG_QUBO = {
+    print("⚠️ MASTER_QUBO_CONFIG or config_hash not found; using defaults.")
+    MASTER_QUBO_CONFIG = {
         "L_c": 7500.0,
         "L_w": 1000.0,
         "Beta": 1.0,
@@ -40,6 +47,9 @@ except NameError:
         "K": 5,
         "D_max_buffer": 1.15,
     }
+    config_str = json.dumps(MASTER_QUBO_CONFIG, sort_keys=True)
+    config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+    print(f"🔑 Generated config hash: {config_hash}")
 
 LOCAL_CACHE = Path("/content/wqm_data")
 OUTPUT_DIR = Path("/content/drive/MyDrive/wqm_data")
@@ -47,8 +57,9 @@ LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------------------------
-# LOAD MASTER DATA (already in memory from Cell 2)
+# LOAD MASTER DATA (hashed version from Cell 2)
 # -----------------------------------------------------------------------------
+# First try from namespace (if Cell 2 already ran)
 try:
     coords_master = coords
     U_master = U
@@ -56,10 +67,15 @@ try:
     water_polygon = water_polygon
     global_D_max = metadata["master_D_max"]
 except NameError:
-    print("⚠️ Master data not in namespace; loading from file...")
-    master_path_local = LOCAL_CACHE / "master_real.pkl"
+    print("⚠️ Master data not in namespace; loading hashed file...")
+    master_path_local = LOCAL_CACHE / f"master_real_{config_hash}.pkl"
     if not master_path_local.exists():
-        master_path_local = OUTPUT_DIR / "master_real.pkl"
+        master_path_local = OUTPUT_DIR / f"master_real_{config_hash}.pkl"
+    if not master_path_local.exists():
+        # Fallback to unhashed (backward compatibility)
+        master_path_local = LOCAL_CACHE / "master_real.pkl"
+        if not master_path_local.exists():
+            master_path_local = OUTPUT_DIR / "master_real.pkl"
     with open(master_path_local, "rb") as f:
         master_data = pickle.load(f)
     coords_master = master_data["coords"]
@@ -77,7 +93,7 @@ except NameError:
 M_set_global = set(M_indices_master)
 
 # -----------------------------------------------------------------------------
-# LOAD SCALING RESULTS (already in memory from Cell 3)
+# LOAD SCALING RESULTS (unhashed, from Cell 3)
 # -----------------------------------------------------------------------------
 try:
     if 'scaling_results' not in dir():
@@ -158,7 +174,6 @@ def compute_pairwise_terms_shape_aware(
 
     # ---- Compute quadratic interactions (within 2*L_c) ----
     raw_quad = {}
-    # Reuse pairs_lc to avoid re-querying
     for i, j in pairs_lc:
         p1, p2 = coords[i], coords[j]
         if not (water_polygon.contains(Point(p1)) and water_polygon.contains(Point(p2))):
@@ -246,51 +261,82 @@ def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Pro
     return problem
 
 # -----------------------------------------------------------------------------
-# MAIN LOOP OVER TIERS (Resumable)
+# MAIN LOOP OVER TIERS (Resumable, Config‑Aware)
 # -----------------------------------------------------------------------------
 print("\n" + "=" * 100)
-print("🔗 GENERATING SPARSE QUBO + MIQP DATA PER RESOLUTION TIER (Resumable)")
+print("🔗 GENERATING SPARSE QUBO + MIQP DATA PER RESOLUTION TIER (Resumable, Config‑Aware)")
 print("=" * 100)
 
 qubo_results = {}  # for plotting
 tiers = sorted(scaling_results.keys())
 
 for N in tqdm(tiers, desc="Tiers"):
-    instance_name = f"instance_data_N{N}.pkl"
-    instance_local = LOCAL_CACHE / instance_name
-    instance_drive = OUTPUT_DIR / instance_name
+    # Hashed filename
+    instance_name_hashed = f"instance_data_N{N}_{config_hash}.pkl"
+    instance_local = LOCAL_CACHE / instance_name_hashed
+    instance_drive = OUTPUT_DIR / instance_name_hashed
 
-    # 1. Check if instance already exists and we are allowed to load
+    # Also check unhashed (backward compatibility)
+    instance_name_unhashed = f"instance_data_N{N}.pkl"
+    unhashed_local = LOCAL_CACHE / instance_name_unhashed
+    unhashed_drive = OUTPUT_DIR / instance_name_unhashed
+
     loaded = False
+    instance_data = None
+
+    # 1. Check if hashed version exists locally or on Drive
     if not FORCE_RECOMPUTE_QUBO:
         if instance_local.exists():
             with open(instance_local, "rb") as f:
                 instance_data = pickle.load(f)
             loaded = True
         elif instance_drive.exists():
-            print(f"📂 Loading {instance_name} from Drive (copying to local)...")
+            print(f"📂 Loading hashed {instance_name_hashed} from Drive (copying to local)...")
             shutil.copy(instance_drive, instance_local)
             with open(instance_local, "rb") as f:
                 instance_data = pickle.load(f)
             loaded = True
+        # 2. If not found, try unhashed (migration)
+        elif unhashed_local.exists():
+            print(f"📂 Loading unhashed {instance_name_unhashed} from local (migrating to hashed)...")
+            with open(unhashed_local, "rb") as f:
+                instance_data = pickle.load(f)
+            loaded = True
+            # Save as hashed for future
+            with open(instance_local, "wb") as f:
+                pickle.dump(instance_data, f)
+            with open(instance_drive, "wb") as f:
+                pickle.dump(instance_data, f)
+            print(f"✅ Migrated instance data to {instance_local}")
+        elif unhashed_drive.exists():
+            print(f"📂 Loading unhashed {instance_name_unhashed} from Drive (migrating to hashed)...")
+            shutil.copy(unhashed_drive, unhashed_local)
+            with open(unhashed_local, "rb") as f:
+                instance_data = pickle.load(f)
+            loaded = True
+            # Save as hashed
+            with open(instance_local, "wb") as f:
+                pickle.dump(instance_data, f)
+            with open(instance_drive, "wb") as f:
+                pickle.dump(instance_data, f)
+            print(f"✅ Migrated instance data to {instance_local}")
 
     if loaded:
-        print(f"✅ Loaded instance data for N={N}")
+        print(f"✅ Loaded instance data for N={N} (config hash: {config_hash})")
         # Extract data for plotting
         if "original_coords" in instance_data:
             coords_plot = instance_data["original_coords"]
         else:
-            # fallback
             free_coords = instance_data["coords"]
             fixed_indices = instance_data["fixed_indices"]
-            fixed_coords = instance_data.get("original_coords_full", None)
-            if fixed_coords is None:
+            # attempt to reconstruct if possible
+            if "original_coords" not in instance_data and "fixed_indices" in instance_data:
+                # We can't reconstruct easily; use free coords only
                 print(f"⚠️ Cannot reconstruct full coords for N={N}; using free coords only.")
                 coords_plot = free_coords
             else:
-                coords_plot = np.vstack([free_coords, fixed_coords])
+                coords_plot = instance_data["coords"]
         M_tier = instance_data["fixed_indices"]
-        # Use valid_edges_lc for plotting (fallback to valid_edges if missing)
         edges_plot = instance_data.get("valid_edges_lc", instance_data.get("valid_edges", set()))
         qubo_results[N] = {
             "edges": edges_plot,
@@ -299,7 +345,7 @@ for N in tqdm(tiers, desc="Tiers"):
         }
         continue
 
-    # 2. Compute from scratch
+    # 3. Compute from scratch
     print(f"🔄 Computing instance for N={N}...")
     t0 = time.perf_counter()
 
@@ -411,13 +457,14 @@ for N in tqdm(tiers, desc="Tiers"):
         }
     }
 
+    # Save to local and Drive
     with open(instance_local, "wb") as f:
         pickle.dump(instance_data, f, protocol=pickle.HIGHEST_PROTOCOL)
     with open(instance_drive, "wb") as f:
         pickle.dump(instance_data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     qubo_results[N] = {
-        "edges": valid_edges_lc,  # use L_c edges for plotting
+        "edges": valid_edges_lc,
         "coords": coords_tier,
         "M_indices": M_tier,
     }
@@ -471,7 +518,7 @@ for ax, N in zip(axes, tiers):
 for ax in axes[n_tiers:]:
     ax.axis("off")
 
-plt.suptitle("Landmass-Aware Network Topology (L_c edges only)", fontsize=14, fontweight="bold")
+plt.suptitle("Landmass-Aware Network Topology (L_c edges only) – Fast Plot", fontsize=14, fontweight="bold")
 plt.tight_layout()
 plt.show()
 
