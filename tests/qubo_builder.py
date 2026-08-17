@@ -1,11 +1,13 @@
-#@title CELL 4: GENERATE SPARSE QUBO + MIQP DATA (No pickling of Instance)
-# =============================================================================
-# Key features:
-#   1. Sparse storage: Q_edges (i,j,val) for i<j, neighbors as list-of-lists.
-#   2. qsum computed from only non‑zero edges – used for penalty scaling in SA.
-#   3. Pre‑built MIQP data dict (not the Instance) – saved for instant rebuild in Cell 5.
-#   4. Single‑pass geometry, endpoint pre‑filter, tqdm progress.
-# =============================================================================
+#@title CELL 4: GENERATE SPARSE QUBO + MIQP DATA (Resumable, Fixed Plotting)
+"""
+================================================================================
+REVISION: Resumable – loads per‑tier instance_data_N{N}.pkl if available.
+- Uses FORCE_RECOMPUTE_QUBO flag from Cell 1.
+- Dual storage: local and Drive.
+- Stores valid_edges inside the instance data for connectivity plots.
+- Plotting correctly uses original_coords (full combined array) from loaded data.
+================================================================================
+"""
 import os
 import pickle
 import time
@@ -17,54 +19,82 @@ from shapely.geometry import LineString, Point
 import matplotlib.pyplot as plt
 import jijmodeling as jm
 from tqdm.notebook import tqdm
+import shutil
+import warnings
+warnings.filterwarnings('ignore')
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION (reuse from Cell 2)
 # -----------------------------------------------------------------------------
-CONFIG_QUBO = {
-    "L_c": 7500.0,                # Spatial correlation length (meters)
-    "L_w": 1000.0,                # Wake persistence length (meters)
-    "Beta": 1.0,                  # Redundancy penalty weight
-    "Delta": 1.0,                 # Wake penalty weight
-    "Current_vector": (1.0, 0.0), # Flow vector (dx, dy)
-    "K": 5,                       # Number of new stations to place per tier
-    "D_max_buffer": 1.15,         # Multiplier for max existing NN distance
-}
+# MASTER_QUBO_CONFIG is defined in Cell 2; we use it directly.
+# If it's not defined, fall back to a default (should not happen).
+try:
+    CONFIG_QUBO = MASTER_QUBO_CONFIG
+except NameError:
+    print("⚠️ MASTER_QUBO_CONFIG not found; using default config.")
+    CONFIG_QUBO = {
+        "L_c": 7500.0,
+        "L_w": 1000.0,
+        "Beta": 1.0,
+        "Delta": 1.0,
+        "Current_vector": (1.0, 0.0),
+        "K": 5,
+        "D_max_buffer": 1.15,
+    }
 
 LOCAL_CACHE = Path("/content/wqm_data")
 OUTPUT_DIR = Path("/content/drive/MyDrive/wqm_data")
 LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------------------------
-# LOAD MASTER DATA (for global D_max and polygon)
+# LOAD MASTER DATA (already in memory from Cell 2)
 # -----------------------------------------------------------------------------
-master_path = OUTPUT_DIR / "master_real.pkl"
-if not master_path.exists():
-    master_path = LOCAL_CACHE / "master_real.pkl"
-with open(master_path, "rb") as f:
-    master = pickle.load(f)
+try:
+    # Variables from Cell 2
+    coords_master = coords
+    U_master = U
+    M_indices_master = M_indices
+    water_polygon = water_polygon
+    global_D_max = metadata["master_D_max"]
+except NameError:
+    print("⚠️ Master data not in namespace; loading from file...")
+    master_path_local = LOCAL_CACHE / "master_real.pkl"
+    if not master_path_local.exists():
+        master_path_local = OUTPUT_DIR / "master_real.pkl"
+    with open(master_path_local, "rb") as f:
+        master_data = pickle.load(f)
+    coords_master = master_data["coords"]
+    U_master = master_data["U"]
+    M_indices_master = master_data["M_indices"]
+    water_polygon = master_data["water_polygon"]
+    a_master = master_data["a"]
+    Q_master_edges = master_data["Q_edges"]
+    metadata = master_data["metadata"]
+    global_D_max = metadata["master_D_max"]
+    # also define coords for backward compatibility
+    coords = coords_master
+    U = U_master
+    M_indices = M_indices_master
 
-coords_master = master["coords"]
-U_master = master["U"]
-M_indices_master = master["M_indices"]
-water_polygon = master["water_polygon"]
 M_set_global = set(M_indices_master)
 
-# Compute global D_max from master existing stations
-master_M_coords = coords_master[list(M_set_global)]
-if len(master_M_coords) > 1:
-    M_tree = cKDTree(master_M_coords)
-    dists, _ = M_tree.query(master_M_coords, k=2)
-    max_nn_dist = np.max(dists[:, 1])
-    global_D_max = max_nn_dist * CONFIG_QUBO["D_max_buffer"]
-else:
-    global_D_max = 15000.0
-print(f"🌍 Global D_max = {global_D_max:.2f} m")
-
-shapely.prepare(water_polygon)
+# -----------------------------------------------------------------------------
+# LOAD SCALING RESULTS (already in memory from Cell 3)
+# -----------------------------------------------------------------------------
+try:
+    if 'scaling_results' not in dir():
+        raise NameError
+except NameError:
+    print("⚠️ Scaling results not in namespace; loading from file...")
+    scaling_path_local = LOCAL_CACHE / "scaling_results.pkl"
+    if not scaling_path_local.exists():
+        scaling_path_local = OUTPUT_DIR / "scaling_results.pkl"
+    with open(scaling_path_local, "rb") as f:
+        scaling_results = pickle.load(f)
 
 # -----------------------------------------------------------------------------
-# PAIRWISE TERM CALCULATION (SPARSE)
+# PAIRWISE TERM CALCULATION (unchanged)
 # -----------------------------------------------------------------------------
 def compute_pairwise_terms_shape_aware(
     coords: np.ndarray,
@@ -99,7 +129,6 @@ def compute_pairwise_terms_shape_aware(
     pairs_dmax = tree.query_pairs(r=global_D_max)
     for i, j in pairs_dmax:
         p1, p2 = coords[i], coords[j]
-        # endpoint pre‑filter
         if not (water_polygon.contains(Point(p1)) and water_polygon.contains(Point(p2))):
             continue
         if water_polygon.contains(LineString([p1, p2])):
@@ -115,7 +144,6 @@ def compute_pairwise_terms_shape_aware(
             neighbors[i].append(j)
         elif j in free_set and i in M_set:
             neighbors[j].append(i)
-    # Remove duplicates and sort
     for i in neighbors:
         neighbors[i] = sorted(set(neighbors[i]))
 
@@ -148,7 +176,7 @@ def compute_pairwise_terms_shape_aware(
         coeff = beta * R_ij + delta * (W_ij + W_ji)
         if abs(coeff) > 1e-12:
             raw_quad[(i, j)] = coeff
-            raw_quad[(j, i)] = coeff   # keep symmetric dict for easier absorption
+            raw_quad[(j, i)] = coeff
 
     # ---- Build linear terms (absorb fixed stations) ----
     linear = {}
@@ -179,7 +207,7 @@ def compute_pairwise_terms_shape_aware(
     }
 
 # -----------------------------------------------------------------------------
-# MIQP MODEL BUILDER (same as Cell 5, now used here)
+# MIQP MODEL BUILDER (unchanged)
 # -----------------------------------------------------------------------------
 def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Problem:
     problem = jm.Problem("WQM_MIQP_sparse", sense=jm.ProblemSense.MINIMIZE)
@@ -208,99 +236,136 @@ def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Pro
     return problem
 
 # -----------------------------------------------------------------------------
-# LOAD SCALING RESULTS (from Cell 3)
+# MAIN LOOP OVER TIERS (Resumable)
 # -----------------------------------------------------------------------------
-scaling_path = OUTPUT_DIR / "scaling_results.pkl"
-if not scaling_path.exists():
-    scaling_path = LOCAL_CACHE / "scaling_results.pkl"
-with open(scaling_path, "rb") as f:
-    scaling_results = pickle.load(f)
-
 print("\n" + "=" * 100)
-print("🔗 GENERATING SPARSE QUBO + MIQP DATA PER RESOLUTION TIER")
+print("🔗 GENERATING SPARSE QUBO + MIQP DATA PER RESOLUTION TIER (Resumable)")
 print("=" * 100)
 
-# -----------------------------------------------------------------------------
-# MAIN LOOP OVER TIERS
-# -----------------------------------------------------------------------------
-qubo_results = {}  # for plotting edges
+qubo_results = {}  # for plotting
+tiers = sorted(scaling_results.keys())
 
-for N, res in tqdm(scaling_results.items(), desc="Tiers"):
+for N in tqdm(tiers, desc="Tiers"):
+    instance_name = f"instance_data_N{N}.pkl"
+    instance_local = LOCAL_CACHE / instance_name
+    instance_drive = OUTPUT_DIR / instance_name
+
+    # 1. Check if instance already exists and we are allowed to load
+    loaded = False
+    if not FORCE_RECOMPUTE_QUBO:
+        if instance_local.exists():
+            with open(instance_local, "rb") as f:
+                instance_data = pickle.load(f)
+            loaded = True
+        elif instance_drive.exists():
+            print(f"📂 Loading {instance_name} from Drive (copying to local)...")
+            shutil.copy(instance_drive, instance_local)
+            with open(instance_local, "rb") as f:
+                instance_data = pickle.load(f)
+            loaded = True
+
+    if loaded:
+        print(f"✅ Loaded instance data for N={N}")
+        # Extract data for plotting
+        # Use original_coords (full combined array) for plotting
+        # Fallback: if original_coords missing, reconstruct from coords and fixed_indices
+        if "original_coords" in instance_data:
+            coords_plot = instance_data["original_coords"]
+        else:
+            # Reconstruct full coordinates: free + fixed
+            free_coords = instance_data["coords"]
+            fixed_indices = instance_data["fixed_indices"]
+            fixed_coords = instance_data.get("original_coords_full", None)
+            if fixed_coords is None:
+                # approximate: use the original master coordinates for fixed stations? Not ideal.
+                # but we can't easily reconstruct; warn and use free coords only.
+                print(f"⚠️ Cannot reconstruct full coords for N={N}; using free coords only.")
+                coords_plot = free_coords
+            else:
+                coords_plot = np.vstack([free_coords, fixed_coords])
+        M_tier = instance_data["fixed_indices"]
+        valid_edges = instance_data.get("valid_edges", set())
+        qubo_results[N] = {
+            "edges": valid_edges,
+            "coords": coords_plot,
+            "M_indices": M_tier,
+        }
+        continue
+
+    # 2. Compute from scratch
+    print(f"🔄 Computing instance for N={N}...")
     t0 = time.perf_counter()
+
+    res = scaling_results[N]
     coords_tier = res["coords"]
     U_tier = res["U"]
-    M_tier = res["M_indices"]          # indices within this tier (already compressed)
-    
+    M_tier = res["M_indices"]          # indices within this tier (compressed)
+    snapped_indices = res["snapped_indices"]
+
     # Call helper on the tier's data
     pair_data = compute_pairwise_terms_shape_aware(
         coords=coords_tier,
         U=U_tier,
         M_indices=M_tier,
         water_polygon=water_polygon,
-        L_c=CONFIG_QUBO["L_c"],
-        L_w=CONFIG_QUBO["L_w"],
-        current_vector=CONFIG_QUBO["Current_vector"],
+        L_c=MASTER_QUBO_CONFIG["L_c"],
+        L_w=MASTER_QUBO_CONFIG["L_w"],
+        current_vector=MASTER_QUBO_CONFIG["Current_vector"],
         global_D_max=global_D_max,
-        beta=CONFIG_QUBO["Beta"],
-        delta=CONFIG_QUBO["Delta"],
+        beta=MASTER_QUBO_CONFIG["Beta"],
+        delta=MASTER_QUBO_CONFIG["Delta"],
     )
-    
+
     linear = pair_data["linear"]
-    quad_edges_raw = pair_data["quad_edges"]      # list (orig_i, orig_j, val)
-    neighbors_dict = pair_data["neighbors"]        # dict orig_i -> list of orig_j
-    valid_edges = pair_data["valid_edges"]         # set of (orig_i, orig_j)
-    
-    # ---- Compress to free variables only ----
-    free_indices_orig = list(neighbors_dict.keys())  # these are the free vertices
+    quad_edges_raw = pair_data["quad_edges"]
+    neighbors_dict = pair_data["neighbors"]
+    valid_edges = pair_data["valid_edges"]
+
+    # Compress to free variables only
+    free_indices_orig = list(neighbors_dict.keys())
     free_set = set(free_indices_orig)
     N_free = len(free_indices_orig)
     orig_to_comp = {orig: idx for idx, orig in enumerate(free_indices_orig)}
-    
-    # a_new
+
     a_new = np.array([linear.get(orig, 0.0) for orig in free_indices_orig], dtype=float)
-    
-    # Q_edges_new (compressed)
+
     Q_edges_new = []
     for i, j, val in quad_edges_raw:
         if i in free_set and j in free_set:
             Q_edges_new.append((orig_to_comp[i], orig_to_comp[j], val))
-    
-    # neighbors_new (compressed, free-free only)
+
     neighbors_new = [[] for _ in range(N_free)]
     for orig_i, nbrs in neighbors_dict.items():
         ci = orig_to_comp[orig_i]
         for orig_j in nbrs:
             if orig_j in free_set:
                 neighbors_new[ci].append(orig_to_comp[orig_j])
-    # Sort and remove duplicates
     for i in range(N_free):
         neighbors_new[i] = sorted(set(neighbors_new[i]))
-    
-    # fixed_neighbors (boolean: 1 if any fixed neighbor)
+
     fixed_neighbors_arr = np.zeros(N_free, dtype=int)
     M_set_tier = set(M_tier)
     for ci, orig_i in enumerate(free_indices_orig):
         if any(nbr in M_set_tier for nbr in neighbors_dict[orig_i]):
             fixed_neighbors_arr[ci] = 1
-    
-    # ---- Compute qsum for penalty scaling ----
+
+    # qsum for penalty scaling
     qsum = np.sum(np.abs(a_new)) + sum(abs(val) for _, _, val in Q_edges_new)
-    
-    # ---- Build MIQP data dict (but NOT the Instance) ----
-    K = CONFIG_QUBO["K"]
+
+    K = MASTER_QUBO_CONFIG["K"]
     max_degree = max(1, max((len(nbrs) for nbrs in neighbors_new), default=1))
     num_edges = len(Q_edges_new)
-    
+
     neighbor_indices = np.zeros((N_free, max_degree), dtype=np.int32)
     neighbor_mask = np.zeros((N_free, max_degree), dtype=np.int8)
     for i in range(N_free):
         for k, j in enumerate(neighbors_new[i][:max_degree]):
             neighbor_indices[i, k] = j
             neighbor_mask[i, k] = 1
-    
-    # a_effective = a (no diagonal Q)
+
     a_effective = a_new.copy()
-    
+
+    # Build MIQP data dict (for Cell 5)
     data_dict = {
         "K_total": int(K),
         "a": a_effective.tolist(),
@@ -313,49 +378,47 @@ for N, res in tqdm(scaling_results.items(), desc="Tiers"):
         qvals_list = [float(v) for _, _, v in Q_edges_new]
         data_dict["edges"] = edges_list
         data_dict["Q_vals"] = qvals_list
-    
-    # ---- Assemble instance data (no miqp_instance) ----
+
+    # Assemble full instance_data
     instance_data = {
         "N": N_free,
         "K": K,
-        "a": a_new,                     # linear coefficients (not including diag)
-        "Q_edges": Q_edges_new,         # list of (i,j,val)
-        "neighbors": neighbors_new,     # list of lists
-        "fixed_neighbors": fixed_neighbors_arr,  # boolean array
+        "a": a_new,
+        "Q_edges": Q_edges_new,
+        "neighbors": neighbors_new,
+        "fixed_neighbors": fixed_neighbors_arr,
         "coords": coords_tier[free_indices_orig],
         "U": U_tier[free_indices_orig],
-        "original_coords": coords_tier,
+        "original_coords": coords_tier,          # full combined coordinates (free + fixed)
         "original_U": U_tier,
         "original_indices": free_indices_orig,
         "fixed_indices": M_tier,
-        "snapped_indices": res["snapped_indices"],
+        "snapped_indices": snapped_indices,
         "D_max": global_D_max,
-        "L_c": CONFIG_QUBO["L_c"],
-        "L_w": CONFIG_QUBO["L_w"],
-        "qsum": qsum,                   # for penalty scaling in SA
-        "miqp_data": data_dict,         # data to rebuild MIQP instance in Cell 5
-        "miqp_params": {                # parameters needed to build the problem
+        "L_c": MASTER_QUBO_CONFIG["L_c"],
+        "L_w": MASTER_QUBO_CONFIG["L_w"],
+        "qsum": qsum,
+        "valid_edges": valid_edges,          # store for connectivity plot
+        "miqp_data": data_dict,
+        "miqp_params": {
             "max_degree": max_degree,
             "num_edges": num_edges,
         }
     }
-    
-    # Save to local cache and Drive
-    save_name = f"instance_data_N{N}.pkl"
-    local_path = LOCAL_CACHE / save_name
-    drive_path = OUTPUT_DIR / save_name
-    with open(local_path, "wb") as f:
+
+    # Save to local and Drive
+    with open(instance_local, "wb") as f:
         pickle.dump(instance_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-    with open(drive_path, "wb") as f:
+    with open(instance_drive, "wb") as f:
         pickle.dump(instance_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-    
-    # Store edges for plotting
+
+    # Store for plotting
     qubo_results[N] = {
         "edges": valid_edges,
         "coords": coords_tier,
         "M_indices": M_tier,
     }
-    
+
     dt = (time.perf_counter() - t0) * 1000
     avg_deg = np.mean([len(nbrs) for nbrs in neighbors_new]) if N_free > 0 else 0
     print(f"✅ N={N:<3d} (Free: {N_free:<3d}) | Avg Deg: {avg_deg:<5.1f} | Q_edges: {len(Q_edges_new):<6d} | qsum: {qsum:.2f} | {dt:.1f} ms")
@@ -364,7 +427,7 @@ print("=" * 100)
 print("🚀 All QUBO + MIQP data saved successfully.")
 
 # -----------------------------------------------------------------------------
-# PLOT CONNECTIVITY GRAPHS (same as before)
+# PLOT CONNECTIVITY GRAPHS (from loaded/computed data)
 # -----------------------------------------------------------------------------
 print("\n📊 Plotting landmass-aware graph edges per tier...")
 tiers = sorted(qubo_results.keys())
@@ -380,19 +443,14 @@ for ax, N in zip(axes, tiers):
     edges = qubo_results[N]["edges"]
     M_tier = qubo_results[N]["M_indices"]
 
-    # Master map backdrop
     ax.scatter(coords_master[:, 0], coords_master[:, 1], c="lightgray", s=4, alpha=0.35, zorder=0)
 
-    # Plot water-valid edges
     for i, j in edges:
         ax.plot([tier_coords[i, 0], tier_coords[j, 0]],
                 [tier_coords[i, 1], tier_coords[j, 1]],
                 color="steelblue", alpha=0.3, linewidth=0.6, zorder=1)
 
-    # Nodes
     ax.scatter(tier_coords[:, 0], tier_coords[:, 1], c="black", s=15, alpha=0.8, zorder=2)
-
-    # Fixed stations
     if len(M_tier) > 0:
         ax.scatter(tier_coords[M_tier, 0], tier_coords[M_tier, 1],
                    c="red", marker="*", s=200, edgecolor="black", linewidth=0.5, zorder=3)
@@ -407,3 +465,5 @@ for ax in axes[n_tiers:]:
 plt.suptitle("Landmass-Aware Network Topology by Tier", fontsize=14, fontweight="bold")
 plt.tight_layout()
 plt.show()
+
+print("✅ Cell 4 complete.")
