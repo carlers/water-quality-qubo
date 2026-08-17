@@ -1,10 +1,12 @@
-#@title 🔬 CELL 6: SA TUNE v4.6 (Resumable, Crash‑Proof, Enhanced Tie‑Break)
+#@title 🔬 CELL 6: SA TUNE v4.7 (Resumable, Config‑Hashed, Enhanced Tie‑Break)
 """
 ================================================================================
-SA TUNING WITH OPTUNA v4.6 – RESUMABLE, CRASH‑PROOF, ENHANCED TIE‑BREAK
+SA TUNING WITH OPTUNA v4.7 – RESUMABLE, CONFIG‑HASHED, ENHANCED TIE‑BREAK
 ================================================================================
 - Inlined JijModeling functions (connectivity includes fixed_neighbors).
 - Dual SQLite storage: local (fast) + Drive (persistent), periodic sync.
+- Study name includes a hash of all QUBO parameters → automatically retunes
+  when configuration changes.
 - Resumes from existing study automatically.
 - Skips already tuned tiers and displays stored results + plots.
 - Enhanced tie-break table includes runtime breakdown and variance metrics.
@@ -12,7 +14,7 @@ SA TUNING WITH OPTUNA v4.6 – RESUMABLE, CRASH‑PROOF, ENHANCED TIE‑BREAK
 ================================================================================
 """
 
-import sys, os, math, time, pickle, re, json, warnings, shutil
+import sys, os, math, time, pickle, re, json, warnings, shutil, hashlib
 from pathlib import Path
 from datetime import datetime
 import numpy as np
@@ -28,30 +30,33 @@ warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION
+# QUBO CONFIGURATION (from cell 4)
+# -----------------------------------------------------------------------------
+
+# Compute a unique hash for this config
+config_str = json.dumps(CONFIG_QUBO, sort_keys=True)
+config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+print(f"🔑 QUBO config hash: {config_hash}")
+
+# -----------------------------------------------------------------------------
+# TUNING CONFIGURATION
 # -----------------------------------------------------------------------------
 CONFIG_SA = {
     "TARGET_N": None,                     # None = tune all discovered tiers
     "NUM_SWEEPS": 1000,
     "NUM_READS": 1024,
     "SYNC_INTERVAL": 5,                   # Sync DB to Drive every N trials
-
-    # Mathematical Convergence Config
     "WARMUP_TRIALS": 15,
     "MAX_FLOOR_HITS": 10,
     "VARIANCE_TOLERANCE": 0.05,
     "MIN_FEASIBLE_FOR_VARIANCE": 5,
-
-    # Rank-Constrained Single Objective
     "FEASIBILITY_RANK_THRESHOLD": 20,
     "TOP_K_ENERGY": 3,
     "ENERGY_TOLERANCE_PCT": 0.5,
-
     "LAMBDA_LOWER": 0.0001,
     "USE_WANDB": True,
     "WANDB_PROJECT": "wqm-placement-optimization",
     "LOG_WANDB_TABLE": True,
-    "RUN_ID": datetime.now().strftime("%Y%m%d_%H%M%S"),
     "FORCE_RETUNE": False,                # Set to True to rerun all tiers
 }
 
@@ -70,17 +75,17 @@ LAMBDA_LOWER = CONFIG_SA["LAMBDA_LOWER"]
 USE_WANDB = CONFIG_SA["USE_WANDB"]
 WANDB_PROJECT = CONFIG_SA["WANDB_PROJECT"]
 LOG_WANDB_TABLE = CONFIG_SA["LOG_WANDB_TABLE"]
-RUN_ID = CONFIG_SA["RUN_ID"]
 FORCE_RETUNE = CONFIG_SA["FORCE_RETUNE"]
 
 LOCAL_CACHE = Path("/content/wqm_data")
 GDRIVE_BASE = Path("/content/drive/MyDrive/wqm_data")
-RUN_DIR = GDRIVE_BASE / f"run_{RUN_ID}"
+# Use config_hash in the run directory to separate experiments
+RUN_DIR = GDRIVE_BASE / f"run_{config_hash}"
 LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------------------------
-# INLINED JijModeling FUNCTIONS (unchanged)
+# INLINED JijModeling FUNCTIONS
 # -----------------------------------------------------------------------------
 def build_augmented_model() -> jm.Problem:
     problem = jm.Problem("WQM_Augmented", sense=jm.ProblemSense.MINIMIZE)
@@ -161,7 +166,7 @@ def compute_master_energy_from_solution(x_sol, snapped_indices, N_free):
     return compute_energy_sparse(x_master, a_master, Q_master_edges)
 
 # -----------------------------------------------------------------------------
-# HELPER FUNCTIONS (vectorized, feasibility, adapter)
+# HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 def compute_energy_vectorized(x: np.ndarray, a: np.ndarray, Q: np.ndarray) -> float:
     x = np.asarray(x, dtype=float)
@@ -239,7 +244,6 @@ class MathematicalConvergenceEngine:
         self.floor_hits = 0
 
     def initialize_from_study(self, study: optuna.study.Study):
-        """Restore internal state from existing study trials."""
         completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         feasible = [t for t in completed if t.user_attrs.get("Mth_budget_dev", 1) == 0 and t.user_attrs.get("Mth_isolated_count", 1) == 0]
         if not feasible:
@@ -247,11 +251,9 @@ class MathematicalConvergenceEngine:
             self.best_penalty_sum = float('inf')
             self.floor_hits = 0
             return
-        # Find best energy and lowest penalty among those with best energy
         feasible.sort(key=lambda t: (t.user_attrs["top_k_avg_energy"], t.user_attrs["penalty_sum"]))
         self.global_best_feasible_energy = feasible[0].user_attrs["top_k_avg_energy"]
         self.best_penalty_sum = feasible[0].user_attrs["penalty_sum"]
-        # Count floor hits: feasible trials with energy within 1e-6 of best and penalty >= best penalty
         rel_tol = max(1e-6, 1e-6 * abs(self.global_best_feasible_energy))
         self.floor_hits = 0
         for t in feasible:
@@ -260,7 +262,6 @@ class MathematicalConvergenceEngine:
             if abs(e - self.global_best_feasible_energy) <= rel_tol:
                 if p >= self.best_penalty_sum - 1e-4:
                     self.floor_hits += 1
-        # The first hit is the best itself, but we need to count actual matches; we can set floor_hits = 1 at least if best exists.
         if self.floor_hits == 0:
             self.floor_hits = 1
 
@@ -282,7 +283,6 @@ class MathematicalConvergenceEngine:
         completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         feasible_trials = [t for t in completed if t.user_attrs.get("Mth_budget_dev", 1) == 0 and t.user_attrs.get("Mth_isolated_count", 1) == 0]
 
-        # Compute sigma_j (joint variance)
         sigma_j = float('inf')
         sigma_str = "N/A"
         if len(feasible_trials) >= self.min_feas_var:
@@ -294,7 +294,6 @@ class MathematicalConvergenceEngine:
             var_c = np.var(log_c, ddof=1) if len(log_c) > 1 else 0.0
             sigma_j = math.sqrt(var_b + var_c)
             sigma_str = f"{sigma_j:.3f}"
-        # Store sigma_j in trial user_attrs for later tie-break
         trial.set_user_attr("sigma_j", sigma_j if sigma_j != float('inf') else None)
 
         status_str = "❌ INFEASIBLE                        "
@@ -363,7 +362,6 @@ class MathematicalConvergenceEngine:
                 "master_energy": trial.user_attrs.get("master_energy", np.nan),
             })
 
-        # Periodic sync to Drive
         if trial.number % SYNC_INTERVAL == 0 and self.db_local.exists():
             shutil.copy(self.db_local, self.db_drive)
 
@@ -393,7 +391,6 @@ def make_objective(instance_data, N, K, a, Q, neigh, fixed_neighbors, snapped_in
             trial.set_user_attr("lambda_conn", lambda_conn)
             trial.set_user_attr("penalty_sum", penalty_sum)
 
-            # Compile fresh instance
             instance = compile_instance(model, filtered_data)
 
             t0 = time.perf_counter()
@@ -480,7 +477,6 @@ def make_objective(instance_data, N, K, a, Q, neigh, fixed_neighbors, snapped_in
 
             return top_k_avg
         except Exception as e:
-            # Log error and return a large value so trial is marked complete
             print(f"⚠️ Trial {trial.number} failed with error: {e}")
             trial.set_user_attr("Mth_budget_dev", 1e9)
             trial.set_user_attr("Mth_isolated_count", 1e9)
@@ -491,7 +487,7 @@ def make_objective(instance_data, N, K, a, Q, neigh, fixed_neighbors, snapped_in
     return objective
 
 # -----------------------------------------------------------------------------
-# PLOTTING FUNCTIONS (same as before, kept for reuse)
+# PLOTTING FUNCTIONS
 # -----------------------------------------------------------------------------
 def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150):
     coords_full = np.asarray(instance_data["original_coords"])
@@ -649,19 +645,19 @@ tuned_params_all = {}
 
 for instance_path in instance_files:
     N_true = int(pattern.search(instance_path.name).group(1))
-    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (Resumable, Crash‑Proof)\n{'='*115}")
+    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (Resumable, Config‑Hashed)\n{'='*115}")
 
-    study_name = f"sa_tuning_N{N_true}_{RUN_ID}"
+    # Study name includes config hash so parameter changes trigger fresh tuning
+    study_name = f"sa_tuning_N{N_true}_{config_hash}"
     db_local = LOCAL_CACHE / f"{study_name}.db"
     db_drive = GDRIVE_BASE / f"{study_name}.db"
-    json_path = GDRIVE_BASE / f"tuned_sa_N{N_true}.json"
+    json_path = GDRIVE_BASE / f"tuned_sa_N{N_true}_{config_hash}.json"
 
     # 1. Check if tier already completed
     if json_path.exists() and not FORCE_RETUNE:
-        print(f"✅ Tier N={N_true} already tuned. Loading saved results...")
+        print(f"✅ Tier N={N_true} already tuned with current config. Loading saved results...")
         with open(json_path, "r") as f:
             saved_params = json.load(f)
-        # Load instance data
         with open(instance_path, "rb") as f:
             instance_data = pickle.load(f)
         instance_data = adapt_sparse_to_dense(instance_data)
@@ -670,11 +666,12 @@ for instance_path in instance_files:
         print(f"\n{'='*115}")
         print(f"🏆 TIE-BREAK BREAKDOWN (Tier N={N_true} – Saved Results)")
         print(f"{'='*115}")
-        print(f"{'Trial':<7} | {'Top-3 Energy':<14} | {'Std Dev':<8} | {'Penalty Sum':<12} | {'Feas %':<8} | {'λ_budget':<10} | {'λ_conn':<10} | {'Master Energy':<14} | {'Sel Free Idx'}")
+        print(f"{'Trial':<7} | {'Top-3 Energy':<14} | {'Std Dev':<8} | {'Penalty Sum':<12} | {'Feas %':<8} | "
+              f"{'λ_budget':<10} | {'λ_conn':<10} | {'Master Energy':<14} | {'Sel Free Idx'}")
         print(f"{'-'*115}")
         notes = "🥇 WINNER (loaded)"
         e_val = saved_params["best_energy"]
-        std_v = 0.0  # not stored; can set to 0
+        std_v = 0.0
         p_sum = saved_params["penalty_sum"]
         f_pct = saved_params["feasibility_rate"] * 100.0
         lb_v = saved_params["lambda_budget"]
@@ -684,7 +681,6 @@ for instance_path in instance_files:
         print(f"#LOADED | {e_val:<14.4f} | {std_v:<8.4f} | {p_sum:<12.2f} | {f_pct:<7.2f}% | {lb_v:<10.2f} | {lc_v:<10.2f} | {m_e:<14.4f} | {sel_free:<20} | {notes}")
         print(f"{'='*115}\n")
 
-        # Generate deployment and QUBO plots
         x_sol = np.array(eval(saved_params["selected_free_indices"]), dtype=int)
         x_sol_full = np.zeros(instance_data["N"], dtype=int)
         for idx in eval(saved_params["selected_free_indices"]):
@@ -692,7 +688,6 @@ for instance_path in instance_files:
                 x_sol_full[idx] = 1
         plot_deployment(instance_data, x_sol_full, save_path=RUN_DIR / f"deployment_SA_N{N_true}_loaded.png", show=True, dpi=150)
 
-        # Rebuild instance for QUBO matrix
         model_plot = build_augmented_model()
         model_keys_plot = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
         filtered_plot = {k: v for k, v in instance_data.items() if k in model_keys_plot}
@@ -810,7 +805,6 @@ for instance_path in instance_files:
           f"{'λ_budget':<10} | {'λ_conn':<10} | {'Master Energy':<14} | {'QUBO':<6} | {'SA':<6} | {'Post':<6} | {'Total':<6} | {'σ_log':<7} | {'Sel Free Idx'}")
     print(f"{'-'*150}")
 
-    # Prepare W&B table if enabled
     if LOG_WANDB_TABLE and wandb_run:
         wb_table = wandb.Table(columns=[
             "Trial", "Top3_Energy", "Std_Dev", "Penalty_Sum", "Feas_Pct",
@@ -868,13 +862,11 @@ for instance_path in instance_files:
     winner_sel_master = winner.user_attrs.get("selected_master_indices", "")
     winner_solution = winner.user_attrs.get("winner_solution", None)
 
-    # Generate plots
     if winner_solution is not None:
         x_winner = np.asarray(winner_solution, dtype=int)
         deploy_save_path = RUN_DIR / f"deployment_SA_N{N_true}_K{K}.png"
         plot_deployment(instance_data, x_winner, save_path=deploy_save_path, show=True, dpi=150)
 
-        # QUBO matrix plot
         model_plot = build_augmented_model()
         model_keys_plot = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
         filtered_plot = {k: v for k, v in instance_data.items() if k in model_keys_plot}
@@ -885,7 +877,6 @@ for instance_path in instance_files:
     else:
         print(f"⚠️ No solution vector stored for winner of N={N_true}. Skipping plots.")
 
-    # Save tuned parameters
     tuned_params = {
         "N": N_true,
         "lambda_budget": float(winner_lb),
@@ -905,7 +896,7 @@ for instance_path in instance_files:
 
     with open(json_path, "w") as f:
         json.dump(tuned_params, f, indent=2)
-    (LOCAL_CACHE / f"tuned_sa_N{N_true}.json").write_text(json.dumps(tuned_params, indent=2))
+    (LOCAL_CACHE / f"tuned_sa_N{N_true}_{config_hash}.json").write_text(json.dumps(tuned_params, indent=2))
     print(f"✅ Tuned parameters saved to {json_path}")
 
     if wandb_run:
