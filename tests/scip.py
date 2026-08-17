@@ -1,24 +1,39 @@
-#@title 🎯 CELL 5: MIQP SOLVE WITH SCIP (Sparse, Pure Solver Timing) – FIXED
+#@title 🎯 CELL 5: MIQP SOLVE WITH SCIP (Resumable, Config‑Aware)
 """
 ================================================================================
-MIQP SOLVE WITH SCIP – REAL DATA (MULTI-TIER) – FIXED
+MIQP SOLVE WITH SCIP – REAL DATA (MULTI-TIER) – RESUMABLE
 ================================================================================
-- Loads sparse instance data from Cell 4.
-- Rebuilds MIQP instance instantly (excluded from timer).
-- Times ONLY SCIP optimize().
-- Computes tier energy and master (global) energy using snapped_indices.
-- Falls back to greedy if SCIP fails.
+- Uses FORCE_RECOMPUTE_SCIP flag from Cell 1.
+- Result filenames include config_hash (based on MASTER_QUBO_CONFIG).
+- Checks local cache first, then Drive; if missing or force, solves.
+- No greedy fallback – SCIP must find a solution.
+- Always generates deployment and matrix plots.
 ================================================================================
 """
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-FALLBACK_GREEDY = True           # Use greedy if SCIP fails
-SAVE_PLOTS = True                # Save plots to disk
-SHOW_PLOTS = True                # Display plots in notebook
-PLOT_DPI = 150                   # Resolution for saved plots
-TARGET_N = None                  # e.g., 35 to solve only N=35
+# MASTER_QUBO_CONFIG is already defined in Cell 2.
+# Generate config hash for filenames (same as Cell 6)
+import hashlib
+import json
+config_str = json.dumps(MASTER_QUBO_CONFIG, sort_keys=True)
+config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+print(f"🔑 SCIP config hash: {config_hash}")
+
+# Force recompute flag (defined in Cell 1)
+try:
+    FORCE_RECOMPUTE_SCIP
+except NameError:
+    FORCE_RECOMPUTE_SCIP = False
+    print("⚠️ FORCE_RECOMPUTE_SCIP not defined; defaulting to False.")
+
+# Paths
+LOCAL_CACHE = Path("/content/wqm_data")
+GDRIVE_BASE = Path("/content/drive/MyDrive/wqm_data")
+LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
+GDRIVE_BASE.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------------------------
 # IMPORTS
@@ -34,9 +49,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.colors as mcolors
-from matplotlib.patches import Patch
 from scipy.interpolate import griddata
 import jijmodeling as jm
+import shutil
 
 # OMMX SCIP adapter
 try:
@@ -44,26 +59,39 @@ try:
     SCIP_AVAILABLE = True
 except ImportError:
     SCIP_AVAILABLE = False
-    print("⚠️ SCIP not available. Will rely on greedy only.")
+    print("⚠️ SCIP not available. Cell 5 will fail.")
+    # We still define the function to avoid errors, but it will raise.
 
 warnings.filterwarnings('ignore')
 
 # -----------------------------------------------------------------------------
-# PATHS
+# LOAD MASTER DATA
 # -----------------------------------------------------------------------------
-LOCAL_CACHE = Path("/content/wqm_data")
-GDRIVE_BASE = Path("/content/drive/MyDrive/wqm_data")
-LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
-GDRIVE_BASE.mkdir(parents=True, exist_ok=True)
+master_path_local = LOCAL_CACHE / "master_real.pkl"
+master_path_gdrive = GDRIVE_BASE / "master_real.pkl"
+
+master_data = None
+if master_path_local.exists():
+    with open(master_path_local, "rb") as f:
+        master_data = pickle.load(f)
+elif master_path_gdrive.exists():
+    with open(master_path_gdrive, "rb") as f:
+        master_data = pickle.load(f)
+
+if master_data is None:
+    raise FileNotFoundError("Master data not found. Run Cell 2 first.")
+
+a_master = master_data["a"]
+Q_master_edges = master_data["Q_edges"]
+U_master = master_data["U"]
+coords_master = master_data["coords"]
+M_indices_master = master_data["M_indices"]
+print(f"✅ Loaded Master Data: N={len(a_master)}, Q_edges={len(Q_master_edges)}")
 
 # -----------------------------------------------------------------------------
-# SPARSE HELPER FUNCTIONS (inlined, no dependency on src)
+# HELPER FUNCTIONS (sparse energy, feasibility, greedy – but greedy not used)
 # -----------------------------------------------------------------------------
 def compute_energy_sparse(x: np.ndarray, a: np.ndarray, Q_edges: list) -> float:
-    """
-    Compute raw MIQP energy for sparse representation.
-    energy = ∑ a_i x_i + ∑_{i<j} Q_ij x_i x_j
-    """
     x = np.asarray(x, dtype=bool)
     energy = np.dot(a, x.astype(float))
     for i, j, val in Q_edges:
@@ -72,11 +100,6 @@ def compute_energy_sparse(x: np.ndarray, a: np.ndarray, Q_edges: list) -> float:
     return float(energy)
 
 def check_feasibility_sparse(x, neighbors, K, fixed_neighbors=None):
-    """
-    Check budget and connectivity constraints.
-    - neighbors: list of lists, neighbors[i] are free neighbor indices.
-    - fixed_neighbors: array or list of bool/int indicating if vertex i connects to a fixed station.
-    """
     x = np.asarray(x, dtype=bool)
     selected = np.where(x)[0]
     num_selected = len(selected)
@@ -107,96 +130,7 @@ def check_feasibility_sparse(x, neighbors, K, fixed_neighbors=None):
         "isolated_indices": isolated_indices,
     }
 
-def compute_violation_rate_sparse(x, neighbors, K, fixed_neighbors=None, continuous=False):
-    """
-    Compute violation metric: continuous = budget deviation + isolated count.
-    """
-    x = np.asarray(x, dtype=bool)
-    selected = np.where(x)[0]
-    budget_dev = abs(len(selected) - K)
-    isolated_count = 0
-    for i in selected:
-        has_free = any(x[j] for j in neighbors[i])
-        has_fixed = False
-        if not has_free and fixed_neighbors is not None:
-            if isinstance(fixed_neighbors, (list, np.ndarray)):
-                has_fixed = bool(fixed_neighbors[i])
-            elif isinstance(fixed_neighbors, dict):
-                has_fixed = len(fixed_neighbors.get(i, [])) > 0
-        if not (has_free or has_fixed):
-            isolated_count += 1
-    if continuous:
-        return float(budget_dev + isolated_count)
-    else:
-        budget_viol = 0.0 if budget_dev == 0 else 0.5
-        conn_viol = 0.0 if isolated_count == 0 else 0.5
-        return budget_viol + conn_viol
-
-def solve_greedy_jij_sparse(instance_data, verbose=False):
-    """
-    Greedy baseline: pick K sites with smallest a (highest utility).
-    """
-    N = instance_data["N"]
-    K = instance_data["K"]
-    a = np.asarray(instance_data["a"])
-    Q_edges = instance_data["Q_edges"]
-    neighbors = instance_data["neighbors"]
-    fixed_neighbors = instance_data.get("fixed_neighbors", None)
-
-    start = time.perf_counter()
-    # Select K with smallest a (most negative a = highest utility)
-    indices = np.argsort(a)[:K]
-    x_sol = np.zeros(N, dtype=int)
-    x_sol[indices] = 1
-
-    energy = compute_energy_sparse(x_sol, a, Q_edges)
-    runtime = time.perf_counter() - start
-
-    feas_detail = check_feasibility_sparse(x_sol, neighbors, K, fixed_neighbors)
-    feasible = feas_detail["feasible"]
-    violation_rate = compute_violation_rate_sparse(x_sol, neighbors, K, fixed_neighbors, continuous=True)
-
-    if verbose:
-        print(f"    Greedy: energy={energy:.6f}, runtime={runtime:.4f}s, "
-              f"feasible={feasible}, violation_rate={violation_rate:.1f}")
-
-    return {
-        "solution": x_sol,
-        "energy": energy,
-        "runtime": runtime,
-        "feasible": feasible,
-        "violation_rate": violation_rate,
-        "status": "feasible" if feasible else "infeasible",
-        "budget_ok": feas_detail["budget_ok"],
-        "connectivity_ok": feas_detail["connectivity_ok"],
-        "num_selected": feas_detail["num_selected"],
-        "isolated_indices": feas_detail["isolated_indices"],
-    }
-
-# -----------------------------------------------------------------------------
-# LOAD MASTER DATA (Global Objective)
-# -----------------------------------------------------------------------------
-master_path_local = LOCAL_CACHE / "master_real.pkl"
-master_path_gdrive = GDRIVE_BASE / "master_real.pkl"
-
-master_data = None
-if master_path_local.exists():
-    with open(master_path_local, "rb") as f:
-        master_data = pickle.load(f)
-elif master_path_gdrive.exists():
-    with open(master_path_gdrive, "rb") as f:
-        master_data = pickle.load(f)
-
-if master_data is None:
-    raise FileNotFoundError("Master data not found. Run Cell 2 first.")
-
-a_master = master_data["a"]                # length 5417
-Q_master_edges = master_data["Q_edges"]   # list of (i,j,val)
-U_master = master_data["U"]
-coords_master = master_data["coords"]
-M_indices_master = master_data["M_indices"]
-
-print(f"✅ Loaded Master Data: N={len(a_master)}, Q_edges={len(Q_master_edges)}")
+# No greedy function – SCIP must succeed.
 
 # -----------------------------------------------------------------------------
 # MIQP PROBLEM BUILDER (same as Cell 4)
@@ -228,13 +162,11 @@ def build_miqp_problem_sparse(N: int, max_degree: int, num_edges: int) -> jm.Pro
     return problem
 
 # -----------------------------------------------------------------------------
-# SCIP SOLVER WRAPPER (sparse) – with ROUNDING FIX
+# SCIP SOLVER WRAPPER (no fallback)
 # -----------------------------------------------------------------------------
 def solve_scip_sparse(instance_data, verbose=False):
     if not SCIP_AVAILABLE:
-        return {"solution": None, "energy": np.nan, "runtime": 0.0,
-                "status": "SCIP not available", "feasible": False,
-                "violation_rate": 1.0}
+        raise RuntimeError("SCIP not available.")
 
     N = instance_data["N"]
     K = instance_data["K"]
@@ -243,7 +175,6 @@ def solve_scip_sparse(instance_data, verbose=False):
     neighbors = instance_data["neighbors"]
     fixed_neighbors = instance_data.get("fixed_neighbors", None)
 
-    # Rebuild MIQP instance from saved data
     miqp_data = instance_data["miqp_data"]
     miqp_params = instance_data["miqp_params"]
     max_degree = miqp_params["max_degree"]
@@ -260,6 +191,7 @@ def solve_scip_sparse(instance_data, verbose=False):
         model.setParam('limits/absgap', 0.0)
         model.setParam('display/verblevel', 4 if verbose else 0)
         try:
+            import pyscipopt
             model.setEmphasis(pyscipopt.SCIP_PARAMEMPHASIS.OPTIMALITY, quiet=True)
         except Exception:
             pass
@@ -270,25 +202,19 @@ def solve_scip_sparse(instance_data, verbose=False):
         solution = OMMXPySCIPOptAdapter.solve(miqp_instance)
         scip_status = "solved"
     except Exception as e:
-        return {"solution": None, "energy": np.nan, "runtime": time.perf_counter() - start,
-                "status": f"SCIP error: {e}", "feasible": False, "violation_rate": 1.0}
+        raise RuntimeError(f"SCIP solver error: {e}")
 
     runtime = time.perf_counter() - start
 
     if solution is None:
-        return {"solution": None, "energy": np.nan, "runtime": runtime,
-                "status": "SCIP error: solution is None", "feasible": False,
-                "violation_rate": 1.0}
+        raise RuntimeError("SCIP returned no solution.")
 
-    # -------------------------------------------------------------------------
-    # CRITICAL FIX 1: Proper rounding of floating-point SCIP solutions
-    # -------------------------------------------------------------------------
+    # Round solution
     x_sol = np.zeros(N, dtype=int)
     if hasattr(solution, "decision_variables_df"):
         df = solution.decision_variables_df
         x_df = df[df["name"] == "x"]
         for _, row in x_df.iterrows():
-            # Use > 0.5 to catch 0.9999999, then convert to int
             if row["value"] > 0.5:
                 subs = row["subscripts"]
                 idx = subs[0] if isinstance(subs, (tuple, list)) and len(subs) > 0 else int(subs)
@@ -300,16 +226,12 @@ def solve_scip_sparse(instance_data, verbose=False):
                 if isinstance(var_id, tuple) and var_id[0] == "x":
                     idx = var_id[1]
                     if 0 <= idx < N:
-                        # Round floating point values before casting
                         x_sol[idx] = int(round(value))
 
-    # Compute tier energy using sparse helper
     tier_energy = compute_energy_sparse(x_sol, a, Q_edges)
-
-    # Compute feasibility
     feas_detail = check_feasibility_sparse(x_sol, neighbors, K, fixed_neighbors)
     feasible = feas_detail["feasible"]
-    violation_rate = compute_violation_rate_sparse(x_sol, neighbors, K, fixed_neighbors, continuous=True)
+    violation_rate = 0.0 if feasible else 1.0  # simple binary for reporting
 
     return {
         "solution": x_sol,
@@ -323,17 +245,16 @@ def solve_scip_sparse(instance_data, verbose=False):
     }
 
 # -----------------------------------------------------------------------------
-# PLOTTING FUNCTIONS (adapted for sparse data)
+# PLOTTING FUNCTIONS (unchanged)
 # -----------------------------------------------------------------------------
 def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
-    """Plot deployment map with existing and new stations, using snapped_indices."""
     coords_full = np.asarray(instance_data["original_coords"])
     U_full = np.asarray(instance_data["original_U"]) if instance_data.get("original_U") is not None else None
     D_MAX = instance_data["D_max"]
     fixed_indices = list(instance_data.get("fixed_indices", []))
     free_indices = list(instance_data.get("original_indices", []))
     snapped_indices = instance_data.get("snapped_indices", None)
-    
+
     N_free = len(free_indices)
     N_total = len(coords_full)
 
@@ -343,13 +264,11 @@ def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
     else:
         x_sol = np.asarray(x_sol)
 
-    # Map local free indices to original master indices
     selected_free_orig = [free_indices[i] for i in np.where(x_sol == 1)[0] if i < len(free_indices)]
     selected_new = [i for i in selected_free_orig if i not in fixed_indices]
     selected_m = fixed_indices
     all_selected = selected_new + selected_m
 
-    # Determine plot bounds
     if len(coords_master) > 0:
         xmin, ymin = coords_master.min(axis=0)
         xmax, ymax = coords_master.max(axis=0)
@@ -365,7 +284,6 @@ def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
     ax_info = fig.add_subplot(gs[1])
     ax_info.axis('off')
 
-    # Utility background
     if len(coords_master) > 0 and U_master is not None:
         sc = ax.scatter(coords_master[:, 0], coords_master[:, 1], c=U_master, cmap='viridis',
                         s=22, alpha=0.55, edgecolor='none', zorder=0, label='Utility Background')
@@ -374,7 +292,6 @@ def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
     else:
         ax.scatter(coords_full[:, 0], coords_full[:, 1], c="#cbd5e1", s=22, alpha=0.6, edgecolor='none', zorder=0, label='_nolegend_')
 
-    # Draw links among selected stations (if within D_max)
     for i in range(len(all_selected)):
         for j in range(i + 1, len(all_selected)):
             idx_i, idx_j = all_selected[i], all_selected[j]
@@ -384,19 +301,14 @@ def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
                         [coords_full[idx_i, 1], coords_full[idx_j, 1]],
                         color='#475569', alpha=0.5, linewidth=1.2, linestyle='--', zorder=1)
 
-    # Candidates (free)
     if free_indices:
         candidate_coords = coords_full[free_indices]
         ax.scatter(candidate_coords[:, 0], candidate_coords[:, 1], c='white', s=40,
                    alpha=0.9, edgecolor='#1e293b', linewidth=0.8, label='Candidates', zorder=2)
-
-    # Existing stations
     if selected_m:
         ax.scatter(coords_full[selected_m, 0], coords_full[selected_m, 1],
                    c='blue', s=110, marker='s', edgecolor='black', linewidth=1.2,
                    label=f'Existing ({len(selected_m)})', zorder=3)
-
-    # New stations
     if selected_new:
         ax.scatter(coords_full[selected_new, 0], coords_full[selected_new, 1],
                    c='red', s=110, marker='o', edgecolor='black', linewidth=1.2,
@@ -417,7 +329,6 @@ def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
     ]
     ax_info.legend(handles=handles, loc='upper left', frameon=True, fontsize=10, title="Legend", title_fontsize=11)
 
-    # Info text
     selected_new_str = ', '.join(map(str, selected_new[:10])) + ('...' if len(selected_new) > 10 else '') if selected_new else 'None'
     selected_m_str = ', '.join(map(str, selected_m[:10])) + ('...' if len(selected_m) > 10 else '') if selected_m else 'None'
 
@@ -440,7 +351,6 @@ def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
         f"New: [{selected_new_str}]\n"
         f"Existing: [{selected_m_str}]"
     )
-
     ax_info.text(0.0, 0.62, info_text, transform=ax_info.transAxes, fontsize=9,
                  verticalalignment='top', horizontalalignment='left', family='monospace',
                  bbox=dict(boxstyle='round,pad=0.6', facecolor='#f8f9fa', alpha=0.95, edgecolor='#ced4da'))
@@ -451,43 +361,41 @@ def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
         plt.show()
     plt.close(fig)
 
-def plot_miqp_matrix_reduced(instance_data, save_path=None, show=True, dpi=150, title_prefix=""):
-    """
-    Plot reduced MIQP matrix with off‑diagonal scaling to make quadratic terms visible.
-    """
+def plot_miqp_matrix_reduced(instance_data, save_path=None, show=True, dpi=150, title_prefix="", sort_by="coords"):
     N = instance_data["N"]
-    a = np.asarray(instance_data["a"])
-    Q_edges = instance_data["Q_edges"]
-
-    # Reconstruct dense matrix (only if N not too large)
-    if N > 300:
-        print(f"  Skipping matrix plot for N={N} (too large).")
-        return
+    a = np.asarray(instance_data["a"], dtype=float)
+    Q_edges = instance_data.get("Q_edges", [])
 
     mat = np.zeros((N, N), dtype=float)
-    np.fill_diagonal(mat, a)   # linear terms on diagonal
+    np.fill_diagonal(mat, a)
     for i, j, val in Q_edges:
         mat[i, j] = val
         mat[j, i] = val
 
-    fig, ax = plt.subplots(figsize=(7, 5.5))
-    
+    if sort_by == "coords" and "coords" in instance_data:
+        coords_free = np.asarray(instance_data["coords"])
+        order = np.lexsort((coords_free[:, 0], -coords_free[:, 1]))
+        mat = mat[np.ix_(order, order)]
+        title_suffix = " (Spatially Sorted)"
+    else:
+        title_suffix = ""
+
     off_diag_mask = ~np.eye(N, dtype=bool)
     off_diag_vals = mat[off_diag_mask]
-    max_off = np.max(np.abs(off_diag_vals)) if len(off_diag_vals) > 0 else 0.0
-    
-    if max_off > 0:
-        norm = mcolors.Normalize(vmin=-max_off, vmax=max_off)
-        cbar_label = "Coefficient Value (Off‑diagonal scaled)"
+    if len(off_diag_vals) > 0 and np.max(np.abs(off_diag_vals)) > 0:
+        max_val = np.max(np.abs(off_diag_vals))
+        norm = mcolors.Normalize(vmin=-max_val, vmax=max_val)
+        cbar_label = f"Quadratic Coeffs (±{max_val:.2f})"
     else:
-        max_abs = np.max(np.abs(mat)) if np.max(np.abs(mat)) > 0 else 1.0
-        norm = mcolors.Normalize(vmin=-max_abs, vmax=max_abs)
-        cbar_label = "Coefficient Value (Full scale)"
+        max_val = np.max(np.abs(mat)) if np.max(np.abs(mat)) > 0 else 1.0
+        norm = mcolors.Normalize(vmin=-max_val, vmax=max_val)
+        cbar_label = "Coefficient Value"
 
+    fig, ax = plt.subplots(figsize=(7, 5.5))
     im = ax.imshow(mat, cmap='RdBu_r', aspect='auto', norm=norm)
-    ax.set_title(f"{title_prefix}Reduced MIQP Matrix (N={N})", fontsize=12, fontweight='bold', pad=12)
-    ax.set_xlabel("Variable Index", fontsize=10)
-    ax.set_ylabel("Variable Index", fontsize=10)
+    ax.set_title(f"{title_prefix}Reduced MIQP Matrix (N={N}){title_suffix}", fontsize=12, fontweight='bold')
+    ax.set_xlabel("Variable Index (spatial order)" if sort_by == "coords" else "Variable Index", fontsize=10)
+    ax.set_ylabel("Variable Index (spatial order)" if sort_by == "coords" else "Variable Index", fontsize=10)
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label(cbar_label, fontsize=9)
     plt.tight_layout()
@@ -501,27 +409,27 @@ def plot_miqp_matrix_reduced(instance_data, save_path=None, show=True, dpi=150, 
 # DISCOVER INSTANCE DATA FILES
 # -----------------------------------------------------------------------------
 pattern = re.compile(r"instance_data_N(\d+)\.pkl")
+instance_files = []
+for p in GDRIVE_BASE.glob("instance_data_N*.pkl"):
+    if pattern.match(p.name):
+        instance_files.append(p)
+if not instance_files:
+    for p in LOCAL_CACHE.glob("instance_data_N*.pkl"):
+        if pattern.match(p.name):
+            instance_files.append(p)
 
-def find_instance_files():
-    local_files = {p.name: p for p in LOCAL_CACHE.glob("instance_data_N*.pkl") if pattern.match(p.name)}
-    drive_files = {p.name: p for p in GDRIVE_BASE.glob("instance_data_N*.pkl") if pattern.match(p.name)}
-    all_files = {}
-    for name, path in drive_files.items():
-        all_files[name] = local_files.get(name, path)
-    for name, path in local_files.items():
-        if name not in all_files:
-            all_files[name] = path
-    return sorted(all_files.values(), key=lambda p: int(pattern.search(p.name).group(1)))
-
-instance_files = find_instance_files()
 if not instance_files:
     raise FileNotFoundError("No instance_data_N*.pkl files found in local or Drive.")
 
+# Optionally filter by TARGET_N if defined (from CONFIG_SA, but we can add a local variable)
+try:
+    TARGET_N = CONFIG_SA.get("TARGET_N", None)
+except NameError:
+    TARGET_N = None
 if TARGET_N is not None:
     instance_files = [p for p in instance_files if int(pattern.search(p.name).group(1)) == TARGET_N]
-    if not instance_files:
-        raise ValueError(f"No instance data found for N={TARGET_N}")
 
+instance_files.sort(key=lambda p: int(pattern.search(p.name).group(1)))
 print(f"Found {len(instance_files)} instance data files: {[p.name for p in instance_files]}")
 
 # -----------------------------------------------------------------------------
@@ -535,6 +443,7 @@ for instance_path in instance_files:
     print(f"🔬 Solving tier N={N_true}")
     print("=" * 70)
 
+    # Load instance data
     with open(instance_path, "rb") as f:
         instance_data = pickle.load(f)
 
@@ -544,63 +453,38 @@ for instance_path in instance_files:
     fixed_count = len(instance_data["fixed_indices"])
     snapped_indices = instance_data.get("snapped_indices", None)
 
-    scip_filename = f"scip_result_N{N_true}_K{K}_Dmax{int(dmax)}_M{fixed_count}.pkl"
+    # Result filename with config hash
+    scip_filename = f"scip_result_N{N_true}_{config_hash}.pkl"
     scip_local = LOCAL_CACHE / scip_filename
     scip_gdrive = GDRIVE_BASE / scip_filename
 
-    # Check for cached result
+    # Check if we should force recompute
+    if FORCE_RECOMPUTE_SCIP:
+        for f in [scip_local, scip_gdrive]:
+            if f.exists():
+                f.unlink()
+                print(f"🗑️  Removed {f}")
+
+    # Load cached result if exists
     scip_result = None
     if scip_local.exists():
         print(f"📂 Loading existing SCIP result from local cache: {scip_local}")
         with open(scip_local, "rb") as f:
             scip_result = pickle.load(f)
     elif scip_gdrive.exists():
-        print(f"📂 Loading existing SCIP result from GDrive: {scip_gdrive}")
-        with open(scip_gdrive, "rb") as f:
+        print(f"📂 Copying SCIP result from Drive to local: {scip_gdrive} → {scip_local}")
+        shutil.copy(scip_gdrive, scip_local)
+        with open(scip_local, "rb") as f:
             scip_result = pickle.load(f)
 
     if scip_result is None:
-        print("🔍 Solving from scratch...")
-        if not SCIP_AVAILABLE and not FALLBACK_GREEDY:
-            print("❌ SCIP not available and FALLBACK_GREEDY is False. Skipping tier.")
-            continue
-
+        print("🔍 Solving with SCIP from scratch...")
         try:
             scip_result = solve_scip_sparse(instance_data, verbose=True)
-            if scip_result["solution"] is None and FALLBACK_GREEDY:
-                print("  ⚠️ SCIP returned no solution. Falling back to greedy.")
-                greedy = solve_greedy_jij_sparse(instance_data, verbose=False)
-                scip_result = {
-                    "solution": greedy["solution"],
-                    "energy": greedy["energy"],
-                    "runtime": greedy["runtime"],
-                    "feasible": greedy["feasible"],
-                    "violation_rate": greedy["violation_rate"],
-                    "budget_ok": greedy["budget_ok"],
-                    "connectivity_ok": greedy["connectivity_ok"],
-                    "status": "greedy_fallback"
-                }
-            elif scip_result["solution"] is not None:
-                scip_result["status"] = "solved"
-            else:
-                scip_result["status"] = "failed"
+            scip_result["status"] = "solved"
         except Exception as e:
-            print(f"  ❌ SCIP solver threw exception: {e}")
-            if FALLBACK_GREEDY:
-                print("  🔄 Falling back to greedy solver...")
-                greedy = solve_greedy_jij_sparse(instance_data, verbose=False)
-                scip_result = {
-                    "solution": greedy["solution"],
-                    "energy": greedy["energy"],
-                    "runtime": greedy["runtime"],
-                    "feasible": greedy["feasible"],
-                    "violation_rate": greedy["violation_rate"],
-                    "budget_ok": greedy["budget_ok"],
-                    "connectivity_ok": greedy["connectivity_ok"],
-                    "status": "greedy_fallback"
-                }
-            else:
-                raise
+            print(f"❌ SCIP solver failed: {e}")
+            raise  # Re-raise to stop execution; no fallback
 
         # Save result
         with open(scip_local, "wb") as f:
@@ -609,51 +493,32 @@ for instance_path in instance_files:
             pickle.dump(scip_result, f)
         print(f"✅ SCIP result saved for N={N_true}.")
 
-    # ---- COMPUTE MASTER ENERGY (using snapped_indices) ----
+    # Compute master energy
     master_energy_val = np.nan
     if scip_result.get("solution") is not None and snapped_indices is not None:
         x_sol = np.asarray(scip_result["solution"], dtype=int)
         free_indices = instance_data["original_indices"]
         fixed_indices = instance_data["fixed_indices"]
-        
-        # Build master assignment using snapped_indices
+
         x_master = np.zeros(len(a_master), dtype=int)
         N_free = len(free_indices)
-        
-        # Free variables: x_sol corresponds to the first N_free entries of snapped_indices
+
         for idx, val in enumerate(x_sol):
             if val == 1:
                 master_idx = snapped_indices[idx]
                 if 0 <= master_idx < len(a_master):
                     x_master[master_idx] = 1
-        
-        # Fixed stations: the last len(fixed_indices) entries of snapped_indices
+
         for k, f_idx in enumerate(fixed_indices):
-            # The fixed station's position in snapped_indices is N_free + k
             master_idx = snapped_indices[N_free + k]
             if 0 <= master_idx < len(a_master):
                 x_master[master_idx] = 1
-        
-        master_energy_val = compute_energy_sparse(x_master, a_master, Q_master_edges)
-    elif scip_result.get("solution") is not None:
-        # Fallback (should not happen if Cell 4 was run correctly)
-        print("  ⚠️ snapped_indices not found; falling back to free_indices mapping (may be incorrect).")
-        x_sol = np.asarray(scip_result["solution"], dtype=int)
-        free_indices = instance_data["original_indices"]
-        fixed_indices = instance_data["fixed_indices"]
-        x_master = np.zeros(len(a_master), dtype=int)
-        for idx, val in enumerate(x_sol):
-            if val == 1 and idx < len(free_indices):
-                x_master[free_indices[idx]] = 1
-        for f_idx in fixed_indices:
-            x_master[f_idx] = 1
-        master_energy_val = compute_energy_sparse(x_master, a_master, Q_master_edges)
 
+        master_energy_val = compute_energy_sparse(x_master, a_master, Q_master_edges)
     scip_result["master_energy"] = master_energy_val
 
     energy = scip_result["energy"]
     feasible = scip_result["feasible"]
-    violation = scip_result["violation_rate"]
     runtime = scip_result["runtime"]
     status = scip_result.get("status", "unknown")
 
@@ -664,14 +529,12 @@ for instance_path in instance_files:
     print(f"  Runtime: {runtime:.4f}s")
 
     # ---- PLOTTING ----
-    if SAVE_PLOTS or SHOW_PLOTS:
-        deploy_save_path = LOCAL_CACHE / f"deployment_N{N_true}_K{K}_Dmax{int(dmax)}_M{fixed_count}.png" if SAVE_PLOTS else None
-        plot_deployment(instance_data, scip_result, save_path=deploy_save_path, show=SHOW_PLOTS, dpi=PLOT_DPI)
+    deploy_save_path = LOCAL_CACHE / f"deployment_N{N_true}_{config_hash}.png"
+    plot_deployment(instance_data, scip_result, save_path=deploy_save_path, show=True, dpi=150)
 
-        if N_free <= 300:
-            matrix_save_path = LOCAL_CACHE / f"miqp_matrix_N{N_true}_K{K}_Dmax{int(dmax)}_M{fixed_count}.png" if SAVE_PLOTS else None
-            plot_miqp_matrix_reduced(instance_data, save_path=matrix_save_path, show=SHOW_PLOTS, dpi=PLOT_DPI,
-                                     title_prefix=f"$N_{{total}}$={len(instance_data['original_coords'])} | ")
+    matrix_save_path = LOCAL_CACHE / f"miqp_matrix_N{N_true}_{config_hash}.png"
+    plot_miqp_matrix_reduced(instance_data, save_path=matrix_save_path, show=True, dpi=150,
+                              title_prefix=f"$N_{{total}}$={len(instance_data['original_coords'])} | ")
 
     all_results.append({
         "N_true": N_true,
@@ -683,7 +546,6 @@ for instance_path in instance_files:
         "master_energy": master_energy_val,
         "runtime": runtime,
         "feasible": feasible,
-        "violation_rate": violation,
         "status": status,
         "instance_data": instance_data,
         "scip_result": scip_result,
@@ -693,7 +555,7 @@ for instance_path in instance_files:
 # SUMMARY TABLE
 # -----------------------------------------------------------------------------
 print("\n" + "=" * 105)
-print("📊 SUMMARY OF ALL SOLVED TIERS (WITH MASTER GRID ENERGY – FIXED)")
+print("📊 SUMMARY OF ALL SOLVED TIERS (WITH MASTER GRID ENERGY)")
 print("=" * 105)
 print(f"{'N_true':<8} | {'N_free':<8} | {'K':<4} | {'D_max (m)':<10} | {'Tier Energy':<13} | {'Master Energy':<14} | {'Runtime(s)':<11} | {'Feasible':<9} | {'Status':<12}")
 print("-" * 105)
@@ -702,4 +564,4 @@ for res in all_results:
     print(f"{res['N_true']:<8} | {res['N_free']:<8} | {res['K']:<4} | {res['D_max']:<10.1f} | {res['energy']:<13.6f} | {m_energy_str:<14} | {res['runtime']:<11.4f} | {str(res['feasible']):<9} | {res['status']:<12}")
 print("=" * 105)
 
-print("\n✅ All SCIP solves complete (fixed version).")
+print("\n✅ All SCIP solves complete.")
