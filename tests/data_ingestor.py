@@ -1,9 +1,10 @@
-#@title CELL 2: REAL DATA INGESTOR + MASTER MIQP (Resumable)
+#@title CELL 2: REAL DATA INGESTOR + MASTER MIQP (Resumable, Config‑Aware)
 # =============================================================================
-# REVISION: Resumable – loads existing master_real.pkl if available.
+# REVISION: Resumable – loads master_real_{config_hash}.pkl if available.
 # - Uses FORCE_RECOMPUTE_MASTER flag from Cell 1.
 # - Dual storage: local and Drive.
-# - Plot generated from loaded data if available.
+# - Filename includes config_hash to invalidate on QUBO parameter changes.
+# - Backward‑compatible: falls back to master_real.pkl if hashed version missing.
 # =============================================================================
 import json
 import os
@@ -16,6 +17,9 @@ import shapely
 from shapely.geometry import MultiPoint, Polygon, LineString, Point
 from tqdm.notebook import tqdm
 import warnings
+import hashlib
+import shutil
+
 warnings.filterwarnings('ignore')
 
 # -----------------------------------------------------------------------------
@@ -57,28 +61,59 @@ MASTER_QUBO_CONFIG = {
     "Beta": 1.0,
     "Delta": 1.0,
     "Current_vector": (1.0, 0.0),
+    "K": 5,
     "D_max_buffer": 1.15,
 }
 
+# ---- Compute config hash ----
+config_str = json.dumps(MASTER_QUBO_CONFIG, sort_keys=True)
+config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+print(f"🔑 Master config hash: {config_hash}")
+
 # -----------------------------------------------------------------------------
-# RESUME LOGIC
+# RESUME LOGIC (with fallback to unhashed)
 # -----------------------------------------------------------------------------
-master_path_local = LOCAL_CACHE / "master_real.pkl"
-master_path_drive = OUTPUT_DIR / "master_real.pkl"
+master_path_local = LOCAL_CACHE / f"master_real_{config_hash}.pkl"
+master_path_drive = OUTPUT_DIR / f"master_real_{config_hash}.pkl"
 master_data = None
 
-# Check if master exists and we are allowed to load
+# 1. Try hashed version
 if not FORCE_RECOMPUTE_MASTER:
     if master_path_local.exists():
-        print("📂 Loading master data from local cache...")
+        print("📂 Loading hashed master data from local cache...")
         with open(master_path_local, "rb") as f:
             master_data = pickle.load(f)
     elif master_path_drive.exists():
-        print("📂 Loading master data from Drive (copying to local)...")
-        import shutil
+        print("📂 Loading hashed master data from Drive (copying to local)...")
         shutil.copy(master_path_drive, master_path_local)
         with open(master_path_local, "rb") as f:
             master_data = pickle.load(f)
+
+# 2. If not found, try unhashed version (backward compatibility)
+if master_data is None and not FORCE_RECOMPUTE_MASTER:
+    unhashed_local = LOCAL_CACHE / "master_real.pkl"
+    unhashed_drive = OUTPUT_DIR / "master_real.pkl"
+    if unhashed_local.exists():
+        print("📂 Loading unhashed master data from local cache (migrating to hashed)...")
+        with open(unhashed_local, "rb") as f:
+            master_data = pickle.load(f)
+        # Save with hash for future
+        with open(master_path_local, "wb") as f:
+            pickle.dump(master_data, f)
+        with open(master_path_drive, "wb") as f:
+            pickle.dump(master_data, f)
+        print(f"✅ Migrated master data to hashed version: {master_path_local}")
+    elif unhashed_drive.exists():
+        print("📂 Loading unhashed master data from Drive (migrating to hashed)...")
+        shutil.copy(unhashed_drive, unhashed_local)
+        with open(unhashed_local, "rb") as f:
+            master_data = pickle.load(f)
+        # Save with hash
+        with open(master_path_local, "wb") as f:
+            pickle.dump(master_data, f)
+        with open(master_path_drive, "wb") as f:
+            pickle.dump(master_data, f)
+        print(f"✅ Migrated master data to hashed version: {master_path_local}")
 
 if master_data is not None:
     # Unpack loaded data
@@ -119,10 +154,9 @@ if master_data is not None:
     plt.tight_layout()
     plt.show()
 
-    # We are done – skip the rest of the cell
+    # We are done – skip the rest
     print("✅ Master data loaded and ready. Skipping recomputation.")
     # Ensure variables are defined for downstream
-    # (They already are from the loaded data)
     pass
 else:
     # -------------------------------------------------------------------------
@@ -316,7 +350,7 @@ else:
     plt.tight_layout()
     plt.show()
 
-    # ---- SAVE MASTER DATA ----
+    # ---- SAVE MASTER DATA (hashed) ----
     master_data = {
         "coords": coords,
         "factors": factors,
