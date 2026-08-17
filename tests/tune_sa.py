@@ -1,19 +1,18 @@
-#@title 🔬 CELL 6: SA TUNE v4.5 (Inlined JijModeling, Fresh Compilation per Trial)
+#@title 🔬 CELL 6: SA TUNE v4.6 (Resumable, Crash‑Proof, Enhanced Tie‑Break)
 """
 ================================================================================
-SA TUNING WITH OPTUNA v4.5 – INLINED JIJMODELING + FIXED MASTER ENERGY
+SA TUNING WITH OPTUNA v4.6 – RESUMABLE, CRASH‑PROOF, ENHANCED TIE‑BREAK
 ================================================================================
-- Inlined JijModeling functions (no external src.jij_model import).
-- Connectivity constraint includes fixed_neighbors.
-- Master energy uses snapped_indices and N_free to map fixed stations.
-- Budget and isolation violations are logged as magnitudes, not binary.
-- **FIXED**: Compiles a fresh JijModeling instance every trial to avoid mutation.
-- Plots appear (show=True) in the notebook.
-- All timing breakdowns preserved.
+- Inlined JijModeling functions (connectivity includes fixed_neighbors).
+- Dual SQLite storage: local (fast) + Drive (persistent), periodic sync.
+- Resumes from existing study automatically.
+- Skips already tuned tiers and displays stored results + plots.
+- Enhanced tie-break table includes runtime breakdown and variance metrics.
+- Continuous violation magnitudes, master energy corrected.
 ================================================================================
 """
 
-import sys, os, math, time, pickle, re, json, warnings
+import sys, os, math, time, pickle, re, json, warnings, shutil
 from pathlib import Path
 from datetime import datetime
 import numpy as np
@@ -24,7 +23,6 @@ import jijmodeling as jm
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.colors as mcolors
-from scipy.interpolate import griddata
 
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -36,7 +34,8 @@ CONFIG_SA = {
     "TARGET_N": None,                     # None = tune all discovered tiers
     "NUM_SWEEPS": 1000,
     "NUM_READS": 1024,
-    
+    "SYNC_INTERVAL": 5,                   # Sync DB to Drive every N trials
+
     # Mathematical Convergence Config
     "WARMUP_TRIALS": 15,
     "MAX_FLOOR_HITS": 10,
@@ -49,17 +48,17 @@ CONFIG_SA = {
     "ENERGY_TOLERANCE_PCT": 0.5,
 
     "LAMBDA_LOWER": 0.0001,
-    
     "USE_WANDB": True,
     "WANDB_PROJECT": "wqm-placement-optimization",
     "LOG_WANDB_TABLE": True,
     "RUN_ID": datetime.now().strftime("%Y%m%d_%H%M%S"),
-    "FORCE_RETUNE": True,
+    "FORCE_RETUNE": False,                # Set to True to rerun all tiers
 }
 
 TARGET_N = CONFIG_SA["TARGET_N"]
 NUM_SWEEPS = CONFIG_SA["NUM_SWEEPS"]
 NUM_READS = CONFIG_SA["NUM_READS"]
+SYNC_INTERVAL = CONFIG_SA["SYNC_INTERVAL"]
 WARMUP_TRIALS = CONFIG_SA["WARMUP_TRIALS"]
 MAX_FLOOR_HITS = CONFIG_SA["MAX_FLOOR_HITS"]
 VARIANCE_TOLERANCE = CONFIG_SA["VARIANCE_TOLERANCE"]
@@ -81,12 +80,10 @@ LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------------------------
-# INLINED JijModeling FUNCTIONS (formerly src.jij_model)
+# INLINED JijModeling FUNCTIONS (unchanged)
 # -----------------------------------------------------------------------------
 def build_augmented_model() -> jm.Problem:
-    """Build the JijModeling Problem with budget + connectivity (includes fixed_neighbors)."""
     problem = jm.Problem("WQM_Augmented", sense=jm.ProblemSense.MINIMIZE)
-
     N_ph = problem.Length("N")
     K_ph = problem.Length("K")
     a_ph = problem.Float("a", shape=(N_ph,))
@@ -94,14 +91,12 @@ def build_augmented_model() -> jm.Problem:
     neigh_ph = problem.Binary("neigh", shape=(N_ph, N_ph))
     fixed_neighbors_ph = problem.Float("fixed_neighbors", shape=(N_ph,))
     x = problem.BinaryVar("x", shape=(N_ph,))
-
     obj_linear = jm.sum(N_ph, lambda i: a_ph[i] * x[i])
     obj_quad = jm.sum(
         jm.product(N_ph, N_ph).filter(lambda i, j: i < j),
         lambda i, j: Q_ph[i, j] * x[i] * x[j]
     )
     problem += obj_linear + obj_quad
-
     problem += problem.Constraint("budget", jm.sum(N_ph, lambda i: x[i]) == K_ph)
     problem += problem.Constraint(
         "connectivity",
@@ -111,21 +106,12 @@ def build_augmented_model() -> jm.Problem:
     return problem
 
 def get_penalty_weights(instance, lambda_budget: float, lambda_conn: float) -> dict:
-    """Map constraint names to penalty weights, using constraint IDs.
-    Raises ValueError if budget or connectivity constraints are missing.
-    """
     penalty_weights = {}
-    # Debug: print available constraints (can be removed after verification)
-    # print(f"🔍 Available constraints in instance:")
-    # for c in instance.constraints:
-    #     print(f"   ID: {c.id}, Name: '{c.name}'")
-    # Assign weights
     for c in instance.constraints:
         if c.name == "budget":
             penalty_weights[c.id] = lambda_budget
         elif c.name == "connectivity":
             penalty_weights[c.id] = lambda_conn
-    # Check that both were found
     if "budget" not in [c.name for c in instance.constraints]:
         raise ValueError("Budget constraint not found in instance!")
     if "connectivity" not in [c.name for c in instance.constraints]:
@@ -133,13 +119,12 @@ def get_penalty_weights(instance, lambda_budget: float, lambda_conn: float) -> d
     return penalty_weights
 
 def compile_instance(problem: jm.Problem, instance_data: dict):
-    """Compile the JijModeling problem with given data."""
     placeholder_names = {p.name for p in problem.placeholders.values()}
     filtered = {k: v for k, v in instance_data.items() if k in placeholder_names}
     return problem.eval(filtered)
 
 # -----------------------------------------------------------------------------
-# LOAD MASTER DATA (for master energy computation)
+# LOAD MASTER DATA (for master energy)
 # -----------------------------------------------------------------------------
 master_path = GDRIVE_BASE / "master_real.pkl"
 if not master_path.exists():
@@ -147,8 +132,8 @@ if not master_path.exists():
 with open(master_path, "rb") as f:
     master_data = pickle.load(f)
 
-a_master = master_data["a"]                     # length 5417
-Q_master_edges = master_data["Q_edges"]         # list of (i,j,val)
+a_master = master_data["a"]
+Q_master_edges = master_data["Q_edges"]
 coords_master = master_data["coords"]
 U_master = master_data["U"]
 M_indices_master = master_data["M_indices"]
@@ -163,19 +148,12 @@ def compute_energy_sparse(x: np.ndarray, a: np.ndarray, Q_edges: list) -> float:
     return float(energy)
 
 def compute_master_energy_from_solution(x_sol, snapped_indices, N_free):
-    """
-    Map local free solution + fixed stations (implicitly) to master grid using snapped_indices.
-    snapped_indices: array of master indices for all variables: [free_1..free_N, fixed_1..fixed_M]
-    N_free: number of free variables (length of x_sol)
-    """
     x_master = np.zeros(len(a_master), dtype=int)
-    # Free variables
     for idx, val in enumerate(x_sol):
         if val == 1:
             master_idx = snapped_indices[idx]
             if master_idx < len(a_master):
                 x_master[master_idx] = 1
-    # Fixed stations: indices from N_free to end
     for k in range(N_free, len(snapped_indices)):
         master_idx = snapped_indices[k]
         if master_idx < len(a_master):
@@ -183,7 +161,7 @@ def compute_master_energy_from_solution(x_sol, snapped_indices, N_free):
     return compute_energy_sparse(x_master, a_master, Q_master_edges)
 
 # -----------------------------------------------------------------------------
-# VECTORIZED HELPER FUNCTIONS
+# HELPER FUNCTIONS (vectorized, feasibility, adapter)
 # -----------------------------------------------------------------------------
 def compute_energy_vectorized(x: np.ndarray, a: np.ndarray, Q: np.ndarray) -> float:
     x = np.asarray(x, dtype=float)
@@ -195,7 +173,6 @@ def check_feasibility_vectorized(x: np.ndarray, neigh: np.ndarray, K: int, fixed
     x_bool = np.asarray(x, dtype=bool)
     num_selected = np.sum(x_bool)
     budget_ok = (num_selected == K)
-
     neighbor_counts = neigh @ x_bool.astype(float)
     if fixed_neighbors is not None:
         fixed_nbrs = np.asarray(fixed_neighbors, dtype=float)
@@ -205,10 +182,8 @@ def check_feasibility_vectorized(x: np.ndarray, neigh: np.ndarray, K: int, fixed
     selected_mask = x_bool
     isolated = selected_mask & ~has_connection
     connectivity_ok = not np.any(isolated)
-
     feasible = budget_ok and connectivity_ok
     isolated_indices = np.where(isolated)[0].tolist()
-
     return {
         "feasible": feasible,
         "budget_ok": budget_ok,
@@ -217,38 +192,6 @@ def check_feasibility_vectorized(x: np.ndarray, neigh: np.ndarray, K: int, fixed
         "isolated_indices": isolated_indices,
     }
 
-def decode_solution(solution_obj, N: int) -> np.ndarray:
-    x_sol = np.zeros(N, dtype=int)
-    if hasattr(solution_obj, "decision_variables_df"):
-        df = solution_obj.decision_variables_df
-        x_df = df[df["name"] == "x"]
-        for _, row in x_df.iterrows():
-            if row["value"] > 0.5:
-                subs = row["subscripts"]
-                idx = subs[0] if isinstance(subs, (tuple, list)) and len(subs) > 0 else int(subs)
-                if 0 <= idx < N:
-                    x_sol[idx] = 1
-        return x_sol
-    if hasattr(solution_obj, "first"):
-        best_sample = solution_obj.first.sample
-        for idx, val in best_sample.items():
-            if isinstance(idx, tuple):
-                idx = idx[0]
-            if 0 <= idx < N:
-                x_sol[idx] = int(round(val))
-        return x_sol
-    if isinstance(solution_obj, dict):
-        for idx, val in solution_obj.items():
-            if isinstance(idx, tuple):
-                idx = idx[0]
-            if 0 <= idx < N:
-                x_sol[idx] = int(round(val))
-        return x_sol
-    raise TypeError(f"Unsupported solution type: {type(solution_obj)}")
-
-# -----------------------------------------------------------------------------
-# ADAPTER: Sparse → Dense (Q and neigh)
-# -----------------------------------------------------------------------------
 def adapt_sparse_to_dense(instance_data: dict) -> dict:
     N = instance_data["N"]
     Q = np.zeros((N, N), dtype=float)
@@ -279,18 +222,47 @@ def adapt_sparse_to_dense(instance_data: dict) -> dict:
     return instance_data
 
 # -----------------------------------------------------------------------------
-# MATHEMATICAL CONVERGENCE ENGINE (Unchanged)
+# CONVERGENCE ENGINE (with resume support and periodic sync)
 # -----------------------------------------------------------------------------
 class MathematicalConvergenceEngine:
-    def __init__(self, warmup, max_floor_hits, var_tol, min_feas_var, wandb_run=None):
+    def __init__(self, warmup, max_floor_hits, var_tol, min_feas_var, db_local, db_drive, wandb_run=None):
         self.warmup = warmup
         self.max_floor_hits = max_floor_hits
         self.var_tol = var_tol
         self.min_feas_var = min_feas_var
+        self.db_local = db_local
+        self.db_drive = db_drive
         self.wandb_run = wandb_run
+
         self.global_best_feasible_energy = float('inf')
         self.best_penalty_sum = float('inf')
         self.floor_hits = 0
+
+    def initialize_from_study(self, study: optuna.study.Study):
+        """Restore internal state from existing study trials."""
+        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        feasible = [t for t in completed if t.user_attrs.get("Mth_budget_dev", 1) == 0 and t.user_attrs.get("Mth_isolated_count", 1) == 0]
+        if not feasible:
+            self.global_best_feasible_energy = float('inf')
+            self.best_penalty_sum = float('inf')
+            self.floor_hits = 0
+            return
+        # Find best energy and lowest penalty among those with best energy
+        feasible.sort(key=lambda t: (t.user_attrs["top_k_avg_energy"], t.user_attrs["penalty_sum"]))
+        self.global_best_feasible_energy = feasible[0].user_attrs["top_k_avg_energy"]
+        self.best_penalty_sum = feasible[0].user_attrs["penalty_sum"]
+        # Count floor hits: feasible trials with energy within 1e-6 of best and penalty >= best penalty
+        rel_tol = max(1e-6, 1e-6 * abs(self.global_best_feasible_energy))
+        self.floor_hits = 0
+        for t in feasible:
+            e = t.user_attrs["top_k_avg_energy"]
+            p = t.user_attrs["penalty_sum"]
+            if abs(e - self.global_best_feasible_energy) <= rel_tol:
+                if p >= self.best_penalty_sum - 1e-4:
+                    self.floor_hits += 1
+        # The first hit is the best itself, but we need to count actual matches; we can set floor_hits = 1 at least if best exists.
+        if self.floor_hits == 0:
+            self.floor_hits = 1
 
     def __call__(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
         if trial.state != optuna.trial.TrialState.COMPLETE:
@@ -310,6 +282,7 @@ class MathematicalConvergenceEngine:
         completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
         feasible_trials = [t for t in completed if t.user_attrs.get("Mth_budget_dev", 1) == 0 and t.user_attrs.get("Mth_isolated_count", 1) == 0]
 
+        # Compute sigma_j (joint variance)
         sigma_j = float('inf')
         sigma_str = "N/A"
         if len(feasible_trials) >= self.min_feas_var:
@@ -321,6 +294,8 @@ class MathematicalConvergenceEngine:
             var_c = np.var(log_c, ddof=1) if len(log_c) > 1 else 0.0
             sigma_j = math.sqrt(var_b + var_c)
             sigma_str = f"{sigma_j:.3f}"
+        # Store sigma_j in trial user_attrs for later tie-break
+        trial.set_user_attr("sigma_j", sigma_j if sigma_j != float('inf') else None)
 
         status_str = "❌ INFEASIBLE                        "
         if is_feas:
@@ -388,137 +363,135 @@ class MathematicalConvergenceEngine:
                 "master_energy": trial.user_attrs.get("master_energy", np.nan),
             })
 
+        # Periodic sync to Drive
+        if trial.number % SYNC_INTERVAL == 0 and self.db_local.exists():
+            shutil.copy(self.db_local, self.db_drive)
+
         if trial.number >= self.warmup:
             if self.floor_hits >= self.max_floor_hits:
                 print(f"\n🛑 [Early Stopping: Strategy B] Internal Top-K energy floor ({self.global_best_feasible_energy:.4f}) hit {self.max_floor_hits} times. (Best Pen: {self.best_penalty_sum:.2f})")
                 study.stop()
             elif sigma_j <= self.var_tol:
-                print(f"\n🛑 [Early Stopping: Strategy A] Parameter variance collapsed (σ = {sigma_j:.4f} ≤ {self.var_tol}). Search exhausted.")
+                print(f"\n🛑 [Early Stopping: Strategy A] Parameter space variance collapsed (σ = {sigma_j:.4f} ≤ {self.var_tol}). Search exhausted.")
                 study.stop()
 
 # -----------------------------------------------------------------------------
-# OBJECTIVE FUNCTION (with fresh compilation per trial)
+# OBJECTIVE FUNCTION (with exception handling)
 # -----------------------------------------------------------------------------
 def make_objective(instance_data, N, K, a, Q, neigh, fixed_neighbors, snapped_indices, LAMBDA_LOWER, LAMBDA_UPPER):
-    # Build the model once; it will be compiled fresh each trial
     model = build_augmented_model()
-    # Filter the static data for placeholders (N, K, a, Q, neigh, fixed_neighbors)
     model_keys = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
 
     def objective(trial):
-        start_time = time.perf_counter()
-        lambda_budget = trial.suggest_float("lambda_budget", LAMBDA_LOWER, LAMBDA_UPPER, log=True)
-        lambda_conn = trial.suggest_float("lambda_conn", LAMBDA_LOWER, LAMBDA_UPPER, log=True)
-        penalty_sum = lambda_budget + lambda_conn
-        trial.set_user_attr("lambda_budget", lambda_budget)
-        trial.set_user_attr("lambda_conn", lambda_conn)
-        trial.set_user_attr("penalty_sum", penalty_sum)
+        try:
+            start_time = time.perf_counter()
+            lambda_budget = trial.suggest_float("lambda_budget", LAMBDA_LOWER, LAMBDA_UPPER, log=True)
+            lambda_conn = trial.suggest_float("lambda_conn", LAMBDA_LOWER, LAMBDA_UPPER, log=True)
+            penalty_sum = lambda_budget + lambda_conn
+            trial.set_user_attr("lambda_budget", lambda_budget)
+            trial.set_user_attr("lambda_conn", lambda_conn)
+            trial.set_user_attr("penalty_sum", penalty_sum)
 
-        # ---- Compile a fresh instance for this trial ----
-        instance = compile_instance(model, filtered_data)
+            # Compile fresh instance
+            instance = compile_instance(model, filtered_data)
 
-        # 1. QUBO build time
-        t0 = time.perf_counter()
-        penalty_weights = get_penalty_weights(instance, lambda_budget, lambda_conn)
-        qubo_dict, _ = instance.to_qubo(penalty_weights=penalty_weights)
-        t1 = time.perf_counter()
-        qubo_build_time = t1 - t0
+            t0 = time.perf_counter()
+            penalty_weights = get_penalty_weights(instance, lambda_budget, lambda_conn)
+            qubo_dict, _ = instance.to_qubo(penalty_weights=penalty_weights)
+            t1 = time.perf_counter()
+            qubo_build_time = t1 - t0
 
-        # 2. SA sampling time
-        sampler = oj.SASampler()
-        response = sampler.sample_qubo(
-            qubo_dict,
-            num_reads=NUM_READS,
-            num_sweeps=NUM_SWEEPS,
-            sparse=True,
-        )
-        t2 = time.perf_counter()
-        sa_sampling_time = t2 - t1
+            sampler = oj.SASampler()
+            response = sampler.sample_qubo(
+                qubo_dict,
+                num_reads=NUM_READS,
+                num_sweeps=NUM_SWEEPS,
+                sparse=True,
+            )
+            t2 = time.perf_counter()
+            sa_sampling_time = t2 - t1
 
-        # 3. Post-processing
-        all_samples = []
-        for idx in range(response.record.shape[0]):
-            sample_arr = response.record['sample'][idx]
-            x_sample = np.zeros(N, dtype=int)
-            for var_idx, val in zip(response.indices, sample_arr):
-                if var_idx < N:
-                    x_sample[var_idx] = int(round(val))
-            e_sample = compute_energy_vectorized(x_sample, a, Q)
-            f_sample = check_feasibility_vectorized(x_sample, neigh, K, fixed_neighbors)
-            v_sample = float(not f_sample["budget_ok"]) * 0.5 + float(not f_sample["connectivity_ok"]) * 0.5
-            all_samples.append({
-                "solution": x_sample.copy(),
-                "energy": e_sample,
-                "violation_rate": v_sample,
-                "feasible": f_sample["feasible"],
-                "budget_ok": f_sample["budget_ok"],
-                "connectivity_ok": f_sample["connectivity_ok"],
-                "num_selected": f_sample["num_selected"],
-                "isolated_indices": f_sample["isolated_indices"],
-            })
+            all_samples = []
+            for idx in range(response.record.shape[0]):
+                sample_arr = response.record['sample'][idx]
+                x_sample = np.zeros(N, dtype=int)
+                for var_idx, val in zip(response.indices, sample_arr):
+                    if var_idx < N:
+                        x_sample[var_idx] = int(round(val))
+                e_sample = compute_energy_vectorized(x_sample, a, Q)
+                f_sample = check_feasibility_vectorized(x_sample, neigh, K, fixed_neighbors)
+                v_sample = float(not f_sample["budget_ok"]) * 0.5 + float(not f_sample["connectivity_ok"]) * 0.5
+                all_samples.append({
+                    "solution": x_sample.copy(),
+                    "energy": e_sample,
+                    "violation_rate": v_sample,
+                    "feasible": f_sample["feasible"],
+                    "budget_ok": f_sample["budget_ok"],
+                    "connectivity_ok": f_sample["connectivity_ok"],
+                    "num_selected": f_sample["num_selected"],
+                    "isolated_indices": f_sample["isolated_indices"],
+                })
 
-        all_samples.sort(key=lambda s: (s["violation_rate"], s["energy"]))
-        m_idx = min(FEASIBILITY_RANK_THRESHOLD - 1, len(all_samples) - 1)
-        m_sample = all_samples[m_idx]
+            all_samples.sort(key=lambda s: (s["violation_rate"], s["energy"]))
+            m_idx = min(FEASIBILITY_RANK_THRESHOLD - 1, len(all_samples) - 1)
+            m_sample = all_samples[m_idx]
 
-        # --- FIX: use actual magnitudes, not binary ---
-        m_budget = float(abs(m_sample["num_selected"] - K))
-        m_isolated = float(len(m_sample["isolated_indices"]))
-        trial.set_user_attr("Mth_budget_dev", m_budget)
-        trial.set_user_attr("Mth_isolated_count", m_isolated)
+            m_budget = float(abs(m_sample["num_selected"] - K))
+            m_isolated = float(len(m_sample["isolated_indices"]))
+            trial.set_user_attr("Mth_budget_dev", m_budget)
+            trial.set_user_attr("Mth_isolated_count", m_isolated)
 
-        feasible_samples = [s for s in all_samples if s["violation_rate"] == 0]
-        feas_rate = len(feasible_samples) / len(all_samples) if all_samples else 0.0
-        trial.set_user_attr("feasibility_rate", feas_rate)
+            feasible_samples = [s for s in all_samples if s["violation_rate"] == 0]
+            feas_rate = len(feasible_samples) / len(all_samples) if all_samples else 0.0
+            trial.set_user_attr("feasibility_rate", feas_rate)
 
-        if feasible_samples:
-            feasible_samples.sort(key=lambda s: s["energy"])
-            top_k_samples = feasible_samples[:min(TOP_K_ENERGY, len(feasible_samples))]
-        else:
-            top_k_samples = all_samples[:min(TOP_K_ENERGY, len(all_samples))]
-        top_k_energies = [s["energy"] for s in top_k_samples if not np.isnan(s["energy"])]
-        if top_k_energies:
-            top_k_avg = float(np.mean(top_k_energies))
-            top_k_std = float(np.std(top_k_energies)) if len(top_k_energies) > 1 else 0.0
-        else:
-            top_k_avg = 1e9
-            top_k_std = 0.0
-        trial.set_user_attr("top_k_avg_energy", top_k_avg)
-        trial.set_user_attr("top_k_energy_std_dev", top_k_std)
+            if feasible_samples:
+                feasible_samples.sort(key=lambda s: s["energy"])
+                top_k_samples = feasible_samples[:min(TOP_K_ENERGY, len(feasible_samples))]
+            else:
+                top_k_samples = all_samples[:min(TOP_K_ENERGY, len(all_samples))]
+            top_k_energies = [s["energy"] for s in top_k_samples if not np.isnan(s["energy"])]
+            if top_k_energies:
+                top_k_avg = float(np.mean(top_k_energies))
+                top_k_std = float(np.std(top_k_energies)) if len(top_k_energies) > 1 else 0.0
+            else:
+                top_k_avg = 1e9
+                top_k_std = 0.0
+            trial.set_user_attr("top_k_avg_energy", top_k_avg)
+            trial.set_user_attr("top_k_energy_std_dev", top_k_std)
 
-        # Best solution
-        best_sample = all_samples[0]
-        x_best = best_sample["solution"]
-        trial.set_user_attr("winner_solution", x_best.tolist())
+            best_sample = all_samples[0]
+            x_best = best_sample["solution"]
+            trial.set_user_attr("winner_solution", x_best.tolist())
 
-        # Log winner violations (optional but helpful)
-        winner_budget_dev = abs(int(np.sum(x_best)) - K)
-        winner_iso_count = len(best_sample["isolated_indices"])
-        trial.set_user_attr("winner_budget_dev", winner_budget_dev)
-        trial.set_user_attr("winner_iso_count", winner_iso_count)
+            master_energy = compute_master_energy_from_solution(x_best, snapped_indices, N)
+            trial.set_user_attr("master_energy", master_energy)
 
-        # Master energy – using corrected function
-        master_energy = compute_master_energy_from_solution(x_best, snapped_indices, N)
-        trial.set_user_attr("master_energy", master_energy)
+            sel_free = np.where(x_best == 1)[0].tolist()
+            trial.set_user_attr("selected_free_indices", str(sel_free))
+            sel_master = [snapped_indices[i] for i in sel_free if i < len(snapped_indices)]
+            trial.set_user_attr("selected_master_indices", str(sel_master))
 
-        # Selected indices
-        sel_free = np.where(x_best == 1)[0].tolist()
-        trial.set_user_attr("selected_free_indices", str(sel_free))
-        sel_master = [snapped_indices[i] for i in sel_free if i < len(snapped_indices)]
-        trial.set_user_attr("selected_master_indices", str(sel_master))
+            trial.set_user_attr("qubo_build_time", qubo_build_time)
+            trial.set_user_attr("sa_sampling_time", sa_sampling_time)
+            trial.set_user_attr("postprocess_time", time.perf_counter() - t2)
+            trial.set_user_attr("runtime_sec", time.perf_counter() - start_time)
 
-        # Timing breakdown
-        trial.set_user_attr("qubo_build_time", qubo_build_time)
-        trial.set_user_attr("sa_sampling_time", sa_sampling_time)
-        trial.set_user_attr("postprocess_time", time.perf_counter() - t2)
-        trial.set_user_attr("runtime_sec", time.perf_counter() - start_time)
+            return top_k_avg
+        except Exception as e:
+            # Log error and return a large value so trial is marked complete
+            print(f"⚠️ Trial {trial.number} failed with error: {e}")
+            trial.set_user_attr("Mth_budget_dev", 1e9)
+            trial.set_user_attr("Mth_isolated_count", 1e9)
+            trial.set_user_attr("feasibility_rate", 0.0)
+            trial.set_user_attr("top_k_avg_energy", 1e9)
+            return 1e9
 
-        return top_k_avg
     return objective
 
 # -----------------------------------------------------------------------------
-# PLOTTING FUNCTIONS (Deployment and QUBO Matrix)
+# PLOTTING FUNCTIONS (same as before, kept for reuse)
 # -----------------------------------------------------------------------------
 def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150):
     coords_full = np.asarray(instance_data["original_coords"])
@@ -596,7 +569,6 @@ def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150)
     selected_new_str = ', '.join(map(str, selected_new[:10])) + ('...' if len(selected_new) > 10 else '') if selected_new else 'None'
     selected_m_str = ', '.join(map(str, selected_m[:10])) + ('...' if len(selected_m) > 10 else '') if selected_m else 'None'
 
-    # Compute master energy correctly
     master_energy_info = compute_master_energy_from_solution(
         x_sol,
         instance_data.get("snapped_indices"),
@@ -625,7 +597,7 @@ def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150)
 def plot_qubo_matrix(instance, penalty_weights, N, save_path=None, show=True, dpi=150, title_prefix=""):
     qubo_dict, offset = instance.to_qubo(penalty_weights=penalty_weights)
     Q_mat = np.zeros((N, N), dtype=float)
-    
+
     def extract_idx(key):
         if isinstance(key, tuple):
             if len(key) == 2 and isinstance(key[0], str) and key[0] == 'x':
@@ -637,13 +609,13 @@ def plot_qubo_matrix(instance, penalty_weights, N, save_path=None, show=True, dp
                 return key[0]
         else:
             return key
-    
+
     for (key_i, key_j), val in qubo_dict.items():
         i = extract_idx(key_i)
         j = extract_idx(key_j)
         if isinstance(i, int) and isinstance(j, int) and i < N and j < N:
             Q_mat[i, j] = val
-    
+
     Q_mat = Q_mat + Q_mat.T - np.diag(np.diag(Q_mat))
     max_abs = np.max(np.abs(Q_mat)) if np.max(np.abs(Q_mat)) > 0 else 1.0
     norm = mcolors.Normalize(vmin=-max_abs, vmax=max_abs)
@@ -662,7 +634,7 @@ def plot_qubo_matrix(instance, penalty_weights, N, save_path=None, show=True, dp
     plt.close(fig)
 
 # -----------------------------------------------------------------------------
-# MAIN LOOP OVER ALL TIERS
+# MAIN LOOP OVER TIERS
 # -----------------------------------------------------------------------------
 pattern = re.compile(r"instance_data_N(\d+)\.pkl")
 instance_files = [p for p in GDRIVE_BASE.glob("instance_data_N*.pkl") if pattern.match(p.name)]
@@ -672,21 +644,95 @@ if not instance_files:
 if TARGET_N is not None:
     instance_files = [p for p in instance_files if int(pattern.search(p.name).group(1)) == TARGET_N]
 
-if not instance_files:
-    raise FileNotFoundError("No instance_data_N*.pkl files found.")
-
 instance_files.sort(key=lambda p: int(pattern.search(p.name).group(1)))
-
 tuned_params_all = {}
 
 for instance_path in instance_files:
     N_true = int(pattern.search(instance_path.name).group(1))
-    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (Fresh Compilation per Trial, Continuous Violations)\n{'='*115}")
+    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (Resumable, Crash‑Proof)\n{'='*115}")
 
+    study_name = f"sa_tuning_N{N_true}_{RUN_ID}"
+    db_local = LOCAL_CACHE / f"{study_name}.db"
+    db_drive = GDRIVE_BASE / f"{study_name}.db"
+    json_path = GDRIVE_BASE / f"tuned_sa_N{N_true}.json"
+
+    # 1. Check if tier already completed
+    if json_path.exists() and not FORCE_RETUNE:
+        print(f"✅ Tier N={N_true} already tuned. Loading saved results...")
+        with open(json_path, "r") as f:
+            saved_params = json.load(f)
+        # Load instance data
+        with open(instance_path, "rb") as f:
+            instance_data = pickle.load(f)
+        instance_data = adapt_sparse_to_dense(instance_data)
+
+        # Print tie-break table from saved data
+        print(f"\n{'='*115}")
+        print(f"🏆 TIE-BREAK BREAKDOWN (Tier N={N_true} – Saved Results)")
+        print(f"{'='*115}")
+        print(f"{'Trial':<7} | {'Top-3 Energy':<14} | {'Std Dev':<8} | {'Penalty Sum':<12} | {'Feas %':<8} | {'λ_budget':<10} | {'λ_conn':<10} | {'Master Energy':<14} | {'Sel Free Idx'}")
+        print(f"{'-'*115}")
+        notes = "🥇 WINNER (loaded)"
+        e_val = saved_params["best_energy"]
+        std_v = 0.0  # not stored; can set to 0
+        p_sum = saved_params["penalty_sum"]
+        f_pct = saved_params["feasibility_rate"] * 100.0
+        lb_v = saved_params["lambda_budget"]
+        lc_v = saved_params["lambda_conn"]
+        m_e = saved_params["best_master_energy"]
+        sel_free = saved_params["selected_free_indices"]
+        print(f"#LOADED | {e_val:<14.4f} | {std_v:<8.4f} | {p_sum:<12.2f} | {f_pct:<7.2f}% | {lb_v:<10.2f} | {lc_v:<10.2f} | {m_e:<14.4f} | {sel_free:<20} | {notes}")
+        print(f"{'='*115}\n")
+
+        # Generate deployment and QUBO plots
+        x_sol = np.array(eval(saved_params["selected_free_indices"]), dtype=int)
+        x_sol_full = np.zeros(instance_data["N"], dtype=int)
+        for idx in eval(saved_params["selected_free_indices"]):
+            if idx < instance_data["N"]:
+                x_sol_full[idx] = 1
+        plot_deployment(instance_data, x_sol_full, save_path=RUN_DIR / f"deployment_SA_N{N_true}_loaded.png", show=True, dpi=150)
+
+        # Rebuild instance for QUBO matrix
+        model_plot = build_augmented_model()
+        model_keys_plot = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
+        filtered_plot = {k: v for k, v in instance_data.items() if k in model_keys_plot}
+        instance_plot = compile_instance(model_plot, filtered_plot)
+        penalty_weights_plot = get_penalty_weights(instance_plot, saved_params["lambda_budget"], saved_params["lambda_conn"])
+        plot_qubo_matrix(instance_plot, penalty_weights_plot, instance_data["N"],
+                         save_path=RUN_DIR / f"qubo_matrix_SA_N{N_true}_loaded.png", show=True, dpi=150,
+                         title_prefix=f"SA Tuned N={N_true} (loaded) | ")
+
+        tuned_params_all[N_true] = saved_params
+        continue
+
+    # 2. Clear files if FORCE_RETUNE
+    if FORCE_RETUNE:
+        for f in [db_local, db_drive, json_path]:
+            if f.exists():
+                f.unlink()
+                print(f"🗑️  Removed {f}")
+
+    # 3. Load or create study
+    if db_local.exists():
+        print(f"📂 Loading existing study from local DB: {db_local}")
+        study = optuna.load_study(study_name=study_name, storage=f"sqlite:///{db_local}")
+    elif db_drive.exists():
+        print(f"📂 Copying study DB from Drive to local: {db_drive} → {db_local}")
+        shutil.copy(db_drive, db_local)
+        study = optuna.load_study(study_name=study_name, storage=f"sqlite:///{db_local}")
+    else:
+        print("🆕 Creating new study.")
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=f"sqlite:///{db_local}",
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=WARMUP_TRIALS),
+            direction="minimize"
+        )
+
+    # 4. Load instance data and set up objective
     with open(instance_path, "rb") as f:
         instance_data = pickle.load(f)
     instance_data = adapt_sparse_to_dense(instance_data)
-
     N = instance_data["N"]
     K = instance_data["K"]
     a = np.asarray(instance_data["a"], dtype=float)
@@ -695,34 +741,27 @@ for instance_path in instance_files:
     fixed_neighbors = instance_data.get("fixed_neighbors", None)
     snapped_indices = instance_data.get("snapped_indices", None)
 
-    # Compute qsum
     qsum = np.sum(np.abs(a)) + np.sum(np.abs(np.triu(Q, 1)))
     print(f"📏 qsum for N={N_true}: {qsum:.4f}")
-
     LAMBDA_UPPER = qsum
 
-    study_name = f"sa_tuning_N{N_true}_{RUN_ID}"
-    local_db = LOCAL_CACHE / f"{study_name}.db"
-
-    if FORCE_RETUNE:
-        try:
-            optuna.delete_study(study_name=study_name, storage=f"sqlite:///{local_db}")
-        except KeyError:
-            pass
-
+    # 5. W&B
     wandb_run = None
     if USE_WANDB:
         wandb_run = wandb.init(project=WANDB_PROJECT, config=CONFIG_SA, name=f"{study_name}", reinit=True)
 
-    convergence_cb = MathematicalConvergenceEngine(
+    # 6. Convergence engine with resume support
+    conv_engine = MathematicalConvergenceEngine(
         warmup=WARMUP_TRIALS,
         max_floor_hits=MAX_FLOOR_HITS,
         var_tol=VARIANCE_TOLERANCE,
         min_feas_var=MIN_FEASIBLE_FOR_VARIANCE,
-        wandb_run=wandb_run,
+        db_local=db_local,
+        db_drive=db_drive,
+        wandb_run=wandb_run
     )
+    conv_engine.initialize_from_study(study)
 
-    # Constraints function: pass the actual magnitudes
     def constraint_func(trial):
         return [trial.user_attrs.get("Mth_budget_dev", 1e9), trial.user_attrs.get("Mth_isolated_count", 1e9)]
 
@@ -739,16 +778,19 @@ for instance_path in instance_files:
         LAMBDA_UPPER=LAMBDA_UPPER,
     )
 
-    sampler = optuna.samplers.TPESampler(seed=42, n_startup_trials=WARMUP_TRIALS, constraints_func=constraint_func)
-    study = optuna.create_study(study_name=study_name, storage=f"sqlite:///{local_db}", sampler=sampler, direction="minimize")
+    # 7. Run optimization
+    study.optimize(objective, callbacks=[conv_engine])
 
-    study.optimize(objective, callbacks=[convergence_cb])
+    # Final sync
+    if db_local.exists():
+        shutil.copy(db_local, db_drive)
 
+    # 8. Post-study analysis
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     feasible = [t for t in completed if t.user_attrs.get("Mth_budget_dev", 1) == 0 and t.user_attrs.get("Mth_isolated_count", 1) == 0]
 
     if not feasible:
-        print(f"⚠️ No feasible trials found for N={N_true}. Skipping this tier.")
+        print(f"⚠️ No feasible trials found for N={N_true}. Skipping tier.")
         if wandb_run:
             wandb_run.finish()
         continue
@@ -760,7 +802,62 @@ for instance_path in instance_files:
     near_best.sort(key=lambda t: (t.user_attrs["top_k_avg_energy"], t.user_attrs["penalty_sum"]))
     winner = near_best[0]
 
-    # Extract winner data
+    # 9. Enhanced tie-break table
+    print(f"\n{'='*115}")
+    print(f"🏆 TIE-BREAK BREAKDOWN (Feasible Trials within {ENERGY_TOLERANCE_PCT}% of Best Energy: {best_e:.4f})")
+    print(f"{'='*115}")
+    print(f"{'Trial':<7} | {'Top-3 Energy':<14} | {'Std Dev':<8} | {'Penalty Sum':<12} | {'Feas %':<8} | "
+          f"{'λ_budget':<10} | {'λ_conn':<10} | {'Master Energy':<14} | {'QUBO':<6} | {'SA':<6} | {'Post':<6} | {'Total':<6} | {'σ_log':<7} | {'Sel Free Idx'}")
+    print(f"{'-'*150}")
+
+    # Prepare W&B table if enabled
+    if LOG_WANDB_TABLE and wandb_run:
+        wb_table = wandb.Table(columns=[
+            "Trial", "Top3_Energy", "Std_Dev", "Penalty_Sum", "Feas_Pct",
+            "Lambda_Budget", "Lambda_Conn", "Master_Energy",
+            "QUBO_s", "SA_s", "Post_s", "Total_s", "σ_log",
+            "Selected_Free_Idx", "Notes"
+        ])
+
+    primary_winner = near_best[0]
+    for t in near_best:
+        num = t.number
+        e_val = t.user_attrs["top_k_avg_energy"]
+        std_v = t.user_attrs["top_k_energy_std_dev"]
+        p_sum = t.user_attrs["penalty_sum"]
+        f_pct = t.user_attrs["feasibility_rate"] * 100.0
+        lb_v = t.user_attrs["lambda_budget"]
+        lc_v = t.user_attrs["lambda_conn"]
+        m_e = t.user_attrs.get("master_energy", np.nan)
+        qb = t.user_attrs.get("qubo_build_time", 0.0)
+        sa = t.user_attrs.get("sa_sampling_time", 0.0)
+        post = t.user_attrs.get("postprocess_time", 0.0)
+        total = t.user_attrs.get("runtime_sec", 0.0)
+        sigma = t.user_attrs.get("sigma_j", float('inf'))
+        sigma_str = f"{sigma:.3f}" if sigma != float('inf') else "N/A"
+        sel_free = t.user_attrs.get("selected_free_indices", "")
+        notes = "🥇 WINNER" if t.number == winner.number else ""
+
+        print(f"#{num:<6} | {e_val:<14.4f} | {std_v:<8.4f} | {p_sum:<12.2f} | {f_pct:<7.2f}% | "
+              f"{lb_v:<10.2f} | {lc_v:<10.2f} | {m_e:<14.4f} | "
+              f"{qb:<6.2f} | {sa:<6.2f} | {post:<6.2f} | {total:<6.2f} | {sigma_str:<7} | {sel_free:<20} | {notes}")
+
+        if LOG_WANDB_TABLE and wandb_run:
+            wb_table.add_data(
+                f"#{num}", e_val, std_v, p_sum, f_pct,
+                lb_v, lc_v, m_e,
+                qb, sa, post, total, sigma_str,
+                sel_free, notes
+            )
+
+    print(f"{'='*150}\n")
+
+    if LOG_WANDB_TABLE and wandb_run:
+        wandb_run.log({"tie_break_candidates": wb_table})
+        wandb_run.summary["global_best_feasible_energy"] = best_e
+        wandb_run.summary["winning_penalty_sum"] = winner.user_attrs["penalty_sum"]
+
+    # 10. Extract winner and save
     winner_lb = winner.user_attrs["lambda_budget"]
     winner_lc = winner.user_attrs["lambda_conn"]
     winner_penalty_sum = winner.user_attrs["penalty_sum"]
@@ -771,65 +868,24 @@ for instance_path in instance_files:
     winner_sel_master = winner.user_attrs.get("selected_master_indices", "")
     winner_solution = winner.user_attrs.get("winner_solution", None)
 
-    # Print tie-break table
-    print(f"\n{'='*115}")
-    print(f"🏆 TIE-BREAK BREAKDOWN (Feasible Trials within {ENERGY_TOLERANCE_PCT}% of Best Energy: {best_e:.4f})")
-    print(f"{'='*115}")
-    print(f"{'Trial':<7} | {'Top-3 Energy':<14} | {'Std Dev':<8} | {'Penalty Sum':<12} | {'Feas %':<8} | {'λ_budget':<10} | {'λ_conn':<10} | {'Master Energy':<14} | {'Sel Free Idx'}")
-    print(f"{'-'*115}")
-    for t in near_best:
-        num = t.number
-        e_val = t.user_attrs["top_k_avg_energy"]
-        std_v = t.user_attrs["top_k_energy_std_dev"]
-        p_sum = t.user_attrs["penalty_sum"]
-        f_pct = t.user_attrs["feasibility_rate"] * 100.0
-        lb_v = t.user_attrs["lambda_budget"]
-        lc_v = t.user_attrs["lambda_conn"]
-        m_e = t.user_attrs.get("master_energy", np.nan)
-        sel_free = t.user_attrs.get("selected_free_indices", "")
-        notes = "🥇 WINNER" if t.number == winner.number else ""
-        print(f"#{num:<6} | {e_val:<14.4f} | {std_v:<8.4f} | {p_sum:<12.2f} | {f_pct:<7.2f}% | {lb_v:<10.2f} | {lc_v:<10.2f} | {m_e:<14.4f} | {sel_free:<20} | {notes}")
-    print(f"{'='*115}\n")
-
-    # W&B table logging
-    if LOG_WANDB_TABLE and wandb_run:
-        wb_table = wandb.Table(columns=["Trial", "Top3_Energy", "Std_Dev", "Penalty_Sum", "Feas_Pct", "Lambda_Budget", "Lambda_Conn", "Master_Energy", "Selected_Free_Idx", "Notes"])
-        for t in near_best:
-            num = t.number
-            e_val = t.user_attrs["top_k_avg_energy"]
-            std_v = t.user_attrs["top_k_energy_std_dev"]
-            p_sum = t.user_attrs["penalty_sum"]
-            f_pct = t.user_attrs["feasibility_rate"] * 100.0
-            lb_v = t.user_attrs["lambda_budget"]
-            lc_v = t.user_attrs["lambda_conn"]
-            m_e = t.user_attrs.get("master_energy", np.nan)
-            sel_free = t.user_attrs.get("selected_free_indices", "")
-            notes = "🥇 WINNER" if t.number == winner.number else ""
-            wb_table.add_data(f"#{num}", e_val, std_v, p_sum, f_pct, lb_v, lc_v, m_e, sel_free, notes)
-        wandb_run.log({"tie_break_candidates": wb_table})
-        wandb_run.summary["global_best_feasible_energy"] = best_e
-        wandb_run.summary["winning_penalty_sum"] = winner_penalty_sum
-
-    # Generate plots if solution exists
+    # Generate plots
     if winner_solution is not None:
         x_winner = np.asarray(winner_solution, dtype=int)
-        # Deployment plot (show=True)
         deploy_save_path = RUN_DIR / f"deployment_SA_N{N_true}_K{K}.png"
         plot_deployment(instance_data, x_winner, save_path=deploy_save_path, show=True, dpi=150)
 
-        # QUBO matrix plot (show=True) – re‑compile instance for plotting
-        # (we don't have the instance here, but we can create a fresh one)
+        # QUBO matrix plot
         model_plot = build_augmented_model()
         model_keys_plot = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
-        filtered_data_plot = {k: v for k, v in instance_data.items() if k in model_keys_plot}
-        instance_plot = compile_instance(model_plot, filtered_data_plot)
+        filtered_plot = {k: v for k, v in instance_data.items() if k in model_keys_plot}
+        instance_plot = compile_instance(model_plot, filtered_plot)
         winner_penalty_weights = get_penalty_weights(instance_plot, winner_lb, winner_lc)
         qubo_save_path = RUN_DIR / f"qubo_matrix_SA_N{N_true}_K{K}.png"
         plot_qubo_matrix(instance_plot, winner_penalty_weights, N, save_path=qubo_save_path, show=True, dpi=150, title_prefix=f"SA Tuned N={N_true} | ")
     else:
         print(f"⚠️ No solution vector stored for winner of N={N_true}. Skipping plots.")
 
-    # Save tuned parameters to JSON
+    # Save tuned parameters
     tuned_params = {
         "N": N_true,
         "lambda_budget": float(winner_lb),
@@ -847,7 +903,6 @@ for instance_path in instance_files:
     }
     tuned_params_all[N_true] = tuned_params
 
-    json_path = GDRIVE_BASE / f"tuned_sa_N{N_true}.json"
     with open(json_path, "w") as f:
         json.dump(tuned_params, f, indent=2)
     (LOCAL_CACHE / f"tuned_sa_N{N_true}.json").write_text(json.dumps(tuned_params, indent=2))
@@ -857,7 +912,7 @@ for instance_path in instance_files:
         wandb_run.finish()
 
 # -----------------------------------------------------------------------------
-# SUMMARY: All tuned parameters
+# FINAL SUMMARY
 # -----------------------------------------------------------------------------
 print("\n" + "=" * 115)
 print("📊 TUNING SUMMARY – ALL TIERS")
