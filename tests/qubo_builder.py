@@ -1,11 +1,11 @@
-#@title CELL 4: GENERATE SPARSE QUBO + MIQP DATA (Resumable, Fixed Plotting)
+#@title CELL 4: GENERATE SPARSE QUBO + MIQP DATA (Resumable, Fast Plotting)
 """
 ================================================================================
 REVISION: Resumable – loads per‑tier instance_data_N{N}.pkl if available.
 - Uses FORCE_RECOMPUTE_QUBO flag from Cell 1.
 - Dual storage: local and Drive.
-- Stores valid_edges inside the instance data for connectivity plots.
-- Plotting correctly uses original_coords (full combined array) from loaded data.
+- Stores both valid_edges (D_max) and valid_edges_lc (2*L_c) for plotting.
+- Connectivity plots use LineCollection for speed and plot only L_c edges.
 ================================================================================
 """
 import os
@@ -17,6 +17,7 @@ from scipy.spatial import cKDTree
 import shapely
 from shapely.geometry import LineString, Point
 import matplotlib.pyplot as plt
+import matplotlib.collections as mcoll
 import jijmodeling as jm
 from tqdm.notebook import tqdm
 import shutil
@@ -26,8 +27,6 @@ warnings.filterwarnings('ignore')
 # -----------------------------------------------------------------------------
 # CONFIGURATION (reuse from Cell 2)
 # -----------------------------------------------------------------------------
-# MASTER_QUBO_CONFIG is defined in Cell 2; we use it directly.
-# If it's not defined, fall back to a default (should not happen).
 try:
     CONFIG_QUBO = MASTER_QUBO_CONFIG
 except NameError:
@@ -51,7 +50,6 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # LOAD MASTER DATA (already in memory from Cell 2)
 # -----------------------------------------------------------------------------
 try:
-    # Variables from Cell 2
     coords_master = coords
     U_master = U
     M_indices_master = M_indices
@@ -72,7 +70,6 @@ except NameError:
     Q_master_edges = master_data["Q_edges"]
     metadata = master_data["metadata"]
     global_D_max = metadata["master_D_max"]
-    # also define coords for backward compatibility
     coords = coords_master
     U = U_master
     M_indices = M_indices_master
@@ -94,7 +91,7 @@ except NameError:
         scaling_results = pickle.load(f)
 
 # -----------------------------------------------------------------------------
-# PAIRWISE TERM CALCULATION (unchanged)
+# PAIRWISE TERM CALCULATION (extended: returns both D_max and L_c edge sets)
 # -----------------------------------------------------------------------------
 def compute_pairwise_terms_shape_aware(
     coords: np.ndarray,
@@ -113,7 +110,8 @@ def compute_pairwise_terms_shape_aware(
       - linear: dict {orig_idx: coeff}
       - quad_edges: list of (orig_i, orig_j, coeff) with orig_i < orig_j
       - neighbors: dict {orig_idx: list_of_neighbor_orig_indices} (free+fixed)
-      - valid_edges: set of (orig_i, orig_j) for connectivity plotting
+      - valid_edges: set of (orig_i, orig_j) for connectivity constraint (D_max)
+      - valid_edges_lc: set of (orig_i, orig_j) within 2*L_c for plotting
     """
     N_total = coords.shape[0]
     free_indices = [i for i in range(N_total) if i not in M_indices]
@@ -134,6 +132,17 @@ def compute_pairwise_terms_shape_aware(
         if water_polygon.contains(LineString([p1, p2])):
             valid_edges.add((i, j))
 
+    # ---- Build L_c edge set (within 2*L_c) for plotting ----
+    lc_radius = 2.0 * L_c
+    valid_edges_lc = set()
+    pairs_lc = tree.query_pairs(r=lc_radius)
+    for i, j in pairs_lc:
+        p1, p2 = coords[i], coords[j]
+        if not (water_polygon.contains(Point(p1)) and water_polygon.contains(Point(p2))):
+            continue
+        if water_polygon.contains(LineString([p1, p2])):
+            valid_edges_lc.add((i, j))
+
     # Build neighbors dict for free vertices only (including fixed neighbors)
     neighbors = {i: [] for i in free_indices}
     for i, j in valid_edges:
@@ -149,8 +158,8 @@ def compute_pairwise_terms_shape_aware(
 
     # ---- Compute quadratic interactions (within 2*L_c) ----
     raw_quad = {}
-    pairs_within = tree.query_pairs(r=2.0 * L_c)
-    for i, j in pairs_within:
+    # Reuse pairs_lc to avoid re-querying
+    for i, j in pairs_lc:
         p1, p2 = coords[i], coords[j]
         if not (water_polygon.contains(Point(p1)) and water_polygon.contains(Point(p2))):
             continue
@@ -204,6 +213,7 @@ def compute_pairwise_terms_shape_aware(
         "quad_edges": quad_edges,
         "neighbors": neighbors,
         "valid_edges": valid_edges,
+        "valid_edges_lc": valid_edges_lc,
     }
 
 # -----------------------------------------------------------------------------
@@ -267,26 +277,23 @@ for N in tqdm(tiers, desc="Tiers"):
     if loaded:
         print(f"✅ Loaded instance data for N={N}")
         # Extract data for plotting
-        # Use original_coords (full combined array) for plotting
-        # Fallback: if original_coords missing, reconstruct from coords and fixed_indices
         if "original_coords" in instance_data:
             coords_plot = instance_data["original_coords"]
         else:
-            # Reconstruct full coordinates: free + fixed
+            # fallback
             free_coords = instance_data["coords"]
             fixed_indices = instance_data["fixed_indices"]
             fixed_coords = instance_data.get("original_coords_full", None)
             if fixed_coords is None:
-                # approximate: use the original master coordinates for fixed stations? Not ideal.
-                # but we can't easily reconstruct; warn and use free coords only.
                 print(f"⚠️ Cannot reconstruct full coords for N={N}; using free coords only.")
                 coords_plot = free_coords
             else:
                 coords_plot = np.vstack([free_coords, fixed_coords])
         M_tier = instance_data["fixed_indices"]
-        valid_edges = instance_data.get("valid_edges", set())
+        # Use valid_edges_lc for plotting (fallback to valid_edges if missing)
+        edges_plot = instance_data.get("valid_edges_lc", instance_data.get("valid_edges", set()))
         qubo_results[N] = {
-            "edges": valid_edges,
+            "edges": edges_plot,
             "coords": coords_plot,
             "M_indices": M_tier,
         }
@@ -299,10 +306,9 @@ for N in tqdm(tiers, desc="Tiers"):
     res = scaling_results[N]
     coords_tier = res["coords"]
     U_tier = res["U"]
-    M_tier = res["M_indices"]          # indices within this tier (compressed)
+    M_tier = res["M_indices"]
     snapped_indices = res["snapped_indices"]
 
-    # Call helper on the tier's data
     pair_data = compute_pairwise_terms_shape_aware(
         coords=coords_tier,
         U=U_tier,
@@ -320,6 +326,7 @@ for N in tqdm(tiers, desc="Tiers"):
     quad_edges_raw = pair_data["quad_edges"]
     neighbors_dict = pair_data["neighbors"]
     valid_edges = pair_data["valid_edges"]
+    valid_edges_lc = pair_data["valid_edges_lc"]
 
     # Compress to free variables only
     free_indices_orig = list(neighbors_dict.keys())
@@ -349,7 +356,6 @@ for N in tqdm(tiers, desc="Tiers"):
         if any(nbr in M_set_tier for nbr in neighbors_dict[orig_i]):
             fixed_neighbors_arr[ci] = 1
 
-    # qsum for penalty scaling
     qsum = np.sum(np.abs(a_new)) + sum(abs(val) for _, _, val in Q_edges_new)
 
     K = MASTER_QUBO_CONFIG["K"]
@@ -365,7 +371,6 @@ for N in tqdm(tiers, desc="Tiers"):
 
     a_effective = a_new.copy()
 
-    # Build MIQP data dict (for Cell 5)
     data_dict = {
         "K_total": int(K),
         "a": a_effective.tolist(),
@@ -379,7 +384,6 @@ for N in tqdm(tiers, desc="Tiers"):
         data_dict["edges"] = edges_list
         data_dict["Q_vals"] = qvals_list
 
-    # Assemble full instance_data
     instance_data = {
         "N": N_free,
         "K": K,
@@ -389,7 +393,7 @@ for N in tqdm(tiers, desc="Tiers"):
         "fixed_neighbors": fixed_neighbors_arr,
         "coords": coords_tier[free_indices_orig],
         "U": U_tier[free_indices_orig],
-        "original_coords": coords_tier,          # full combined coordinates (free + fixed)
+        "original_coords": coords_tier,
         "original_U": U_tier,
         "original_indices": free_indices_orig,
         "fixed_indices": M_tier,
@@ -398,7 +402,8 @@ for N in tqdm(tiers, desc="Tiers"):
         "L_c": MASTER_QUBO_CONFIG["L_c"],
         "L_w": MASTER_QUBO_CONFIG["L_w"],
         "qsum": qsum,
-        "valid_edges": valid_edges,          # store for connectivity plot
+        "valid_edges": valid_edges,
+        "valid_edges_lc": valid_edges_lc,
         "miqp_data": data_dict,
         "miqp_params": {
             "max_degree": max_degree,
@@ -406,15 +411,13 @@ for N in tqdm(tiers, desc="Tiers"):
         }
     }
 
-    # Save to local and Drive
     with open(instance_local, "wb") as f:
         pickle.dump(instance_data, f, protocol=pickle.HIGHEST_PROTOCOL)
     with open(instance_drive, "wb") as f:
         pickle.dump(instance_data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    # Store for plotting
     qubo_results[N] = {
-        "edges": valid_edges,
+        "edges": valid_edges_lc,  # use L_c edges for plotting
         "coords": coords_tier,
         "M_indices": M_tier,
     }
@@ -427,9 +430,9 @@ print("=" * 100)
 print("🚀 All QUBO + MIQP data saved successfully.")
 
 # -----------------------------------------------------------------------------
-# PLOT CONNECTIVITY GRAPHS (from loaded/computed data)
+# PLOT CONNECTIVITY GRAPHS (using LineCollection, plotting L_c edges)
 # -----------------------------------------------------------------------------
-print("\n📊 Plotting landmass-aware graph edges per tier...")
+print("\n📊 Plotting landmass-aware graph edges per tier (L_c edges only)...")
 tiers = sorted(qubo_results.keys())
 n_tiers = len(tiers)
 cols = 2
@@ -443,26 +446,32 @@ for ax, N in zip(axes, tiers):
     edges = qubo_results[N]["edges"]
     M_tier = qubo_results[N]["M_indices"]
 
+    # Master map backdrop
     ax.scatter(coords_master[:, 0], coords_master[:, 1], c="lightgray", s=4, alpha=0.35, zorder=0)
 
+    # Build line segments for LineCollection
+    segments = []
     for i, j in edges:
-        ax.plot([tier_coords[i, 0], tier_coords[j, 0]],
-                [tier_coords[i, 1], tier_coords[j, 1]],
-                color="steelblue", alpha=0.3, linewidth=0.6, zorder=1)
+        segments.append([(tier_coords[i, 0], tier_coords[i, 1]),
+                         (tier_coords[j, 0], tier_coords[j, 1])])
+    if segments:
+        lc = mcoll.LineCollection(segments, colors="steelblue", alpha=0.3, linewidth=0.6, zorder=1)
+        ax.add_collection(lc)
 
+    # Nodes
     ax.scatter(tier_coords[:, 0], tier_coords[:, 1], c="black", s=15, alpha=0.8, zorder=2)
     if len(M_tier) > 0:
         ax.scatter(tier_coords[M_tier, 0], tier_coords[M_tier, 1],
                    c="red", marker="*", s=200, edgecolor="black", linewidth=0.5, zorder=3)
 
-    ax.set_title(f"Graph N={N} | D_max={global_D_max:.0f}m", fontsize=10, fontweight="bold")
+    ax.set_title(f"Graph N={N} | Edges: {len(edges):,} within 2·L_c ({2*MASTER_QUBO_CONFIG['L_c']:.0f}m)", fontsize=10, fontweight="bold")
     ax.set_aspect("equal")
     ax.axis("off")
 
 for ax in axes[n_tiers:]:
     ax.axis("off")
 
-plt.suptitle("Landmass-Aware Network Topology by Tier", fontsize=14, fontweight="bold")
+plt.suptitle("Landmass-Aware Network Topology (L_c edges only)", fontsize=14, fontweight="bold")
 plt.tight_layout()
 plt.show()
 
