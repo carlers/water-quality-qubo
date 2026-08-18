@@ -5,7 +5,8 @@ MIQP SOLVE WITH SCIP – REAL DATA (MULTI-TIER) – RESUMABLE
 ================================================================================
 - Uses FORCE_RECOMPUTE_SCIP flag from Cell 1.
 - Result filenames include config_hash (based on MASTER_QUBO_CONFIG).
-- Checks local cache first, then Drive; if missing or force, solves.
+- Loads hashed instance files (fallback to unhashed, auto‑migrate).
+- Loads hashed master file (fallback to unhashed).
 - No greedy fallback – SCIP must find a solution.
 - Always generates deployment and matrix plots.
 ================================================================================
@@ -14,10 +15,24 @@ MIQP SOLVE WITH SCIP – REAL DATA (MULTI-TIER) – RESUMABLE
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-# MASTER_QUBO_CONFIG is already defined in Cell 2.
-# Generate config hash for filenames (same as Cell 6)
 import hashlib
 import json
+
+# MASTER_QUBO_CONFIG is already defined in Cell 2.
+# If not, we compute it (fallback).
+try:
+    MASTER_QUBO_CONFIG
+except NameError:
+    print("⚠️ MASTER_QUBO_CONFIG not found; using defaults.")
+    MASTER_QUBO_CONFIG = {
+        "L_c": 7500.0,
+        "L_w": 1000.0,
+        "Beta": 1.0,
+        "Delta": 1.0,
+        "Current_vector": (1.0, 0.0),
+        "K": 5,
+        "D_max_buffer": 1.15,
+    }
 config_str = json.dumps(MASTER_QUBO_CONFIG, sort_keys=True)
 config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
 print(f"🔑 SCIP config hash: {config_hash}")
@@ -60,23 +75,51 @@ try:
 except ImportError:
     SCIP_AVAILABLE = False
     print("⚠️ SCIP not available. Cell 5 will fail.")
-    # We still define the function to avoid errors, but it will raise.
 
 warnings.filterwarnings('ignore')
 
 # -----------------------------------------------------------------------------
-# LOAD MASTER DATA
+# LOAD MASTER DATA (hashed first, fallback to unhashed)
 # -----------------------------------------------------------------------------
-master_path_local = LOCAL_CACHE / "master_real.pkl"
-master_path_gdrive = GDRIVE_BASE / "master_real.pkl"
+master_path_hashed_local = LOCAL_CACHE / f"master_real_{config_hash}.pkl"
+master_path_hashed_drive = GDRIVE_BASE / f"master_real_{config_hash}.pkl"
+master_path_unhashed_local = LOCAL_CACHE / "master_real.pkl"
+master_path_unhashed_drive = GDRIVE_BASE / "master_real.pkl"
 
 master_data = None
-if master_path_local.exists():
-    with open(master_path_local, "rb") as f:
+
+# 1. Try hashed local
+if master_path_hashed_local.exists():
+    with open(master_path_hashed_local, "rb") as f:
         master_data = pickle.load(f)
-elif master_path_gdrive.exists():
-    with open(master_path_gdrive, "rb") as f:
+    print("✅ Loaded hashed master from local.")
+elif master_path_hashed_drive.exists():
+    print("📂 Loading hashed master from Drive (copying to local)...")
+    shutil.copy(master_path_hashed_drive, master_path_hashed_local)
+    with open(master_path_hashed_local, "rb") as f:
         master_data = pickle.load(f)
+    print("✅ Loaded hashed master from Drive.")
+# 2. If not found, try unhashed (backward compatibility)
+elif master_path_unhashed_local.exists():
+    print("📂 Loading unhashed master from local (migrating to hashed)...")
+    with open(master_path_unhashed_local, "rb") as f:
+        master_data = pickle.load(f)
+    # Save as hashed
+    with open(master_path_hashed_local, "wb") as f:
+        pickle.dump(master_data, f)
+    with open(master_path_hashed_drive, "wb") as f:
+        pickle.dump(master_data, f)
+    print("✅ Migrated master to hashed version.")
+elif master_path_unhashed_drive.exists():
+    print("📂 Loading unhashed master from Drive (migrating to hashed)...")
+    shutil.copy(master_path_unhashed_drive, master_path_unhashed_local)
+    with open(master_path_unhashed_local, "rb") as f:
+        master_data = pickle.load(f)
+    with open(master_path_hashed_local, "wb") as f:
+        pickle.dump(master_data, f)
+    with open(master_path_hashed_drive, "wb") as f:
+        pickle.dump(master_data, f)
+    print("✅ Migrated master to hashed version.")
 
 if master_data is None:
     raise FileNotFoundError("Master data not found. Run Cell 2 first.")
@@ -89,7 +132,7 @@ M_indices_master = master_data["M_indices"]
 print(f"✅ Loaded Master Data: N={len(a_master)}, Q_edges={len(Q_master_edges)}")
 
 # -----------------------------------------------------------------------------
-# HELPER FUNCTIONS (sparse energy, feasibility, greedy – but greedy not used)
+# HELPER FUNCTIONS (sparse energy, feasibility)
 # -----------------------------------------------------------------------------
 def compute_energy_sparse(x: np.ndarray, a: np.ndarray, Q_edges: list) -> float:
     x = np.asarray(x, dtype=bool)
@@ -129,8 +172,6 @@ def check_feasibility_sparse(x, neighbors, K, fixed_neighbors=None):
         "num_selected": num_selected,
         "isolated_indices": isolated_indices,
     }
-
-# No greedy function – SCIP must succeed.
 
 # -----------------------------------------------------------------------------
 # MIQP PROBLEM BUILDER (same as Cell 4)
@@ -231,7 +272,7 @@ def solve_scip_sparse(instance_data, verbose=False):
     tier_energy = compute_energy_sparse(x_sol, a, Q_edges)
     feas_detail = check_feasibility_sparse(x_sol, neighbors, K, fixed_neighbors)
     feasible = feas_detail["feasible"]
-    violation_rate = 0.0 if feasible else 1.0  # simple binary for reporting
+    violation_rate = 0.0 if feasible else 1.0
 
     return {
         "solution": x_sol,
@@ -249,7 +290,6 @@ def solve_scip_sparse(instance_data, verbose=False):
 # -----------------------------------------------------------------------------
 def plot_deployment(instance_data, result, save_path=None, show=True, dpi=150):
     coords_full = np.asarray(instance_data["original_coords"])
-    U_full = np.asarray(instance_data["original_U"]) if instance_data.get("original_U") is not None else None
     D_MAX = instance_data["D_max"]
     fixed_indices = list(instance_data.get("fixed_indices", []))
     free_indices = list(instance_data.get("original_indices", []))
@@ -406,31 +446,58 @@ def plot_miqp_matrix_reduced(instance_data, save_path=None, show=True, dpi=150, 
     plt.close(fig)
 
 # -----------------------------------------------------------------------------
-# DISCOVER INSTANCE DATA FILES
+# DISCOVER INSTANCE DATA FILES (hashed first, fallback to unhashed)
 # -----------------------------------------------------------------------------
-pattern = re.compile(r"instance_data_N(\d+)\.pkl")
+pattern_hashed = re.compile(r"instance_data_N(\d+)_([a-f0-9]{8})\.pkl")
+pattern_unhashed = re.compile(r"instance_data_N(\d+)\.pkl")
+
 instance_files = []
-for p in GDRIVE_BASE.glob("instance_data_N*.pkl"):
-    if pattern.match(p.name):
+# 1. Hashed files
+for p in GDRIVE_BASE.glob("instance_data_N*_*.pkl"):
+    m = pattern_hashed.match(p.name)
+    if m and m.group(2) == config_hash:
         instance_files.append(p)
+# 2. If none, try unhashed (fallback)
 if not instance_files:
-    for p in LOCAL_CACHE.glob("instance_data_N*.pkl"):
-        if pattern.match(p.name):
+    for p in GDRIVE_BASE.glob("instance_data_N*.pkl"):
+        if pattern_unhashed.match(p.name):
             instance_files.append(p)
+# Also check local cache
+if not instance_files:
+    for p in LOCAL_CACHE.glob("instance_data_N*_*.pkl"):
+        m = pattern_hashed.match(p.name)
+        if m and m.group(2) == config_hash:
+            instance_files.append(p)
+    if not instance_files:
+        for p in LOCAL_CACHE.glob("instance_data_N*.pkl"):
+            if pattern_unhashed.match(p.name):
+                instance_files.append(p)
 
 if not instance_files:
     raise FileNotFoundError("No instance_data_N*.pkl files found in local or Drive.")
 
-# Optionally filter by TARGET_N if defined (from CONFIG_SA, but we can add a local variable)
+# Optionally filter by TARGET_N
 try:
     TARGET_N = CONFIG_SA.get("TARGET_N", None)
 except NameError:
     TARGET_N = None
 if TARGET_N is not None:
-    instance_files = [p for p in instance_files if int(pattern.search(p.name).group(1)) == TARGET_N]
+    def extract_N(p):
+        m = pattern_hashed.match(p.name) or pattern_unhashed.match(p.name)
+        if m:
+            return int(m.group(1))
+        return None
+    instance_files = [p for p in instance_files if extract_N(p) == TARGET_N]
 
-instance_files.sort(key=lambda p: int(pattern.search(p.name).group(1)))
-print(f"Found {len(instance_files)} instance data files: {[p.name for p in instance_files]}")
+# Sort by N
+def extract_N_from_path(p):
+    m = pattern_hashed.match(p.name) or pattern_unhashed.match(p.name)
+    return int(m.group(1)) if m else 0
+
+instance_files.sort(key=extract_N_from_path)
+print(f"Found {len(instance_files)} instance data files:")
+for p in instance_files:
+    print(f"  {p.name}")
 
 # -----------------------------------------------------------------------------
 # SOLVE EACH TIER
@@ -438,7 +505,13 @@ print(f"Found {len(instance_files)} instance data files: {[p.name for p in insta
 all_results = []
 
 for instance_path in instance_files:
-    N_true = int(pattern.search(instance_path.name).group(1))
+    # Extract N from filename
+    m = pattern_hashed.match(instance_path.name) or pattern_unhashed.match(instance_path.name)
+    if not m:
+        print(f"⚠️ Skipping unrecognized file: {instance_path.name}")
+        continue
+    N_true = int(m.group(1))
+
     print("\n" + "=" * 70)
     print(f"🔬 Solving tier N={N_true}")
     print("=" * 70)
@@ -446,6 +519,19 @@ for instance_path in instance_files:
     # Load instance data
     with open(instance_path, "rb") as f:
         instance_data = pickle.load(f)
+
+    # If unhashed, save as hashed for future
+    if pattern_unhashed.match(instance_path.name):
+        hashed_name = f"instance_data_N{N_true}_{config_hash}.pkl"
+        hashed_local = LOCAL_CACHE / hashed_name
+        hashed_drive = GDRIVE_BASE / hashed_name
+        with open(hashed_local, "wb") as f:
+            pickle.dump(instance_data, f)
+        with open(hashed_drive, "wb") as f:
+            pickle.dump(instance_data, f)
+        print(f"✅ Migrated instance data to hashed: {hashed_local}")
+        # Use hashed path for result saving
+        instance_path = hashed_local
 
     N_free = instance_data["N"]
     K = instance_data["K"]
@@ -458,7 +544,7 @@ for instance_path in instance_files:
     scip_local = LOCAL_CACHE / scip_filename
     scip_gdrive = GDRIVE_BASE / scip_filename
 
-    # Check if we should force recompute
+    # If force recompute, delete existing files
     if FORCE_RECOMPUTE_SCIP:
         for f in [scip_local, scip_gdrive]:
             if f.exists():
@@ -484,7 +570,7 @@ for instance_path in instance_files:
             scip_result["status"] = "solved"
         except Exception as e:
             print(f"❌ SCIP solver failed: {e}")
-            raise  # Re-raise to stop execution; no fallback
+            raise  # No fallback
 
         # Save result
         with open(scip_local, "wb") as f:
@@ -501,7 +587,7 @@ for instance_path in instance_files:
         fixed_indices = instance_data["fixed_indices"]
 
         x_master = np.zeros(len(a_master), dtype=int)
-        N_free = len(free_indices)
+        N_free_local = len(free_indices)
 
         for idx, val in enumerate(x_sol):
             if val == 1:
@@ -510,7 +596,7 @@ for instance_path in instance_files:
                     x_master[master_idx] = 1
 
         for k, f_idx in enumerate(fixed_indices):
-            master_idx = snapped_indices[N_free + k]
+            master_idx = snapped_indices[N_free_local + k]
             if 0 <= master_idx < len(a_master):
                 x_master[master_idx] = 1
 
