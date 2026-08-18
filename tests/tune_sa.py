@@ -1,16 +1,17 @@
-#@title 🔬 CELL 6: SA TUNE v4.7 (Resumable, Config‑Hashed, Enhanced Tie‑Break)
+#@title 🔬 CELL 6: SA TUNE v4.8 (Resumable, Config‑Aware, Saves Samples)
 """
 ================================================================================
-SA TUNING WITH OPTUNA v4.7 – RESUMABLE, CONFIG‑HASHED, ENHANCED TIE‑BREAK
+SA TUNING WITH OPTUNA v4.8 – RESUMABLE, CONFIG‑AWARE, SAVES SAMPLES
 ================================================================================
 - Inlined JijModeling functions (connectivity includes fixed_neighbors).
 - Dual SQLite storage: local (fast) + Drive (persistent), periodic sync.
-- Study name includes a hash of all QUBO parameters → automatically retunes
-  when configuration changes.
+- Study name includes config_hash (from MASTER_QUBO_CONFIG).
 - Resumes from existing study automatically.
 - Skips already tuned tiers and displays stored results + plots.
 - Enhanced tie-break table includes runtime breakdown and variance metrics.
 - Continuous violation magnitudes, master energy corrected.
+- Saves all SA samples (per trial) to a pickle file for later visualisation.
+- Crash‑proof: saves samples incrementally (after each trial) and loads existing.
 ================================================================================
 """
 
@@ -30,11 +31,22 @@ warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # -----------------------------------------------------------------------------
-# QUBO CONFIGURATION (from cell 4)
+# QUBO CONFIGURATION (reuse from Cell 2)
 # -----------------------------------------------------------------------------
-
-# Compute a unique hash for this config
-config_str = json.dumps(CONFIG_QUBO, sort_keys=True)
+try:
+    MASTER_QUBO_CONFIG
+except NameError:
+    print("⚠️ MASTER_QUBO_CONFIG not found; using defaults.")
+    MASTER_QUBO_CONFIG = {
+        "L_c": 7500.0,
+        "L_w": 1000.0,
+        "Beta": 1.0,
+        "Delta": 1.0,
+        "Current_vector": (1.0, 0.0),
+        "K": 5,
+        "D_max_buffer": 1.15,
+    }
+config_str = json.dumps(MASTER_QUBO_CONFIG, sort_keys=True)
 config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
 print(f"🔑 QUBO config hash: {config_hash}")
 
@@ -57,7 +69,7 @@ CONFIG_SA = {
     "USE_WANDB": True,
     "WANDB_PROJECT": "wqm-placement-optimization",
     "LOG_WANDB_TABLE": True,
-    "FORCE_RETUNE": False,                # Set to True to rerun all tiers
+    "SAVE_SA_SAMPLES": True,               # Set to False to skip saving samples (save space)
 }
 
 TARGET_N = CONFIG_SA["TARGET_N"]
@@ -75,7 +87,14 @@ LAMBDA_LOWER = CONFIG_SA["LAMBDA_LOWER"]
 USE_WANDB = CONFIG_SA["USE_WANDB"]
 WANDB_PROJECT = CONFIG_SA["WANDB_PROJECT"]
 LOG_WANDB_TABLE = CONFIG_SA["LOG_WANDB_TABLE"]
-FORCE_RETUNE = CONFIG_SA["FORCE_RETUNE"]
+SAVE_SA_SAMPLES = CONFIG_SA["SAVE_SA_SAMPLES"]
+
+# Force retune flag (defined in Cell 1)
+try:
+    FORCE_RETUNE_SA
+except NameError:
+    FORCE_RETUNE_SA = False
+    print("⚠️ FORCE_RETUNE_SA not defined; defaulting to False.")
 
 LOCAL_CACHE = Path("/content/wqm_data")
 GDRIVE_BASE = Path("/content/drive/MyDrive/wqm_data")
@@ -85,7 +104,7 @@ LOCAL_CACHE.mkdir(parents=True, exist_ok=True)
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 # -----------------------------------------------------------------------------
-# INLINED JijModeling FUNCTIONS
+# INLINED JijModeling FUNCTIONS (unchanged)
 # -----------------------------------------------------------------------------
 def build_augmented_model() -> jm.Problem:
     problem = jm.Problem("WQM_Augmented", sense=jm.ProblemSense.MINIMIZE)
@@ -129,14 +148,43 @@ def compile_instance(problem: jm.Problem, instance_data: dict):
     return problem.eval(filtered)
 
 # -----------------------------------------------------------------------------
-# LOAD MASTER DATA (for master energy)
+# LOAD MASTER DATA (hashed, fallback to unhashed)
 # -----------------------------------------------------------------------------
-master_path = GDRIVE_BASE / "master_real.pkl"
-if not master_path.exists():
-    master_path = LOCAL_CACHE / "master_real.pkl"
-with open(master_path, "rb") as f:
-    master_data = pickle.load(f)
+def load_master_data():
+    master_path_hashed_local = LOCAL_CACHE / f"master_real_{config_hash}.pkl"
+    master_path_hashed_drive = GDRIVE_BASE / f"master_real_{config_hash}.pkl"
+    master_path_unhashed_local = LOCAL_CACHE / "master_real.pkl"
+    master_path_unhashed_drive = GDRIVE_BASE / "master_real.pkl"
 
+    master_data = None
+    if master_path_hashed_local.exists():
+        with open(master_path_hashed_local, "rb") as f:
+            master_data = pickle.load(f)
+    elif master_path_hashed_drive.exists():
+        shutil.copy(master_path_hashed_drive, master_path_hashed_local)
+        with open(master_path_hashed_local, "rb") as f:
+            master_data = pickle.load(f)
+    elif master_path_unhashed_local.exists():
+        with open(master_path_unhashed_local, "rb") as f:
+            master_data = pickle.load(f)
+        # migrate
+        with open(master_path_hashed_local, "wb") as f:
+            pickle.dump(master_data, f)
+        with open(master_path_hashed_drive, "wb") as f:
+            pickle.dump(master_data, f)
+    elif master_path_unhashed_drive.exists():
+        shutil.copy(master_path_unhashed_drive, master_path_unhashed_local)
+        with open(master_path_unhashed_local, "rb") as f:
+            master_data = pickle.load(f)
+        with open(master_path_hashed_local, "wb") as f:
+            pickle.dump(master_data, f)
+        with open(master_path_hashed_drive, "wb") as f:
+            pickle.dump(master_data, f)
+    if master_data is None:
+        raise FileNotFoundError("Master data not found. Run Cell 2 first.")
+    return master_data
+
+master_data = load_master_data()
 a_master = master_data["a"]
 Q_master_edges = master_data["Q_edges"]
 coords_master = master_data["coords"]
@@ -166,7 +214,7 @@ def compute_master_energy_from_solution(x_sol, snapped_indices, N_free):
     return compute_energy_sparse(x_master, a_master, Q_master_edges)
 
 # -----------------------------------------------------------------------------
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (vectorized, feasibility, adapter)
 # -----------------------------------------------------------------------------
 def compute_energy_vectorized(x: np.ndarray, a: np.ndarray, Q: np.ndarray) -> float:
     x = np.asarray(x, dtype=float)
@@ -374,9 +422,9 @@ class MathematicalConvergenceEngine:
                 study.stop()
 
 # -----------------------------------------------------------------------------
-# OBJECTIVE FUNCTION (with exception handling)
+# OBJECTIVE FUNCTION (with exception handling and sample storage)
 # -----------------------------------------------------------------------------
-def make_objective(instance_data, N, K, a, Q, neigh, fixed_neighbors, snapped_indices, LAMBDA_LOWER, LAMBDA_UPPER):
+def make_objective(instance_data, N, K, a, Q, neigh, fixed_neighbors, snapped_indices, LAMBDA_LOWER, LAMBDA_UPPER, sa_samples_dict):
     model = build_augmented_model()
     model_keys = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
     filtered_data = {k: v for k, v in instance_data.items() if k in model_keys}
@@ -475,6 +523,24 @@ def make_objective(instance_data, N, K, a, Q, neigh, fixed_neighbors, snapped_in
             trial.set_user_attr("postprocess_time", time.perf_counter() - t2)
             trial.set_user_attr("runtime_sec", time.perf_counter() - start_time)
 
+            # ---- Store samples for later visualisation ----
+            if SAVE_SA_SAMPLES:
+                # Convert to serializable format (list of dicts with basic types)
+                samples_storage = [
+                    {
+                        "solution": s["solution"].tolist(),
+                        "energy": s["energy"],
+                        "violation_rate": s["violation_rate"],
+                        "feasible": s["feasible"],
+                        "budget_ok": s["budget_ok"],
+                        "connectivity_ok": s["connectivity_ok"],
+                        "num_selected": s["num_selected"],
+                        "isolated_indices": s["isolated_indices"],
+                    }
+                    for s in all_samples
+                ]
+                sa_samples_dict[trial.number] = samples_storage
+
             return top_k_avg
         except Exception as e:
             print(f"⚠️ Trial {trial.number} failed with error: {e}")
@@ -487,7 +553,7 @@ def make_objective(instance_data, N, K, a, Q, neigh, fixed_neighbors, snapped_in
     return objective
 
 # -----------------------------------------------------------------------------
-# PLOTTING FUNCTIONS
+# PLOTTING FUNCTIONS (same as before, kept for reuse)
 # -----------------------------------------------------------------------------
 def plot_deployment(instance_data, solution, save_path=None, show=True, dpi=150):
     coords_full = np.asarray(instance_data["original_coords"])
@@ -633,32 +699,72 @@ def plot_qubo_matrix(instance, penalty_weights, N, save_path=None, show=True, dp
 # MAIN LOOP OVER TIERS
 # -----------------------------------------------------------------------------
 pattern = re.compile(r"instance_data_N(\d+)\.pkl")
-instance_files = [p for p in GDRIVE_BASE.glob("instance_data_N*.pkl") if pattern.match(p.name)]
+instance_files = [p for p in GDRIVE_BASE.glob("instance_data_N*_*.pkl") if pattern.match(p.name)]
+if not instance_files:
+    # fallback to unhashed
+    instance_files = [p for p in GDRIVE_BASE.glob("instance_data_N*.pkl") if pattern.match(p.name)]
+if not instance_files:
+    instance_files = [p for p in LOCAL_CACHE.glob("instance_data_N*_*.pkl") if pattern.match(p.name)]
 if not instance_files:
     instance_files = [p for p in LOCAL_CACHE.glob("instance_data_N*.pkl") if pattern.match(p.name)]
 
 if TARGET_N is not None:
-    instance_files = [p for p in instance_files if int(pattern.search(p.name).group(1)) == TARGET_N]
+    def extract_N(p):
+        m = pattern.match(p.name)
+        if m:
+            return int(m.group(1))
+        return None
+    instance_files = [p for p in instance_files if extract_N(p) == TARGET_N]
 
-instance_files.sort(key=lambda p: int(pattern.search(p.name).group(1)))
+# Deduplicate by checking config hash if present
+def get_hash_from_filename(p):
+    m = re.search(r"_([a-f0-9]{8})\.pkl$", p.name)
+    return m.group(1) if m else None
+
+# Keep only those that match current config_hash (if hashed), else keep unhashed
+filtered_files = []
+for p in instance_files:
+    h = get_hash_from_filename(p)
+    if h is None:
+        filtered_files.append(p)  # keep unhashed as fallback
+    elif h == config_hash:
+        filtered_files.append(p)
+instance_files = sorted(filtered_files, key=lambda p: int(pattern.match(p.name).group(1)))
+
+if not instance_files:
+    raise FileNotFoundError("No instance_data_N*.pkl files found in local or Drive.")
+
 tuned_params_all = {}
 
 for instance_path in instance_files:
-    N_true = int(pattern.search(instance_path.name).group(1))
-    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (Resumable, Config‑Hashed)\n{'='*115}")
+    # Extract N
+    m = pattern.match(instance_path.name)
+    if not m:
+        print(f"⚠️ Skipping unrecognized file: {instance_path.name}")
+        continue
+    N_true = int(m.group(1))
+    print(f"\n{'='*115}\n🔬 Tuning SA for tier N={N_true} (Resumable, Config‑Aware)\n{'='*115}")
 
-    # Study name includes config hash so parameter changes trigger fresh tuning
+    # Study name includes config hash
     study_name = f"sa_tuning_N{N_true}_{config_hash}"
     db_local = LOCAL_CACHE / f"{study_name}.db"
     db_drive = GDRIVE_BASE / f"{study_name}.db"
     json_path = GDRIVE_BASE / f"tuned_sa_N{N_true}_{config_hash}.json"
+    samples_path_local = LOCAL_CACHE / f"sa_samples_N{N_true}_{config_hash}.pkl"
+    samples_path_drive = GDRIVE_BASE / f"sa_samples_N{N_true}_{config_hash}.pkl"
 
-    # 1. Check if tier already completed
-    if json_path.exists() and not FORCE_RETUNE:
-        print(f"✅ Tier N={N_true} already tuned with current config. Loading saved results...")
+    # ---- Check if tier already completed ----
+    if json_path.exists() and not FORCE_RETUNE_SA:
+        print(f"✅ Tier N={N_true} already tuned. Loading saved results...")
         with open(json_path, "r") as f:
             saved_params = json.load(f)
-        with open(instance_path, "rb") as f:
+        # Load instance data (hashed if possible)
+        inst_path = LOCAL_CACHE / f"instance_data_N{N_true}_{config_hash}.pkl"
+        if not inst_path.exists():
+            inst_path = GDRIVE_BASE / f"instance_data_N{N_true}_{config_hash}.pkl"
+        if not inst_path.exists():
+            inst_path = LOCAL_CACHE / f"instance_data_N{N_true}.pkl"
+        with open(inst_path, "rb") as f:
             instance_data = pickle.load(f)
         instance_data = adapt_sparse_to_dense(instance_data)
 
@@ -700,32 +806,23 @@ for instance_path in instance_files:
         tuned_params_all[N_true] = saved_params
         continue
 
-    # 2. Clear files if FORCE_RETUNE
-    if FORCE_RETUNE:
-        for f in [db_local, db_drive, json_path]:
+    # ---- Clear files if FORCE_RETUNE_SA ----
+    if FORCE_RETUNE_SA:
+        for f in [db_local, db_drive, json_path, samples_path_local, samples_path_drive]:
             if f.exists():
                 f.unlink()
                 print(f"🗑️  Removed {f}")
 
-    # 3. Load or create study
-    if db_local.exists():
-        print(f"📂 Loading existing study from local DB: {db_local}")
-        study = optuna.load_study(study_name=study_name, storage=f"sqlite:///{db_local}")
-    elif db_drive.exists():
-        print(f"📂 Copying study DB from Drive to local: {db_drive} → {db_local}")
-        shutil.copy(db_drive, db_local)
-        study = optuna.load_study(study_name=study_name, storage=f"sqlite:///{db_local}")
-    else:
-        print("🆕 Creating new study.")
-        study = optuna.create_study(
-            study_name=study_name,
-            storage=f"sqlite:///{db_local}",
-            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=WARMUP_TRIALS),
-            direction="minimize"
-        )
-
-    # 4. Load instance data and set up objective
-    with open(instance_path, "rb") as f:
+    # ---- Load instance data ----
+    # Try hashed first
+    inst_path = LOCAL_CACHE / f"instance_data_N{N_true}_{config_hash}.pkl"
+    if not inst_path.exists():
+        inst_path = GDRIVE_BASE / f"instance_data_N{N_true}_{config_hash}.pkl"
+    if not inst_path.exists():
+        inst_path = LOCAL_CACHE / f"instance_data_N{N_true}.pkl"
+    if not inst_path.exists():
+        inst_path = GDRIVE_BASE / f"instance_data_N{N_true}.pkl"
+    with open(inst_path, "rb") as f:
         instance_data = pickle.load(f)
     instance_data = adapt_sparse_to_dense(instance_data)
     N = instance_data["N"]
@@ -740,12 +837,42 @@ for instance_path in instance_files:
     print(f"📏 qsum for N={N_true}: {qsum:.4f}")
     LAMBDA_UPPER = qsum
 
-    # 5. W&B
+    # ---- Load existing samples if any ----
+    SA_SAMPLES = {}
+    if SAVE_SA_SAMPLES:
+        if samples_path_local.exists():
+            with open(samples_path_local, "rb") as f:
+                SA_SAMPLES = pickle.load(f)
+            print(f"📂 Loaded existing SA samples from {samples_path_local}")
+        elif samples_path_drive.exists():
+            shutil.copy(samples_path_drive, samples_path_local)
+            with open(samples_path_local, "rb") as f:
+                SA_SAMPLES = pickle.load(f)
+            print(f"📂 Loaded existing SA samples from Drive (copied to local)")
+
+    # ---- W&B ----
     wandb_run = None
     if USE_WANDB:
         wandb_run = wandb.init(project=WANDB_PROJECT, config=CONFIG_SA, name=f"{study_name}", reinit=True)
 
-    # 6. Convergence engine with resume support
+    # ---- Create/load study ----
+    if db_local.exists():
+        print(f"📂 Loading existing study from local DB: {db_local}")
+        study = optuna.load_study(study_name=study_name, storage=f"sqlite:///{db_local}")
+    elif db_drive.exists():
+        print(f"📂 Copying study DB from Drive to local: {db_drive} → {db_local}")
+        shutil.copy(db_drive, db_local)
+        study = optuna.load_study(study_name=study_name, storage=f"sqlite:///{db_local}")
+    else:
+        print("🆕 Creating new study.")
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=f"sqlite:///{db_local}",
+            sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=WARMUP_TRIALS, constraints_func=constraint_func),
+            direction="minimize"
+        )
+
+    # ---- Convergence engine with resume support ----
     conv_engine = MathematicalConvergenceEngine(
         warmup=WARMUP_TRIALS,
         max_floor_hits=MAX_FLOOR_HITS,
@@ -771,16 +898,25 @@ for instance_path in instance_files:
         snapped_indices=snapped_indices,
         LAMBDA_LOWER=LAMBDA_LOWER,
         LAMBDA_UPPER=LAMBDA_UPPER,
+        sa_samples_dict=SA_SAMPLES,
     )
 
-    # 7. Run optimization
+    # ---- Run optimization ----
     study.optimize(objective, callbacks=[conv_engine])
 
-    # Final sync
+    # ---- Final sync DB ----
     if db_local.exists():
         shutil.copy(db_local, db_drive)
 
-    # 8. Post-study analysis
+    # ---- Save samples ----
+    if SAVE_SA_SAMPLES and SA_SAMPLES:
+        with open(samples_path_local, "wb") as f:
+            pickle.dump(SA_SAMPLES, f)
+        with open(samples_path_drive, "wb") as f:
+            pickle.dump(SA_SAMPLES, f)
+        print(f"✅ Saved SA samples to {samples_path_local}")
+
+    # ---- Post-study analysis ----
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     feasible = [t for t in completed if t.user_attrs.get("Mth_budget_dev", 1) == 0 and t.user_attrs.get("Mth_isolated_count", 1) == 0]
 
@@ -797,7 +933,7 @@ for instance_path in instance_files:
     near_best.sort(key=lambda t: (t.user_attrs["top_k_avg_energy"], t.user_attrs["penalty_sum"]))
     winner = near_best[0]
 
-    # 9. Enhanced tie-break table
+    # Enhanced tie-break table
     print(f"\n{'='*115}")
     print(f"🏆 TIE-BREAK BREAKDOWN (Feasible Trials within {ENERGY_TOLERANCE_PCT}% of Best Energy: {best_e:.4f})")
     print(f"{'='*115}")
@@ -851,7 +987,7 @@ for instance_path in instance_files:
         wandb_run.summary["global_best_feasible_energy"] = best_e
         wandb_run.summary["winning_penalty_sum"] = winner.user_attrs["penalty_sum"]
 
-    # 10. Extract winner and save
+    # ---- Save tuned parameters ----
     winner_lb = winner.user_attrs["lambda_budget"]
     winner_lc = winner.user_attrs["lambda_conn"]
     winner_penalty_sum = winner.user_attrs["penalty_sum"]
