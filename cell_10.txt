@@ -1,0 +1,609 @@
+#@title 📊 BENCHMARK: JijModeling vs Custom QUBO Builder (Final Fix)
+"""
+================================================================================
+BENCHMARK: JijModeling vs Custom Sparse QUBO Builder
+================================================================================
+- Uses exact functions from Cell 6.
+- Fix: strict loading of hashed instance files (no fallback to unhashed).
+- Fix: constraints extracted as a list once.
+- Optimised: fewer penalty pairs, repeats, random solutions, lower SA params.
+- Times QUBO construction and SA sampling for both methods.
+- Verifies correctness with random solutions.
+- Saves results to a DataFrame and plots.
+================================================================================
+"""
+
+import sys, os, time, pickle, json, hashlib, shutil, re
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import jijmodeling as jm
+import openjij as oj
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# 1. EXACT FUNCTIONS COPIED FROM CELL 6
+# ============================================================================
+
+def build_augmented_model() -> jm.Problem:
+    problem = jm.Problem("WQM_Augmented", sense=jm.ProblemSense.MINIMIZE)
+    N_ph = problem.Length("N")
+    K_ph = problem.Length("K")
+    a_ph = problem.Float("a", shape=(N_ph,))
+    Q_ph = problem.Float("Q", shape=(N_ph, N_ph))
+    neigh_ph = problem.Binary("neigh", shape=(N_ph, N_ph))
+    fixed_neighbors_ph = problem.Float("fixed_neighbors", shape=(N_ph,))
+    x = problem.BinaryVar("x", shape=(N_ph,))
+    obj_linear = jm.sum(N_ph, lambda i: a_ph[i] * x[i])
+    obj_quad = jm.sum(
+        jm.product(N_ph, N_ph).filter(lambda i, j: i < j),
+        lambda i, j: Q_ph[i, j] * x[i] * x[j]
+    )
+    problem += obj_linear + obj_quad
+    problem += problem.Constraint("budget", jm.sum(N_ph, lambda i: x[i]) == K_ph)
+    problem += problem.Constraint(
+        "connectivity",
+        lambda i: x[i] <= fixed_neighbors_ph[i] + jm.sum(N_ph, lambda j: neigh_ph[i, j] * x[j]),
+        domain=N_ph
+    )
+    return problem
+
+def compile_instance(problem: jm.Problem, instance_data: dict):
+    placeholder_names = {p.name for p in problem.placeholders.values()}
+    filtered = {k: v for k, v in instance_data.items() if k in placeholder_names}
+    return problem.eval(filtered)
+
+def adapt_sparse_to_dense(instance_data: dict) -> dict:
+    N = instance_data["N"]
+    Q = np.zeros((N, N), dtype=float)
+    for i, j, val in instance_data.get("Q_edges", []):
+        Q[i, j] = val
+        Q[j, i] = val
+    neigh = np.zeros((N, N), dtype=int)
+    for i, nbrs in enumerate(instance_data.get("neighbors", [])):
+        for j in nbrs:
+            if j < N:
+                neigh[i, j] = 1
+    fixed_neighbors_raw = instance_data.get("fixed_neighbors", None)
+    if fixed_neighbors_raw is not None:
+        if isinstance(fixed_neighbors_raw, (list, np.ndarray)):
+            fixed_neighbors = np.asarray(fixed_neighbors_raw, dtype=float)
+        elif isinstance(fixed_neighbors_raw, dict):
+            fixed_neighbors = np.zeros(N, dtype=float)
+            for k, v in fixed_neighbors_raw.items():
+                if int(k) < N and (isinstance(v, (list, tuple, dict)) and len(v) > 0) or (isinstance(v, (int, float)) and v > 0):
+                    fixed_neighbors[int(k)] = 1.0
+        else:
+            fixed_neighbors = None
+    else:
+        fixed_neighbors = None
+    instance_data["Q"] = Q
+    instance_data["neigh"] = neigh
+    instance_data["fixed_neighbors"] = fixed_neighbors
+    return instance_data
+
+# === PATH FALLBACK (hybrid: Colab + local) ===
+try:
+    CACHE_DIR
+except NameError:
+    import importlib.util
+    try:
+        IN_COLAB = importlib.util.find_spec("google.colab") is not None
+    except Exception:
+        IN_COLAB = False
+    if IN_COLAB:
+        from google.colab import drive
+        if not Path("/content/drive/MyDrive").exists():
+            drive.mount("/content/drive")
+        CACHE_DIR = Path("/content/wqm_data")
+        RESULTS_DIR = Path("/content/drive/MyDrive/wqm_data")
+        DATA_DIR = RESULTS_DIR
+    else:
+        REPO_PATH = Path.cwd().resolve()
+        for _ in range(6):
+            if (REPO_PATH / "notebooks").exists() or (REPO_PATH / "src").exists() or (REPO_PATH / ".git").exists():
+                break
+            REPO_PATH = REPO_PATH.parent
+        DATA_DIR = REPO_PATH / "data"
+        CACHE_DIR = DATA_DIR / "cache"
+        RESULTS_DIR = REPO_PATH / "results"
+    # Legacy aliases (used by existing cell code)
+    LOCAL_CACHE = CACHE_DIR
+    GDRIVE_BASE = RESULTS_DIR
+    OUTPUT_DIR = RESULTS_DIR
+    DRIVE_CACHE = RESULTS_DIR
+    GEOJSON_PATH = DATA_DIR / "LDB_centroids_clean.geojson"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================================================
+# 2. BENCHMARK CONFIGURATION (optimised for speed)
+# ============================================================================
+CONFIG_BENCH = {
+    "N_TESTS": [200, 500, 1000],
+    "PENALTY_PAIRS": [
+        (0.1, 0.1),
+        (1.0, 1.0),
+        (10.0, 10.0),
+    ],
+    "NUM_READS": 256,
+    "NUM_SWEEPS": 200,
+    "RANDOM_SOLUTIONS": 5,
+    "REPEAT_TIMES": 3,
+    "CACHE_FILE": str(CACHE_DIR / "benchmark_results.pkl")
+}
+
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================================================
+# 3. ROBUST CONFIG HASH – PRIORITISE NOTEBOOK NAMESPACE
+# ============================================================================
+def get_config_hash():
+    try:
+        from IPython import get_ipython
+        ns = get_ipython().user_ns
+        if "config_hash" in ns:
+            h = ns["config_hash"]
+            if isinstance(h, str) and len(h) == 8:
+                print(f"✅ Using config_hash from notebook namespace: {h}")
+                return h
+    except:
+        pass
+
+    hash_file = LOCAL_CACHE / "config_hash.txt"
+    if hash_file.exists():
+        h = hash_file.read_text().strip()
+        if len(h) == 8:
+            print(f"✅ Using config_hash from file: {h}")
+            return h
+
+    for cache_dir in [LOCAL_CACHE, DRIVE_CACHE]:
+        for f in cache_dir.glob("instance_data_N*_*.pkl"):
+            m = re.search(r"_([a-f0-9]{8})\.pkl$", f.name)
+            if m:
+                h = m.group(1)
+                print(f"✅ Using config_hash from filename scan: {h}")
+                return h
+
+    default_config = {
+        "L_c": 7500.0,
+        "L_w": 1000.0,
+        "Beta": 1.0,
+        "Delta": 1.0,
+        "Current_vector": (1.0, 0.0),
+        "K": 5,
+        "D_max_buffer": 1.15,
+    }
+    config_str = json.dumps(default_config, sort_keys=True)
+    h = hashlib.md5(config_str.encode()).hexdigest()[:8]
+    print(f"⚠️ Using computed default hash: {h}")
+    return h
+
+config_hash = get_config_hash()
+print(f"Final config hash: {config_hash}")
+
+# ============================================================================
+# 4. STRICT INSTANCE LOADER – ONLY HASHED VERSION
+# ============================================================================
+def load_instance(N):
+    # Try local hashed
+    inst_path = CACHE_DIR / f"instance_data_N{N}_{config_hash}.pkl"
+    if not inst_path.exists():
+        # Try Drive hashed
+        inst_path = RESULTS_DIR / f"instance_data_N{N}_{config_hash}.pkl"
+        if inst_path.exists():
+            print(f"📂 Copying hashed instance from Drive to local: {inst_path}")
+            shutil.copy(inst_path, CACHE_DIR / f"instance_data_N{N}_{config_hash}.pkl")
+            inst_path = CACHE_DIR / f"instance_data_N{N}_{config_hash}.pkl"
+        else:
+            raise FileNotFoundError(
+                f"❌ Hashed instance file not found: instance_data_N{N}_{config_hash}.pkl\n"
+                f"Please run Cell 4 to generate the hashed files."
+            )
+
+    with open(inst_path, "rb") as f:
+        instance = pickle.load(f)
+
+    print(f"🔍 Benchmark loading instance from: {inst_path}")
+
+    # ----- Validation: ensure all indices are < N -----
+    N_free = instance["N"]
+    for i, j, _ in instance.get("Q_edges", []):
+        if i >= N_free or j >= N_free:
+            raise ValueError(f"Q_edges contains out‑of‑range index: ({i},{j}) >= {N_free}. "
+                             "The file is not compressed. Please regenerate with Cell 4.")
+    for nbrs in instance.get("neighbors", []):
+        for nbr in nbrs:
+            if nbr >= N_free:
+                raise ValueError(f"neighbors contains out‑of‑range index: {nbr} >= {N_free}. "
+                                 "The file is not compressed. Please regenerate with Cell 4.")
+
+    # Convert to dense matrices (same as Cell 6)
+    instance = adapt_sparse_to_dense(instance)
+
+    # Ensure fixed_neighbors is a list of floats
+    if instance.get("fixed_neighbors") is not None:
+        if isinstance(instance["fixed_neighbors"], np.ndarray):
+            instance["fixed_neighbors"] = instance["fixed_neighbors"].tolist()
+    instance["K"] = int(instance["K"])
+    if isinstance(instance["a"], np.ndarray):
+        instance["a"] = instance["a"].tolist()
+
+    return instance
+
+# ============================================================================
+# 5. CUSTOM SPARSE QUBO BUILDER (unchanged)
+# ============================================================================
+def build_custom_qubo_sparse(instance, lambda_budget, lambda_conn):
+    N = instance["N"]
+    a = np.asarray(instance["a"], dtype=float)
+    Q_edges = instance.get("Q_edges", [])
+    neighbors = instance.get("neighbors", [])
+    fixed_neighbors = np.asarray(instance.get("fixed_neighbors", [0]*N), dtype=float)
+    K = instance["K"]
+
+    linear = {i: float(a[i]) for i in range(N)}
+    quad = {}
+    for i,j,val in Q_edges:
+        if i < j:
+            quad[(i,j)] = float(val)
+        else:
+            quad[(j,i)] = float(val)
+
+    lb = float(lambda_budget)
+    lc = float(lambda_conn)
+
+    # Budget penalty: (sum x - K)^2
+    for i in range(N):
+        linear[i] = linear.get(i, 0.0) + lb * (1 - 2*K)
+    for i in range(N):
+        for j in range(i+1, N):
+            quad[(i,j)] = quad.get((i,j), 0.0) + 2*lb
+
+    # Connectivity penalty
+    for i in range(N):
+        linear[i] = linear.get(i, 0.0) + lc * (1 - fixed_neighbors[i])
+    for i in range(N):
+        for j in neighbors[i]:
+            if i < j:
+                quad[(i,j)] = quad.get((i,j), 0.0) - lc
+            elif j < i:
+                quad[(j,i)] = quad.get((j,i), 0.0) - lc
+
+    eps = 1e-12
+    linear = {k: v for k, v in linear.items() if abs(v) > eps}
+    quad = {k: v for k, v in quad.items() if abs(v) > eps}
+    return linear, quad, N
+
+def custom_to_qubo_dict(linear, quad, N):
+    qubo = {}
+    for i, val in linear.items():
+        qubo[(i,i)] = val
+    for (i,j), val in quad.items():
+        qubo[(i,j)] = val
+        qubo[(j,i)] = val
+    qubo = {k: v for k, v in qubo.items() if abs(v) > 1e-12}
+    return qubo
+
+# ============================================================================
+# 6. MANUAL ENERGY (for correctness)
+# ============================================================================
+def compute_energy_manual(instance, x, lambda_budget, lambda_conn):
+    a = np.asarray(instance["a"], dtype=float)
+    Q_edges = instance.get("Q_edges", [])
+    neighbors = instance.get("neighbors", [])
+    fixed_neighbors = np.asarray(instance.get("fixed_neighbors", [0]*len(a)), dtype=float)
+    K = instance["K"]
+    x = np.asarray(x, dtype=float)
+    energy = np.dot(a, x)
+    for i,j,val in Q_edges:
+        if x[i] and x[j]:
+            energy += val
+    s = np.sum(x)
+    energy += lambda_budget * (s - K)**2
+    neigh_mat = np.zeros((len(a), len(a)), dtype=int)
+    for i, lst in enumerate(neighbors):
+        for j in lst:
+            neigh_mat[i,j] = 1
+    violation = 0.0
+    for i in range(len(x)):
+        conn = fixed_neighbors[i] + np.sum(neigh_mat[i] * x)
+        if x[i] > conn:
+            violation += x[i] - conn
+    energy += lambda_conn * violation
+    return energy
+
+# ============================================================================
+# 7. BENCHMARK FUNCTION (FIXED & OPTIMISED)
+# ============================================================================
+def benchmark_instance(N, penalty_pairs, num_reads, num_sweeps, repeat=3, random_sols=5):
+    instance = load_instance(N)
+    model = build_augmented_model()
+    model_keys = {"N", "K", "a", "Q", "neigh", "fixed_neighbors"}
+    filtered_data = {k: v for k, v in instance.items() if k in model_keys}
+    compiled = compile_instance(model, filtered_data)
+
+    # Extract constraints ONCE as a list
+    constraints = list(compiled.constraints) if hasattr(compiled, 'constraints') else []
+    print(f"Compiled instance for N={N} has {len(constraints)} constraints: {[c.name for c in constraints[:5]]}...")
+
+    results = []
+    sampler = oj.SASampler()
+
+    for lb, lc in penalty_pairs:
+        # Build penalty weights manually
+        penalty_weights = {}
+        for c in constraints:
+            if c.name == "budget":
+                penalty_weights[c.id] = lb
+            elif c.name == "connectivity":
+                penalty_weights[c.id] = lc
+
+        # ---- JijModeling ----
+        try:
+            def build_jm():
+                qubo_dict, offset = compiled.to_qubo(penalty_weights=penalty_weights)
+                return qubo_dict, offset
+
+            times_jm = []
+            for _ in range(repeat):
+                t0 = time.perf_counter()
+                qd, off = build_jm()
+                times_jm.append(time.perf_counter() - t0)
+
+            N_vars_jm = len({k[0] for k in qd.keys()})
+            terms_jm = len(qd)
+
+            def sample_jm():
+                return sampler.sample_qubo(qd, num_reads=num_reads, num_sweeps=num_sweeps, sparse=True)
+
+            times_sa_jm = []
+            for _ in range(repeat):
+                t0 = time.perf_counter()
+                sample_jm()
+                times_sa_jm.append(time.perf_counter() - t0)
+
+            jm_success = True
+            jm_offset = off
+        except Exception as e:
+            print(f"⚠️ JijModeling failed for N={N}, lb={lb}, lc={lc}: {e}")
+            times_jm = [np.nan]*repeat
+            times_sa_jm = [np.nan]*repeat
+            N_vars_jm = np.nan
+            terms_jm = np.nan
+            qd = {}
+            jm_offset = np.nan
+            jm_success = False
+
+        # ---- Custom builder ----
+        def build_custom():
+            linear, quad, N_custom = build_custom_qubo_sparse(instance, lb, lc)
+            qubo_dict_custom = custom_to_qubo_dict(linear, quad, N_custom)
+            return qubo_dict_custom, 0.0
+
+        times_custom = []
+        for _ in range(repeat):
+            t0 = time.perf_counter()
+            qdc, off_c = build_custom()
+            times_custom.append(time.perf_counter() - t0)
+
+        N_vars_custom = len({k[0] for k in qdc.keys()})
+        terms_custom = len(qdc)
+
+        def sample_custom():
+            return sampler.sample_qubo(qdc, num_reads=num_reads, num_sweeps=num_sweeps, sparse=True)
+
+        times_sa_custom = []
+        for _ in range(repeat):
+            t0 = time.perf_counter()
+            sample_custom()
+            times_sa_custom.append(time.perf_counter() - t0)
+
+        # ---- Correctness ----
+        correct = True
+        max_diff = 0.0
+        if jm_success:
+            for _ in range(random_sols):
+                x = np.random.randint(0, 2, size=instance["N"])
+                e_manual = compute_energy_manual(instance, x, lb, lc)
+                e_jm = 0.0
+                for (i,j), val in qd.items():
+                    if i == j:
+                        e_jm += val * x[i]
+                    else:
+                        if x[i] and x[j]:
+                            e_jm += val
+                e_jm += jm_offset
+                e_custom = 0.0
+                for (i,j), val in qdc.items():
+                    if i == j:
+                        e_custom += val * x[i]
+                    else:
+                        if x[i] and x[j]:
+                            e_custom += val
+                e_custom += off_c
+                diff_jm = abs(e_manual - e_jm)
+                diff_custom = abs(e_manual - e_custom)
+                if diff_jm > 1e-6 or diff_custom > 1e-6:
+                    correct = False
+                    max_diff = max(max_diff, diff_jm, diff_custom)
+        else:
+            # Only custom can be checked
+            for _ in range(random_sols):
+                x = np.random.randint(0, 2, size=instance["N"])
+                e_manual = compute_energy_manual(instance, x, lb, lc)
+                e_custom = 0.0
+                for (i,j), val in qdc.items():
+                    if i == j:
+                        e_custom += val * x[i]
+                    else:
+                        if x[i] and x[j]:
+                            e_custom += val
+                e_custom += off_c
+                diff_custom = abs(e_manual - e_custom)
+                if diff_custom > 1e-6:
+                    correct = False
+                    max_diff = max(max_diff, diff_custom)
+
+        # Store results
+        results.append({
+            "N": N,
+            "lambda_budget": lb,
+            "lambda_conn": lc,
+            "builder": "JijModeling",
+            "build_time_median": np.nanmedian(times_jm),
+            "build_time_std": np.nanstd(times_jm),
+            "sa_time_median": np.nanmedian(times_sa_jm),
+            "sa_time_std": np.nanstd(times_sa_jm),
+            "N_vars": N_vars_jm,
+            "terms": terms_jm,
+            "offset": jm_offset,
+            "correct": correct,
+            "max_diff": max_diff,
+            "success": jm_success
+        })
+        results.append({
+            "N": N,
+            "lambda_budget": lb,
+            "lambda_conn": lc,
+            "builder": "Custom",
+            "build_time_median": np.median(times_custom),
+            "build_time_std": np.std(times_custom),
+            "sa_time_median": np.median(times_sa_custom),
+            "sa_time_std": np.std(times_sa_custom),
+            "N_vars": N_vars_custom,
+            "terms": terms_custom,
+            "offset": off_c,
+            "correct": correct,
+            "max_diff": max_diff,
+            "success": True
+        })
+
+        # Print summary
+        if jm_success:
+            speedup = np.median(times_jm) / np.median(times_custom) if np.median(times_custom) > 0 else np.inf
+            print(f"N={N}, λb={lb:.2f}, λc={lc:.2f}: "
+                  f"JM build {np.median(times_jm):.4f}s, custom build {np.median(times_custom):.4f}s (speedup {speedup:.1f}x) "
+                  f"JM SA {np.median(times_sa_jm):.4f}s, custom SA {np.median(times_sa_custom):.4f}s "
+                  f"JM terms={terms_jm}, custom terms={terms_custom}. Correctness: {'OK' if correct else f'FAIL (max diff {max_diff:.2e})'}")
+        else:
+            print(f"N={N}, λb={lb:.2f}, λc={lc:.2f}: "
+                  f"JM FAILED, custom build {np.median(times_custom):.4f}s "
+                  f"custom SA {np.median(times_sa_custom):.4f}s, custom terms={terms_custom}. Correctness: {'OK' if correct else f'FAIL (max diff {max_diff:.2e})'}")
+    return results
+
+# ============================================================================
+# 8. MAIN RUN
+# ============================================================================
+def run_benchmark():
+    cache_file = Path(CONFIG_BENCH["CACHE_FILE"])
+    if cache_file.exists():
+        with open(cache_file, "rb") as f:
+            df = pickle.load(f)
+        print("Loaded cached benchmark results.")
+        return df
+
+    all_results = []
+    for N in CONFIG_BENCH["N_TESTS"]:
+        print(f"\n{'='*60}\nBenchmarking N={N}\n{'='*60}")
+        try:
+            res = benchmark_instance(
+                N,
+                CONFIG_BENCH["PENALTY_PAIRS"],
+                num_reads=CONFIG_BENCH["NUM_READS"],
+                num_sweeps=CONFIG_BENCH["NUM_SWEEPS"],
+                repeat=CONFIG_BENCH["REPEAT_TIMES"],
+                random_sols=CONFIG_BENCH["RANDOM_SOLUTIONS"]
+            )
+            all_results.extend(res)
+        except Exception as e:
+            print(f"❌ Failed for N={N}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    df = pd.DataFrame(all_results)
+    with open(cache_file, "wb") as f:
+        pickle.dump(df, f)
+    print(f"\n✅ Cached benchmark results to {cache_file}")
+    return df
+
+# ---- Run ----
+df = run_benchmark()
+
+if df.empty:
+    print("No results to plot.")
+else:
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    ax = axes[0,0]
+    for builder in df["builder"].unique():
+        sub = df[df["builder"] == builder]
+        if builder == "JijModeling":
+            sub = sub[sub["success"] == True]
+        grouped = sub.groupby("N")["build_time_median"].mean()
+        ax.plot(grouped.index, grouped.values, marker='o', label=builder)
+    ax.set_xlabel("N")
+    ax.set_ylabel("Build Time (s)")
+    ax.set_title("QUBO Build Time")
+    ax.legend()
+    ax.grid(True)
+
+    ax = axes[0,1]
+    for builder in df["builder"].unique():
+        sub = df[df["builder"] == builder]
+        if builder == "JijModeling":
+            sub = sub[sub["success"] == True]
+        grouped = sub.groupby("N")["sa_time_median"].mean()
+        ax.plot(grouped.index, grouped.values, marker='s', label=builder)
+    ax.set_xlabel("N")
+    ax.set_ylabel("SA Sampling Time (s)")
+    ax.set_title("SA Sampling Time ({} reads, {} sweeps)".format(CONFIG_BENCH["NUM_READS"], CONFIG_BENCH["NUM_SWEEPS"]))
+    ax.legend()
+    ax.grid(True)
+
+    ax = axes[1,0]
+    for builder in df["builder"].unique():
+        sub = df[df["builder"] == builder]
+        if builder == "JijModeling":
+            sub = sub[sub["success"] == True]
+        grouped = sub.groupby("N")["terms"].mean()
+        ax.plot(grouped.index, grouped.values, marker='^', label=builder)
+    ax.set_xlabel("N")
+    ax.set_ylabel("Number of QUBO terms")
+    ax.set_title("QUBO Size (terms)")
+    ax.legend()
+    ax.grid(True)
+
+    ax = axes[1,1]
+    pivot = df.pivot_table(index=["N", "lambda_budget", "lambda_conn"], columns="builder", values="build_time_median").reset_index()
+    pivot = pivot.dropna(subset=["JijModeling", "Custom"])
+    pivot["speedup"] = pivot["JijModeling"] / pivot["Custom"]
+    grouped_speedup = pivot.groupby("N")["speedup"].mean()
+    ax.bar(grouped_speedup.index.astype(str), grouped_speedup.values)
+    ax.set_xlabel("N")
+    ax.set_ylabel("Speedup (JM/Custom)")
+    ax.set_title("Average QUBO Build Speedup")
+    ax.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    print("\n" + "="*80)
+    print("BENCHMARK SUMMARY (averages over penalty pairs)")
+    print("="*80)
+    summary = df[df["success"] == True].groupby(["N", "builder"]).agg({
+        "build_time_median": "mean",
+        "sa_time_median": "mean",
+        "terms": "mean",
+        "N_vars": "mean"
+    }).reset_index()
+    print(summary.to_string(index=False))
+
+    correctness = df.groupby("builder")["correct"].all()
+    print("\nCorrectness check (all random solutions matched manual energy within 1e-6):")
+    print(correctness)
+
+print("\nBenchmark complete.")
