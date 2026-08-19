@@ -1,0 +1,33 @@
+# Requirements for running notebooks/experiment.ipynb in the LOCAL venv.
+# (The old Colab setup cell installed these + drive mount; that is gone.)
+# Python 3.14 is the target for this venv -> numpy>=2.x (NOT <2.0 like Colab).
+
+numpy>=2.0
+scipy>=1.9
+pandas>=2.0,<3.0
+matplotlib>=3.5
+shapely>=2.0
+tqdm>=4.60
+ipywidgets>=8.0
+
+# JijModeling / OpenJij stack (SA sampling + model building)
+jijmodeling>=2.7
+openjij>=0.12
+ommx-pyscipopt-adapter>=2.0
+
+# Tuning / tracking
+optuna>=3.0
+wandb>=0.15
+
+# ---------------------------------------------------------------------------
+# Optional extras that the old Colab setup installed but the notebook does NOT
+# import (kept for reference):
+#   seaborn
+#   optuna-integration[wandb]
+#   gurobipy
+#   pyomo
+#   qiskit qiskit-optimization qiskit-aer
+#   qamomile
+#   kaleido
+# NOTE: "ommx-openjij-adapter" from the old setup cell does NOT exist on PyPI.
+# ---------------------------------------------------------------------------

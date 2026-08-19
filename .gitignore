@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local notebook artifacts (created by the notebook at runtime)
+data/cache/
+results/
+*.sqlite3
+wandb/
