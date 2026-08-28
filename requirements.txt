@@ -9,6 +9,14 @@ matplotlib>=3.5
 shapely>=2.0
 tqdm>=4.60
 ipywidgets>=8.0
+tabulate
+seaborn
+torch
+botorch
+gpytorch
+plotly
+kaleido
+nbformat>=4.2.0
 
 # JijModeling / OpenJij stack (SA sampling + model building)
 jijmodeling>=2.7
@@ -17,6 +25,7 @@ ommx-pyscipopt-adapter>=2.0
 
 # Tuning / tracking
 optuna>=3.0
+optuna_integration
 wandb>=0.15
 
 # ---------------------------------------------------------------------------

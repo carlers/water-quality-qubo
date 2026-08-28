@@ -151,6 +151,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv_bak
 env/
 venv/
 ENV/
@@ -219,6 +220,11 @@ __marimo__/
 
 # Local notebook artifacts (created by the notebook at runtime)
 data/cache/
+data/cache2/
+data/cache3/
 results/
+results2/
+results3/
+test_moo_plots/
 *.sqlite3
 wandb/
